@@ -7719,10 +7719,9 @@ bool cannotDependOnLoopIV(const SCEV *S, const Loop *L) {
         return false;
     return true;
   }
-  if (auto expr = dyn_cast<SCEVSignExtendExpr>(S)) {
+  if (auto expr = dyn_cast<SCEVCastExpr>(S)) {
     return cannotDependOnLoopIV(expr->getOperand(), L);
   }
-  llvm::errs() << " cannot tell if depends on loop iv: " << *S << "\n";
   return false;
 }
 
@@ -8726,8 +8725,9 @@ getSparseConditions(bool &legal, Value *val,
         if (cannotDependOnLoopIV(sub1, ctx.loopToSolve)) {
           auto res = Constraints::make_compare(
               sub1, icmp->getPredicate() == ICmpInst::ICMP_EQ, nullptr, ctx);
-          llvm::errs() << " getSparse(icmp_noloop, " << *I << ") = " << *res
-                       << "\n";
+          if (SparseDebug)
+            llvm::errs() << " getSparse(icmp_noloop, " << *I << ") = " << *res
+                         << "\n";
           return res;
         }
       }
