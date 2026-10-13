@@ -22,12 +22,12 @@ module {
     }
 
     enzyme.yield
-  } attributes {
+  } <{
     activity=[#enzyme.activity<enzyme_active>,
               #enzyme.activity<enzyme_const>],
     ret_activity=[#enzyme.activity<enzyme_active>],
     function_type = (f32, f32) -> f32
-  }
+  }>
 
   func.func @f(%arg0:f32, %arg1: f32) -> f32 attributes {enzyme.custom_rule = @reverse_f} {
     %0 = math.exp %arg0 : f32
@@ -53,11 +53,11 @@ module {
       enzyme.yield %x : f32
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f32) -> f32
-  }
+  }>
   func.func @main(%x: f32, %y: f32) -> f32 {
     %r = arith.addf %x, %y : f32
     return %r : f32
@@ -73,11 +73,11 @@ module {
       enzyme.yield %dx : f32
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f32) -> f32
-  }
+  }>
   func.func @main(%x: f32, %y: f32) -> f32 {
     %r = arith.addf %x, %y : f32
     return %r : f32
@@ -89,11 +89,11 @@ module {
 module {
   // expected-error @below {{a custom reverse rule needs one body block}}
   enzyme.custom_reverse_rule @empty_rule {
-  } attributes {
+  } <{
     activity = [],
     ret_activity = [],
     function_type = () -> ()
-  }
+  }>
   func.func @main(%x: f32, %y: f32) -> f32 {
     %r = arith.addf %x, %y : f32
     return %r : f32
@@ -114,11 +114,11 @@ module {
       enzyme.yield %dx : f32
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f32) -> f32
-  }
+  }>
   func.func @main(%x: f32, %y: f32) -> f32 {
     %r = arith.addf %x, %y : f32
     return %r : f32
@@ -137,11 +137,11 @@ module {
       enzyme.yield %dx : f32
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f32) -> f32
-  }
+  }>
   func.func @main(%x: f32, %y: f32) -> f32 {
     %r = arith.addf %x, %y : f32
     return %r : f32
@@ -160,11 +160,11 @@ module {
       enzyme.yield %dx : f32
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_dup>],
     function_type = (f32) -> f32
-  }
+  }>
   func.func @main(%x: f32, %y: f32) -> f32 {
     %r = arith.addf %x, %y : f32
     return %r : f32

@@ -32,11 +32,11 @@ module {
       enzyme.yield %abar, %xbar : tensor<4xf64>, tensor<4xf64>
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (tensor<4xf64>, tensor<4xf64>) -> tensor<4xf64>
-  }
+  }>
 
   func.func @outer(%a: tensor<4xf64>, %x: tensor<4xf64>) -> tensor<4xf64> {
     %c0 = arith.constant 0 : index
@@ -50,10 +50,10 @@ module {
   }
 
   func.func @main(%a: tensor<4xf64>, %x: tensor<4xf64>, %dz: tensor<4xf64>) -> (tensor<4xf64>, tensor<4xf64>) {
-    %da, %dx = enzyme.autodiff @outer(%a, %x, %dz) {
+    %da, %dx = enzyme.autodiff @outer(%a, %x, %dz) <{
       activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (tensor<4xf64>, tensor<4xf64>, tensor<4xf64>) -> (tensor<4xf64>, tensor<4xf64>)
+    }> : (tensor<4xf64>, tensor<4xf64>, tensor<4xf64>) -> (tensor<4xf64>, tensor<4xf64>)
     return %da, %dx : tensor<4xf64>, tensor<4xf64>
   }
 }
@@ -120,11 +120,11 @@ module {
       enzyme.yield %abar, %xbar : tensor<4xf64>, tensor<4xf64>
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (tensor<4xf64>, tensor<4xf64>) -> tensor<4xf64>
-  }
+  }>
 
   func.func @outer(%p: i1, %a: tensor<4xf64>, %x: tensor<4xf64>) -> tensor<4xf64> {
     %r = scf.if %p -> (tensor<4xf64>) {
@@ -137,10 +137,10 @@ module {
   }
 
   func.func @main(%p: i1, %a: tensor<4xf64>, %x: tensor<4xf64>, %dz: tensor<4xf64>) -> (tensor<4xf64>, tensor<4xf64>) {
-    %da, %dx = enzyme.autodiff @outer(%p, %a, %x, %dz) {
+    %da, %dx = enzyme.autodiff @outer(%p, %a, %x, %dz) <{
       activity = [#enzyme.activity<enzyme_const>, #enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (i1, tensor<4xf64>, tensor<4xf64>, tensor<4xf64>) -> (tensor<4xf64>, tensor<4xf64>)
+    }> : (i1, tensor<4xf64>, tensor<4xf64>, tensor<4xf64>) -> (tensor<4xf64>, tensor<4xf64>)
     return %da, %dx : tensor<4xf64>, tensor<4xf64>
   }
 }

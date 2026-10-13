@@ -17,10 +17,10 @@ module {
   }
 
   func.func @main(%a: f64, %b: f64, %dz: f64) -> (f64, f64) {
-    %da, %db = enzyme.autodiff @outer(%a, %b, %dz) {
+    %da, %db = enzyme.autodiff @outer(%a, %b, %dz) <{
       activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64, f64) -> (f64, f64)
+    }> : (f64, f64, f64) -> (f64, f64)
     return %da, %db : f64, f64
   }
 }
@@ -60,10 +60,10 @@ module {
   }
 
   func.func @main(%a: f64, %b: f64, %dz: f64) -> (f64, f64) {
-    %da, %db = enzyme.autodiff @outer(%a, %b, %dz) {
+    %da, %db = enzyme.autodiff @outer(%a, %b, %dz) <{
       activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64, f64) -> (f64, f64)
+    }> : (f64, f64, f64) -> (f64, f64)
     return %da, %db : f64, f64
   }
 }
@@ -114,11 +114,11 @@ module {
       enzyme.yield %xbar : f64
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f64) -> f64
-  }
+  }>
 
   func.func @outer(%a: f64, %b: f64) -> f64 {
     %ya = func.call @sq(%a) : (f64) -> f64
@@ -128,10 +128,10 @@ module {
   }
 
   func.func @main(%a: f64, %b: f64, %dz: f64) -> (f64, f64) {
-    %da, %db = enzyme.autodiff @outer(%a, %b, %dz) {
+    %da, %db = enzyme.autodiff @outer(%a, %b, %dz) <{
       activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64, f64) -> (f64, f64)
+    }> : (f64, f64, f64) -> (f64, f64)
     return %da, %db : f64, f64
   }
 }

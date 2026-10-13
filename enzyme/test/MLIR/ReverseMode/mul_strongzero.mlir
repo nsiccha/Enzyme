@@ -30,15 +30,15 @@ module {
     return %y : f64
   }
   func.func @main(%x: f64, %dy: f64) -> (f64, f64) {
-    %plain = enzyme.autodiff @square(%x, %dy) {
+    %plain = enzyme.autodiff @square(%x, %dy) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64) -> f64
-    %strong = enzyme.autodiff @square(%x, %dy) {
+    }> : (f64, f64) -> f64
+    %strong = enzyme.autodiff @square(%x, %dy) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>],
       strong_zero = true
-    } : (f64, f64) -> f64
+    }> : (f64, f64) -> f64
     return %plain, %strong : f64, f64
   }
 }
@@ -71,15 +71,15 @@ module {
     return %y : f64
   }
   func.func @main(%x: f64, %dy: f64) -> (f64, f64) {
-    %plain = enzyme.autodiff @outer1(%x, %dy) {
+    %plain = enzyme.autodiff @outer1(%x, %dy) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64) -> f64
-    %strong = enzyme.autodiff @outer2(%x, %dy) {
+    }> : (f64, f64) -> f64
+    %strong = enzyme.autodiff @outer2(%x, %dy) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>],
       strong_zero = true
-    } : (f64, f64) -> f64
+    }> : (f64, f64) -> f64
     return %plain, %strong : f64, f64
   }
 }

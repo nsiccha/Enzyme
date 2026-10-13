@@ -11,18 +11,18 @@ module {
 
   // Split mode
   func.func @main(%a: f32, %b: f32) -> (f32, f32, f32) {
-    %r, %tape = enzyme.autodiff_split_mode.primal @mul(%a, %b) {
+    %r, %tape = enzyme.autodiff_split_mode.primal @mul(%a, %b) <{
       activity=[#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity=[#enzyme.activity<enzyme_active>]
-    } : (f32, f32) -> (f32, !enzyme.Tape)
+    }> : (f32, f32) -> (f32, !enzyme.Tape)
 
     // ---
 
     %dres = arith.constant 1.0 : f32
-    %da, %db = enzyme.autodiff_split_mode.reverse @mul(%dres, %tape) {
+    %da, %db = enzyme.autodiff_split_mode.reverse @mul(%dres, %tape) <{
       activity=[#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity=[#enzyme.activity<enzyme_active>]
-    } : (f32, !enzyme.Tape) -> (f32, f32)
+    }> : (f32, !enzyme.Tape) -> (f32, f32)
 
     return %r, %da, %db : f32, f32, f32
   }
@@ -70,11 +70,11 @@ module {
       enzyme.yield %dx : f64
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f64) -> f64
-  }
+  }>
 }
 
 // PARSE: "enzyme.custom_reverse_rule.augmented_primal"() <{function_type = (f64) -> f64}>
@@ -103,11 +103,11 @@ module {
       enzyme.yield
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_constnoneed>],
     ret_activity = [#enzyme.activity<enzyme_constnoneed>],
     function_type = (f64) -> f64
-  }
+  }>
 
   enzyme.custom_reverse_rule @dupnoneed_rule {
     enzyme.custom_reverse_rule.augmented_primal (%x: !llvm.ptr, %dx: !llvm.ptr) {
@@ -117,11 +117,11 @@ module {
       enzyme.yield
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_dupnoneed>],
     ret_activity = [],
     function_type = (!llvm.ptr) -> ()
-  }
+  }>
 }
 
 // PARSE: "enzyme.custom_reverse_rule.augmented_primal"() <{function_type = (f64) -> f64}>
@@ -152,11 +152,11 @@ module {
   }
   func.func @main(%x: f64) -> f64 {
     // expected-error @below {{failed to create reverse-mode adjoint for callee "square"}}
-    %y, %tape = enzyme.autodiff_split_mode.primal @square(%x) {
+    %y, %tape = enzyme.autodiff_split_mode.primal @square(%x) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_active>],
       width = 2
-    } : (f64) -> (f64, !enzyme.Tape)
+    }> : (f64) -> (f64, !enzyme.Tape)
     return %y : f64
   }
 }

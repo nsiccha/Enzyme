@@ -28,11 +28,11 @@ module {
       enzyme.yield %xbar : tensor<f64>
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (tensor<f64>) -> tensor<f64>
-  }
+  }>
 
   func.func private @elem(%x: tensor<f64>) -> tensor<f64> {
     %y = func.call @sq(%x) : (tensor<f64>) -> tensor<f64>
@@ -40,15 +40,15 @@ module {
   }
 
   func.func @outer(%x: tensor<3xf64>) -> tensor<3xf64> {
-    %y = enzyme.batch @elem(%x) {batch_shape = array<i64: 3>} : (tensor<3xf64>) -> tensor<3xf64>
+    %y = enzyme.batch @elem(%x) <{batch_shape = array<i64: 3>}> : (tensor<3xf64>) -> tensor<3xf64>
     return %y : tensor<3xf64>
   }
 
   func.func @main(%x: tensor<3xf64>, %dy: tensor<3xf64>) -> tensor<3xf64> {
-    %dx = enzyme.autodiff @outer(%x, %dy) {
+    %dx = enzyme.autodiff @outer(%x, %dy) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (tensor<3xf64>, tensor<3xf64>) -> tensor<3xf64>
+    }> : (tensor<3xf64>, tensor<3xf64>) -> tensor<3xf64>
     return %dx : tensor<3xf64>
   }
 }

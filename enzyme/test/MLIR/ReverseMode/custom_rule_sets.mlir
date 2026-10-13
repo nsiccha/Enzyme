@@ -30,11 +30,11 @@ module {
       enzyme.yield %abar, %xbar : f64, f64
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f64, f64) -> f64
-  }
+  }>
 
   enzyme.custom_reverse_rule @mul_x {
     %ca = "enzyme.init"() : () -> !enzyme.Cache<f64>
@@ -51,11 +51,11 @@ module {
       enzyme.yield %xbar : f64
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_const>, #enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f64, f64) -> f64
-  }
+  }>
 
   // Both operands active, then only x active (the first operand is a constant).
   func.func @outer(%a: f64, %x: f64) -> f64 {
@@ -67,10 +67,10 @@ module {
   }
 
   func.func @main(%a: f64, %x: f64, %dz: f64) -> (f64, f64) {
-    %da, %dx = enzyme.autodiff @outer(%a, %x, %dz) {
+    %da, %dx = enzyme.autodiff @outer(%a, %x, %dz) <{
       activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64, f64) -> (f64, f64)
+    }> : (f64, f64, f64) -> (f64, f64)
     return %da, %dx : f64, f64
   }
 }
@@ -132,11 +132,11 @@ module {
       enzyme.yield %abar, %xbar : f64, f64
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f64, f64) -> f64
-  }
+  }>
 
   func.func @outer(%x: f64) -> f64 {
     %k = arith.constant 3.0 : f64
@@ -145,10 +145,10 @@ module {
   }
 
   func.func @main(%x: f64, %dz: f64) -> f64 {
-    %dx = enzyme.autodiff @outer(%x, %dz) {
+    %dx = enzyme.autodiff @outer(%x, %dz) <{
       activity = [#enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64) -> f64
+    }> : (f64, f64) -> f64
     return %dx : f64
   }
 }
@@ -193,11 +193,11 @@ module {
       enzyme.yield %xbar : f64
     }
     enzyme.yield
-  } attributes {
+  } <{
     activity = [#enzyme.activity<enzyme_const>, #enzyme.activity<enzyme_active>],
     ret_activity = [#enzyme.activity<enzyme_active>],
     function_type = (f64, f64) -> f64
-  }
+  }>
 
   func.func @outer(%a: f64, %x: f64) -> f64 {
     // expected-error @below {{could not find a rule with the right activity (rule activity=[#enzyme.activity<enzyme_const>, #enzyme.activity<enzyme_active>], ret_activity=[#enzyme.activity<enzyme_active>])}}
@@ -206,10 +206,10 @@ module {
   }
 
   func.func @main(%a: f64, %x: f64, %dz: f64) -> (f64, f64) {
-    %da, %dx = enzyme.autodiff @outer(%a, %x, %dz) {
+    %da, %dx = enzyme.autodiff @outer(%a, %x, %dz) <{
       activity = [#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>],
       ret_activity = [#enzyme.activity<enzyme_activenoneed>]
-    } : (f64, f64, f64) -> (f64, f64)
+    }> : (f64, f64, f64) -> (f64, f64)
     return %da, %dx : f64, f64
   }
 }

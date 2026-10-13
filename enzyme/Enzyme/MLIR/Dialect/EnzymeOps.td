@@ -181,7 +181,7 @@ def AutoDiffSplitModePrimalOp : Enzyme_Op<"autodiff_split_mode.primal",
   let arguments = (ins FlatSymbolRefAttr:$fn, Variadic<AnyType>:$inputs, ActivityArrayAttr:$activity, ActivityArrayAttr:$ret_activity, DefaultValuedAttr<I64Attr, "1">:$width, DefaultValuedAttr<BoolAttr, "false">:$strong_zero);
   let results = (outs Variadic<AnyType>:$outputs, AnyTape:$tape);
   let assemblyFormat = [{
-    $fn `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
+    $fn `(` $inputs `)` prop-dict attr-dict `:` functional-type($inputs, results)
   }];
 }
 
@@ -193,7 +193,7 @@ def AutoDiffSplitModeReverseOp : Enzyme_Op<"autodiff_split_mode.reverse",
   let results = (outs Variadic<AnyType>:$outputs);
 
   let assemblyFormat = [{
-    $fn `(` operands `)` attr-dict `:` functional-type(operands, results)
+    $fn `(` operands `)` prop-dict attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -204,7 +204,7 @@ def CustomReverseRuleOp : Enzyme_Op<"custom_reverse_rule", [IsolatedFromAbove, S
   let results = (outs);
 
   let assemblyFormat = [{
-    $sym_name $body attr-dict-with-keyword
+    $sym_name $body prop-dict attr-dict-with-keyword
   }];
 
   let extraClassDeclaration = [{
