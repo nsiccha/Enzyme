@@ -22,6 +22,7 @@ add_mlir_dialect_library(
   LowerEnzymeCustomRulesToFuncPass.cpp
   PrintActivityAnalysis.cpp
   PrintAliasAnalysis.cpp
+  PrintBaseObject.cpp
   EnzymeToMemRef.cpp
   SimplifyMath.cpp
   SplitMultiResults.cpp
