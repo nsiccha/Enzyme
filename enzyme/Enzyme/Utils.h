@@ -1258,29 +1258,24 @@ allInstructionsBetween(llvm::LoopInfo &LI, llvm::Instruction *inst1,
       return;
   }
 
-  std::set<llvm::Instruction *> instructions;
-
   llvm::Loop *l1 = LI.getLoopFor(inst1->getParent());
   while (l1 && !l1->contains(inst2->getParent()))
     l1 = l1->getParentLoop();
 
-  // Do all instructions from inst1 up to first instance of inst2's start block
+  // Do all instructions from inst1 up to first instance of inst2's start
+  // block. Every instruction of a reached block is in between, so keep the
+  // blocks rather than each of their instructions.
+  llvm::SmallPtrSet<llvm::BasicBlock *, 16> blocks;
   {
     std::deque<llvm::BasicBlock *> todo;
-    std::set<llvm::BasicBlock *> done;
     for (auto suc : llvm::successors(inst1->getParent())) {
       todo.push_back(suc);
     }
     while (todo.size()) {
       auto BB = todo.front();
       todo.pop_front();
-      if (done.count(BB))
+      if (!blocks.insert(BB).second)
         continue;
-      done.insert(BB);
-
-      for (auto &ni : *BB) {
-        instructions.insert(&ni);
-      }
       for (auto suc : llvm::successors(BB)) {
         if (!l1 || suc != l1->getHeader()) {
           todo.push_back(suc);
@@ -1290,7 +1285,7 @@ allInstructionsBetween(llvm::LoopInfo &LI, llvm::Instruction *inst1,
   }
 
   allPredecessorsOf(inst2, [&](llvm::Instruction *I) -> bool {
-    if (instructions.find(I) == instructions.end())
+    if (!blocks.count(I->getParent()))
       return /*earlyReturn*/ false;
     return f(I);
   });
