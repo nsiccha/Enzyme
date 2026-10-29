@@ -221,6 +221,24 @@ public:
 
   bool assumeDynamicLoopOfSizeOne(llvm::Loop *L) const override;
 
+  /// Whether, in a split derivative (\p mode ReverseModePrimal or
+  /// ReverseModeGradient), the reverse function replays the loop exited by the
+  /// conditional branch \p term of the original function only once, so that
+  /// the replay needs no condition for \p term. That holds when \p term is the
+  /// loop's latch and only exiting branch, the loop's limit cannot be computed
+  /// and assumeDynamicLoopOfSizeOne holds (its reverse already runs one
+  /// iteration), its exit is dedicated, it writes no memory, and its values
+  /// leave it only through phis, which are cached rather than recomputed.
+  bool isReplayedOnceLatch(const llvm::Instruction *term,
+                           DerivativeMode mode) const;
+  /// isReplayedOnceLatch per latch block of the original function, computed
+  /// at the first query so that later changes to newFunc cannot change it.
+  mutable std::map<const llvm::BasicBlock *, bool> replayedOnceLatches;
+
+  /// In the reverse function of a split derivative, make each latch for which
+  /// isReplayedOnceLatch holds branch to its exit.
+  void replayLatchesOnce();
+
   llvm::DebugLoc getNewFromOriginal(const llvm::DebugLoc L) const;
 
   llvm::Value *getNewFromOriginal(const llvm::Value *originst) const;

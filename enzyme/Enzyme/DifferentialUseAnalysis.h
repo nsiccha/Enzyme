@@ -403,6 +403,10 @@ inline bool is_value_needed_in_reverse(
         }
         if (num <= 1)
           continue;
+        // The reverse function replays the loop this latch exits only once
+        // (replayLatchesOnce), so it needs no condition for the latch.
+        if (gutils->isReplayedOnceLatch(cast<Instruction>(use), mode))
+          continue;
         if (EnzymePrintDiffUse)
           llvm::errs() << " Need: " << to_string(VT) << " of " << *inst
                        << " in reverse as control-flow " << *user << "\n";

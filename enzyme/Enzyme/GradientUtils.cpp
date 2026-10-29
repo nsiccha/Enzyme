@@ -631,6 +631,102 @@ bool GradientUtils::assumeDynamicLoopOfSizeOne(Loop *L) const {
   return true;
 }
 
+bool GradientUtils::isReplayedOnceLatch(const Instruction *term,
+                                        DerivativeMode mode) const {
+  if (mode != DerivativeMode::ReverseModePrimal &&
+      mode != DerivativeMode::ReverseModeGradient)
+    return false;
+  auto BI = dyn_cast<BranchInst>(term);
+  if (!BI || !BI->isConditional())
+    return false;
+  const BasicBlock *BB = BI->getParent();
+  assert(BB->getParent() == oldFunc);
+  auto found = replayedOnceLatches.find(BB);
+  if (found != replayedOnceLatches.end())
+    return found->second;
+
+  auto compute = [&]() {
+    Loop *L = OrigLI->getLoopFor(BB);
+    if (!L || L->getLoopLatch() != BB || L->getExitingBlock() != BB)
+      return false;
+    BasicBlock *exit = nullptr;
+    if (BI->getSuccessor(0) == L->getHeader())
+      exit = BI->getSuccessor(1);
+    else if (BI->getSuccessor(1) == L->getHeader())
+      exit = BI->getSuccessor(0);
+    if (!exit || L->contains(exit))
+      return false;
+    // A dedicated exit: the reverse of the exit block never needs to know
+    // whether it was entered from the loop.
+    for (auto pred : predecessors(exit))
+      if (pred != BB)
+        return false;
+
+    Loop *NL = LI.getLoopFor(getNewFromOriginal(BB));
+    if (!NL)
+      return false;
+    auto self = const_cast<GradientUtils *>(this);
+    if (self->computeLoopLimit(NL).first != self->SE.getCouldNotCompute())
+      return false;
+    if (!assumeDynamicLoopOfSizeOne(NL))
+      return false;
+
+    for (auto OB : L->getBlocks()) {
+      for (auto &I : *OB) {
+        // A replay of a single iteration must not change memory that the
+        // loop would have written.
+        if (I.mayWriteToMemory())
+          return false;
+        // A phi outside the loop with an incoming value from inside it is
+        // never recomputed (legalRecompute, isPotentialLastLoopValue), so a
+        // value of the loop used only through such phis reaches the replay
+        // from the tape. Any other use outside the loop could be recomputed
+        // from the replay's single iteration.
+        for (auto U : I.users()) {
+          auto UI = cast<Instruction>(U);
+          if (L->contains(UI->getParent()))
+            continue;
+          if (!isa<PHINode>(UI))
+            return false;
+        }
+      }
+    }
+    return true;
+  };
+  return replayedOnceLatches[BB] = compute();
+}
+
+void GradientUtils::replayLatchesOnce() {
+  assert(mode == DerivativeMode::ReverseModeGradient);
+  for (BasicBlock &OBB : *oldFunc) {
+    auto term = OBB.getTerminator();
+    if (!isReplayedOnceLatch(term, mode))
+      continue;
+    auto OBI = cast<BranchInst>(term);
+    BasicBlock *OHeader = OrigLI->getLoopFor(&OBB)->getHeader();
+    BasicBlock *OExit = OBI->getSuccessor(0) == OHeader ? OBI->getSuccessor(1)
+                                                        : OBI->getSuccessor(0);
+    BasicBlock *NBB = getNewFromOriginal(&OBB);
+    BasicBlock *NHeader = getNewFromOriginal(OHeader);
+    BasicBlock *NExit = getNewFromOriginal(OExit);
+    auto NBI = dyn_cast<BranchInst>(NBB->getTerminator());
+    if (!NBI || !NBI->isConditional() ||
+        !((NBI->getSuccessor(0) == NHeader && NBI->getSuccessor(1) == NExit) ||
+          (NBI->getSuccessor(0) == NExit && NBI->getSuccessor(1) == NHeader))) {
+      std::string str;
+      raw_string_ostream ss(str);
+      ss << "replayed-once latch " << OBB.getName()
+         << " no longer branches to its header and exit: " << *NBB << "\n";
+      report_fatal_error(StringRef(ss.str()));
+    }
+    // The condition was not needed in the reverse, so it was not cached and
+    // its replay was erased. A constant condition keeps every phi of the
+    // header valid; the back edge folds away after differentiation.
+    NBI->setCondition(
+        ConstantInt::getBool(NBI->getContext(), NBI->getSuccessor(0) == NExit));
+  }
+}
+
 DebugLoc GradientUtils::getNewFromOriginal(const DebugLoc L) const {
   if (L.get() == nullptr)
     return nullptr;

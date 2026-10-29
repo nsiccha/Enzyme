@@ -972,7 +972,8 @@ void calculateUnusedValuesInFunction(
               num++;
             }
           }
-          if (num > 1 || mode != DerivativeMode::ReverseModeGradient) {
+          if (mode != DerivativeMode::ReverseModeGradient ||
+              (num > 1 && !gutils->isReplayedOnceLatch(inst, mode))) {
             return UseReq::Need;
           }
         }
@@ -4621,8 +4622,10 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
                              key.retType);
   }
 
-  if (key.mode == DerivativeMode::ReverseModeGradient)
+  if (key.mode == DerivativeMode::ReverseModeGradient) {
     restoreCache(gutils, mapping, guaranteedUnreachable);
+    gutils->replayLatchesOnce();
+  }
 
   gutils->eraseFictiousPHIs();
 
