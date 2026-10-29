@@ -25,6 +25,7 @@
 #ifndef ENZYME_UTILS_H
 #define ENZYME_UTILS_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -1219,6 +1220,13 @@ bool writesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
                           llvm::Instruction *maybeReader,
                           llvm::Instruction *maybeWriter);
 
+/// For each load out of a fresh allocation or alloca, whether memory that the
+/// load reads may be written between the allocation and the load (see
+/// arePointersGuaranteedNoAlias). The answer depends on the load alone, so a
+/// caller that compares many pointers within one unchanged function can keep
+/// the answers here instead of rescanning the function for every pair.
+using AllocWrittenBeforeLoadCache = llvm::DenseMap<llvm::LoadInst *, bool>;
+
 // A more advanced version of writesToMemoryReadBy, where the writing
 // instruction comes after the reading function. Specifically, even if the two
 // instructions may access the same location, this variant checks whether
@@ -1230,13 +1238,11 @@ bool writesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
 //      load A[i-1]
 //      store A[i] = ...
 //   }
-bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
-                              llvm::TargetLibraryInfo &TLI,
-                              llvm::ScalarEvolution &SE, llvm::LoopInfo &LI,
-                              llvm::DominatorTree &DT,
-                              llvm::Instruction *maybeReader,
-                              llvm::Instruction *maybeWriter,
-                              llvm::Loop *scope = nullptr);
+bool overwritesToMemoryReadBy(
+    const TypeResults *TR, llvm::AAResults &AA, llvm::TargetLibraryInfo &TLI,
+    llvm::ScalarEvolution &SE, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
+    llvm::Instruction *maybeReader, llvm::Instruction *maybeWriter,
+    llvm::Loop *scope = nullptr, AllocWrittenBeforeLoadCache *cache = nullptr);
 static inline void
 /// Call the function f for all instructions that happen between inst1 and inst2
 /// If the function returns true, the iteration will early exit
@@ -2693,7 +2699,8 @@ llvm::Optional<bool>
 arePointersGuaranteedNoAlias(llvm::TargetLibraryInfo &TLI, llvm::AAResults &AA,
                              llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                              llvm::Value *op0, llvm::Value *op1,
-                             bool offsetAllowed = false);
+                             bool offsetAllowed = false,
+                             AllocWrittenBeforeLoadCache *cache = nullptr);
 
 /// MPI routines recognized by Enzyme, keyed by their lowercase,
 /// underscore-free base name and mapped to the canonical C name (without the

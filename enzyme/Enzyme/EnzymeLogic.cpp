@@ -177,6 +177,7 @@ struct CacheAnalysis {
   const std::vector<bool> &overwritten_args;
   DerivativeMode mode;
   std::map<Value *, bool> seen;
+  AllocWrittenBeforeLoadCache allocWrittenBeforeLoad;
   bool omp;
   CacheAnalysis(
       const ValueMap<const CallInst *, SmallPtrSet<const CallInst *, 1>>
@@ -425,7 +426,8 @@ struct CacheAnalysis {
         }
 
         if (!overwritesToMemoryReadBy(&TR, AA, TLI, SE, OrigLI, OrigDT, &li,
-                                      inst2)) {
+                                      inst2, /*scope*/ nullptr,
+                                      &allocWrittenBeforeLoad)) {
           return false;
         }
 

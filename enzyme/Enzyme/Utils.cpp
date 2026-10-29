@@ -2950,8 +2950,8 @@ bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
                               llvm::TargetLibraryInfo &TLI, ScalarEvolution &SE,
                               llvm::LoopInfo &LI, llvm::DominatorTree &DT,
                               llvm::Instruction *maybeReader,
-                              llvm::Instruction *maybeWriter,
-                              llvm::Loop *scope) {
+                              llvm::Instruction *maybeWriter, llvm::Loop *scope,
+                              AllocWrittenBeforeLoadCache *cache) {
   using namespace llvm;
   if (!writesToMemoryReadBy(TR, AA, TLI, maybeReader, maybeWriter))
     return false;
@@ -3049,7 +3049,7 @@ bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
 
   if (loadPtr && storePtr)
     if (auto alias = arePointersGuaranteedNoAlias(TLI, AA, DT, LI, loadPtr,
-                                                  storePtr, true))
+                                                  storePtr, true, cache))
       if (*alias)
         return false;
 
@@ -4861,6 +4861,36 @@ bool notCaptured(llvm::Value *V, llvm::TargetLibraryInfo *TLI) {
   return notCapturedBefore(V, nullptr, 0, nullptr, TLI);
 }
 
+// Whether an instruction between alloc_call and ld may write memory that ld
+// reads. alloc_call is ld's base object, so the answer depends on ld alone and
+// is kept in cache when one is given.
+static bool isAllocWrittenBeforeLoad(LoopInfo &LI, AAResults &AA,
+                                     TargetLibraryInfo &TLI,
+                                     Instruction *alloc_call, LoadInst *ld,
+                                     AllocWrittenBeforeLoadCache *cache) {
+  if (cache) {
+    auto found = cache->find(ld);
+    if (found != cache->end())
+      return found->second;
+  }
+  bool alloc_written = false;
+  allInstructionsBetween(LI, alloc_call, ld, [&](Instruction *I) -> bool {
+    if (!I->mayWriteToMemory())
+      return /*earlyBreak*/ false;
+
+    if (writesToMemoryReadBy(nullptr, AA, TLI,
+                             /*maybeReader*/ ld,
+                             /*maybeWriter*/ I)) {
+      alloc_written = true;
+      return /*earlyBreak*/ true;
+    }
+    return /*earlyBreak*/ false;
+  });
+  if (cache)
+    (*cache)[ld] = alloc_written;
+  return alloc_written;
+}
+
 // Return true if guaranteed not to alias
 // Return false if guaranteed to alias [with possible offset depending on flag].
 // Return {} if no information is given.
@@ -4872,7 +4902,8 @@ llvm::Optional<bool>
 arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
                              llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                              llvm::Value *op0, llvm::Value *op1,
-                             bool offsetAllowed) {
+                             bool offsetAllowed,
+                             AllocWrittenBeforeLoadCache *cache) {
   auto lhs = getBaseObject(op0, offsetAllowed);
   auto rhs = getBaseObject(op1, offsetAllowed);
 
@@ -4961,19 +4992,8 @@ arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
         // know that there is no way to dataflow end into start, so we now
         // merely must prove there is no way to dataflow start into end.
 
-        bool alloc_written = false;
-        allInstructionsBetween(LI, alloc_call, ld, [&](Instruction *I) -> bool {
-          if (!I->mayWriteToMemory())
-            return /*earlyBreak*/ false;
-
-          if (writesToMemoryReadBy(nullptr, AA, TLI,
-                                   /*maybeReader*/ ld,
-                                   /*maybeWriter*/ I)) {
-            alloc_written = true;
-            return /*earlyBreak*/ true;
-          }
-          return /*earlyBreak*/ false;
-        });
+        bool alloc_written =
+            isAllocWrittenBeforeLoad(LI, AA, TLI, alloc_call, ld, cache);
 
         if (!alloc_written && end_base != alloc_call) {
           // If end is marked noalias at the time of construction it
