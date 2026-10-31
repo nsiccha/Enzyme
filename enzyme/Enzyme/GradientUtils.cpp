@@ -8104,6 +8104,31 @@ BasicBlock *GradientUtils::originalForReverseBlock(BasicBlock &BB2) const {
 //   * If replacePHIs isn't null, do not perform the branch and instead replace
 //   the PHI's with the derived condition as to whether we should branch to a
 //   particular target
+/// Whether `cond` can be recomputed on every path into the reverse of `ctx`,
+/// including paths on which the forward pass never computed it: every
+/// instruction it is computed from that is not guaranteed to have run before
+/// `ctx` must be safe to execute on values that block never saw.
+static bool safeToRecomputeOnAllPaths(Value *cond, BasicBlock *ctx,
+                                      DominatorTree &DT) {
+  SmallVector<Instruction *, 8> todo;
+  SmallPtrSet<Instruction *, 8> seen;
+  if (auto I = dyn_cast<Instruction>(cond))
+    todo.push_back(I);
+  while (!todo.empty()) {
+    auto I = todo.pop_back_val();
+    if (!seen.insert(I).second)
+      continue;
+    if (DT.dominates(I->getParent(), ctx))
+      continue;
+    if (isa<PHINode>(I) || !isSafeToSpeculativelyExecute(I))
+      return false;
+    for (auto &op : I->operands())
+      if (auto OI = dyn_cast<Instruction>(op))
+        todo.push_back(OI);
+  }
+  return true;
+}
+
 void GradientUtils::branchToCorrespondingTarget(
     BasicBlock *ctx, IRBuilder<> &BuilderM,
     const std::map<BasicBlock *,
@@ -8354,13 +8379,17 @@ void GradientUtils::branchToCorrespondingTarget(
           if (!bi2)
             goto rnextpair;
 
+          // Replacing phis needs cond2 here, before any branch, so it is also
+          // computed on the path to uniqueTargets[0], where the forward pass
+          // never ran `subblock`. Split on it only if that is safe; otherwise
+          // fall back to caching which edge was taken.
+          if (replacePHIs != nullptr &&
+              !safeToRecomputeOnAllPaths(getBranchCondition(bi2), ctx, DT))
+            goto rnextpair;
+
           // Condition cond1 splits off uniqueTargets[0] from
           // the remainder of foundTargets.
           auto cond1 = lookupM(getBranchCondition(bi1), BuilderM);
-
-          // Condition cond2 splits off the two blocks in
-          // (foundTargets-uniqueTargets) from each other.
-          auto cond2 = lookupM(getBranchCondition(bi2), BuilderM);
 
           if (replacePHIs == nullptr) {
             BasicBlock *staging =
@@ -8374,14 +8403,35 @@ void GradientUtils::branchToCorrespondingTarget(
                 return staging;
               }
             };
+            // Only the forward paths into the two merged targets ran
+            // `subblock`, so cond2 is only computed on those paths. Look it up
+            // in `staging`, which only they reach: before the branch on cond1
+            // it would also be recomputed on the path to uniqueTargets[0],
+            // from values the forward pass never computed there, and a
+            // recomputed call can throw on them (Julia's `sqrt` does for a
+            // negative argument).
+            BasicBlock *current = BuilderM.GetInsertBlock();
+            auto found = reverseBlockToPrimal.find(current);
+            if (found != reverseBlockToPrimal.end())
+              reverseBlockToPrimal[staging] = found->second;
+            for (auto pair : unwrap_cache[current])
+              unwrap_cache[staging].insert(pair);
+            for (auto pair : lookup_cache[current])
+              lookup_cache[staging].insert(pair);
             BuilderM.CreateCondBr(cond1, stagingIfNeeded(bi1->getSuccessor(0)),
                                   stagingIfNeeded(bi1->getSuccessor(1)));
             BuilderM.SetInsertPoint(staging);
+            // Condition cond2 splits off the two blocks in
+            // (foundTargets-uniqueTargets) from each other.
+            auto cond2 = lookupM(getBranchCondition(bi2), BuilderM);
             BuilderM.CreateCondBr(
                 cond2,
                 *done[std::make_pair(subblock, bi2->getSuccessor(0))].begin(),
                 *done[std::make_pair(subblock, bi2->getSuccessor(1))].begin());
           } else {
+            // Condition cond2 splits off the two blocks in
+            // (foundTargets-uniqueTargets) from each other.
+            auto cond2 = lookupM(getBranchCondition(bi2), BuilderM);
             Value *otherBranch = nullptr;
             for (unsigned i = 0; i < 2; ++i) {
               Value *val = cond1;
