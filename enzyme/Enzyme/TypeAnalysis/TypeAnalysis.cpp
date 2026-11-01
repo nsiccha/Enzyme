@@ -24,6 +24,7 @@
 //===----------------------------------------------------------------------===//
 #include <cstdint>
 #include <deque>
+#include <limits>
 
 #include <llvm/Config/llvm-config.h>
 
@@ -654,6 +655,13 @@ FnTypeInfo::knownIntegralValues(llvm::Value *val, const DominatorTree &DT,
       if (inset0.size() == 1 || inset1.size() == 1) {
         for (auto val0 : inset0) {
           for (auto val1 : inset1) {
+            // The sets hold values the operands may take, so a divisor's set
+            // can hold 0 although the program never divides by it (a loop
+            // variable starting at 0 under a guard). An sdiv yields no value
+            // for these operands, and evaluating them here would trap.
+            if (val1 == 0 ||
+                (val0 == std::numeric_limits<int64_t>::min() && val1 == -1))
+              continue;
             insert(val0 / val1);
           }
         }
