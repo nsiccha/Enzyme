@@ -5256,18 +5256,24 @@ public:
     // classification tries to duplicate inactive allocations (or interpret the
     // native address as a derivative-function structure).
     if (foreignFunction && gutils->isConstantValue(call.getCalledOperand())) {
-      IRBuilder<> Builder2(&call);
-      if (Mode == DerivativeMode::ReverseModeGradient ||
-          Mode == DerivativeMode::ReverseModeCombined)
-        getReverseBuilder(Builder2);
-      else
-        getForwardBuilder(Builder2);
-      std::string str;
-      raw_string_ostream ss(str);
-      ss << "No derivative available for indirect call through an inactive "
-            "function pointer: "
-         << call;
-      EmitNoDerivativeError(ss.str(), call, gutils, Builder2);
+      // The augmented primal must follow the original control flow. An error
+      // about a missing reverse derivative belongs in the reverse pass: raising
+      // it here can activate a primal exception handler and silently return the
+      // derivative of that handler instead of diagnosing the original call.
+      if (Mode != DerivativeMode::ReverseModePrimal) {
+        IRBuilder<> Builder2(&call);
+        if (Mode == DerivativeMode::ReverseModeGradient ||
+            Mode == DerivativeMode::ReverseModeCombined)
+          getReverseBuilder(Builder2);
+        else
+          getForwardBuilder(Builder2);
+        std::string str;
+        raw_string_ostream ss(str);
+        ss << "No derivative available for indirect call through an inactive "
+              "function pointer: "
+           << call;
+        EmitNoDerivativeError(ss.str(), call, gutils, Builder2);
+      }
       auto found = gutils->invertedPointers.find(&call);
       if (found != gutils->invertedPointers.end()) {
         auto placeholder = cast<PHINode>(&*found->second);
