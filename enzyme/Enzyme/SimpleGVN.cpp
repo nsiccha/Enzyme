@@ -297,8 +297,11 @@ collectMemoryOps(Value *Arg, const DataLayout &DL,
         // Casts don't change offset
         ToProcess.push_back({CI, CurrentOffset});
       } else if (auto *Call = dyn_cast<CallInst>(Usr)) {
-        // Get the argument index from the Use
-        unsigned ArgIdx = U.getOperandNo();
+        // Callee and operand-bundle uses are not argument uses. In particular,
+        // querying a parameter attribute for the callee is out of bounds.
+        if (!Call->isArgOperand(&U))
+          return false;
+        unsigned ArgIdx = Call->getArgOperandNo(&U);
         if (isNoCapture(Call, ArgIdx)) {
           Calls.push_back({Call, CurrentOffset});
         } else {
