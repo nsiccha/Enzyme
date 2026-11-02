@@ -1,4 +1,4 @@
-; RUN: %opt < %s %newLoadEnzyme -enzyme-preopt=false -enzyme-runtime-error -passes="enzyme,function(mem2reg,simplifycfg)" -S | FileCheck %s
+; RUN: %opt < %s %OPnewLoadEnzyme -enzyme-preopt=false -enzyme-runtime-error -passes="enzyme,function(mem2reg,simplifycfg)" -S | FileCheck %s
 
 ; A constant function pointer can consume an active scalar or active memory.
 ; It has no shadow function with Enzyme's indirect derivative ABI. Diagnose

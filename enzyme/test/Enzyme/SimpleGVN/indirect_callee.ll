@@ -1,4 +1,4 @@
-; RUN: %opt < %s %newLoadEnzyme -passes="simple-gvn" -S | FileCheck %s
+; RUN: %opt < %s %OPnewLoadEnzyme -passes="simple-gvn" -S | FileCheck %s
 
 ; The callee is a use of a pointer, but not a parameter of the call.
 define double @indirect(ptr %fn, double %x) {
