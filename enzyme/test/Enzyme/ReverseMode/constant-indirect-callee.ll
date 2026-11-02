@@ -47,6 +47,28 @@ define double @local_input(ptr %fn, double %x) {
   ret double %r
 }
 
+define double @reused_buffer(ptr %fn, double %x, ptr %y) {
+  %out = alloca double
+  store double 0.0, ptr %out
+  %s1 = call i32 %fn(ptr %y, ptr %out) nounwind nofree
+  %s2 = call i32 %fn(ptr %y, ptr %out) nounwind nofree
+  %r = load double, ptr %out
+  %xx = fmul double %x, %x
+  %result = fadd double %xx, %r
+  ret double %result
+}
+
+define double @shared_active_buffer(ptr %fn, double %x, ptr %y) {
+  %input = alloca double
+  store double %x, ptr %input
+  %out = alloca double
+  store double 0.0, ptr %out
+  %s1 = call i32 %fn(ptr %y, ptr %out) nounwind nofree
+  %s2 = call i32 %fn(ptr %input, ptr %out) nounwind nofree
+  %r = load double, ptr %out
+  ret double %r
+}
+
 declare double @__enzyme_autodiff(...)
 declare double @__enzyme_fwddiff(...)
 declare { ptr, double } @__enzyme_augmentfwd(...)
@@ -91,6 +113,21 @@ define double @reverse_local_input(ptr %fn, double %x) {
   ret double %r
 }
 
+define double @reverse_reused_buffer(ptr %fn, double %x, ptr %y) {
+  %r = call double (...) @__enzyme_autodiff(ptr @reused_buffer, metadata !"enzyme_const", ptr %fn, double %x, metadata !"enzyme_const", ptr %y)
+  ret double %r
+}
+
+define double @forward_reused_buffer(ptr %fn, double %x, double %dx, ptr %y) {
+  %r = call double (...) @__enzyme_fwddiff(ptr @reused_buffer, metadata !"enzyme_const", ptr %fn, double %x, double %dx, metadata !"enzyme_const", ptr %y)
+  ret double %r
+}
+
+define double @reverse_shared_active_buffer(ptr %fn, double %x, ptr %y) {
+  %r = call double (...) @__enzyme_autodiff(ptr @shared_active_buffer, metadata !"enzyme_const", ptr %fn, double %x, metadata !"enzyme_const", ptr %y)
+  ret double %r
+}
+
 ; CHECK: No derivative available for indirect call through an inactive function pointer
 ; CHECK-LABEL: define internal {{.*}} @diffescalar(
 ; CHECK: call void @exit(i32 1)
@@ -115,4 +152,16 @@ define double @reverse_local_input(ptr %fn, double %x) {
 ; CHECK-NOT: @exit
 ; CHECK: ret
 ; CHECK-LABEL: define internal {{.*}} @diffelocal_input(
+; CHECK: call void @exit(i32 1)
+; CHECK-LABEL: define internal {{.*}} @differeused_buffer(
+; CHECK-NOT: @exit
+; CHECK: call i32 %fn(
+; CHECK-NOT: @exit
+; CHECK: ret
+; CHECK-LABEL: define internal {{.*}} @fwddiffereused_buffer(
+; CHECK-NOT: @exit
+; CHECK: call i32 %fn(
+; CHECK-NOT: @exit
+; CHECK: ret
+; CHECK-LABEL: define internal {{.*}} @diffeshared_active_buffer(
 ; CHECK: call void @exit(i32 1)

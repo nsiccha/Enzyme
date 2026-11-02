@@ -2688,11 +2688,12 @@ bool ActivityAnalyzer::isLocalMemoryInactiveForCall(TypeResults const &TR,
   if (!isa<AllocaInst>(base) && !isAllocationCall(base, TLI))
     return false;
 
-  // The call may read and write its local buffers. Prove that no other use
+  // Calls may share local buffers. Prove that none of their inputs or stores
   // supplies active data, without assuming the buffers themselves inactive:
   // that would incorrectly discard an active value stored into an input Ref.
   SmallVector<Value *, 8> todo = {base};
   SmallPtrSet<Value *, 8> seen;
+  SmallPtrSet<CallInst *, 8> calls = {call};
   while (!todo.empty()) {
     Value *ptr = todo.pop_back_val();
     if (!seen.insert(ptr).second)
@@ -2721,7 +2722,25 @@ bool ActivityAnalyzer::isLocalMemoryInactiveForCall(TypeResults const &TR,
             isa<DbgInfoIntrinsic>(intrinsic))
           continue;
       }
-      // Other calls, escapes, and writes require their own activity proof.
+      if (auto other = dyn_cast<CallInst>(user)) {
+        if (!calls.insert(other).second)
+          continue;
+        if (getFunctionFromCall(other) ||
+            !isConstantValue(TR, other->getCalledOperand()) ||
+            (EnzymeGlobalActivity && !other->onlyAccessesArgMemory() &&
+             !other->doesNotAccessMemory()))
+          return false;
+        for (Value *arg : other->args()) {
+          Value *argBase = getBaseObject(arg);
+          if (isa<AllocaInst>(argBase) || isAllocationCall(argBase, TLI)) {
+            todo.push_back(argBase);
+          } else if (!isConstantValue(TR, arg)) {
+            return false;
+          }
+        }
+        continue;
+      }
+      // Escapes and other writes require their own activity proof.
       return false;
     }
   }
