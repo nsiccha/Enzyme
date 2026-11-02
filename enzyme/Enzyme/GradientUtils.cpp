@@ -8952,6 +8952,22 @@ void GradientUtils::computeMinCache() {
         continue;
       bool multiLevel = DifferentialUseAnalysis::is_value_needed_in_reverse<
           QueryType::Primal>(this, V, minCutMode, FullSeen, notForAnalysis);
+      // A cycle through a rematerialized allocation and its stores can leave
+      // provisional false entries in FullSeen. Recheck the allocation without
+      // those entries so required loads and their pointer operands remain
+      // connected to the stored values in the cache graph. Only true results
+      // are independent of the recursion's starting point.
+      if (!multiLevel && rematerializableAllocations.count(V)) {
+        std::map<UsageKey, bool> RematSeen;
+        for (auto &entry : FullSeen)
+          if (entry.second)
+            RematSeen.insert(entry);
+        multiLevel = DifferentialUseAnalysis::is_value_needed_in_reverse<
+            QueryType::Primal>(this, V, minCutMode, RematSeen, notForAnalysis);
+        for (auto &entry : RematSeen)
+          if (entry.second)
+            FullSeen[entry.first] = true;
+      }
       if (!multiLevel) {
         continue;
       }
