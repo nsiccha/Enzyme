@@ -5251,6 +5251,37 @@ public:
 
     bool foreignFunction = called == nullptr;
 
+    // An indirect derivative call uses a shadow function and its fixed ABI.
+    // A constant native pointer has no such shadow. Diagnose it before argument
+    // classification tries to duplicate inactive allocations (or interpret the
+    // native address as a derivative-function structure).
+    if (foreignFunction && gutils->isConstantValue(call.getCalledOperand())) {
+      IRBuilder<> Builder2(&call);
+      if (Mode == DerivativeMode::ReverseModeGradient ||
+          Mode == DerivativeMode::ReverseModeCombined)
+        getReverseBuilder(Builder2);
+      else
+        getForwardBuilder(Builder2);
+      std::string str;
+      raw_string_ostream ss(str);
+      ss << "No derivative available for indirect call through an inactive "
+            "function pointer: "
+         << call;
+      EmitNoDerivativeError(ss.str(), call, gutils, Builder2);
+      auto found = gutils->invertedPointers.find(&call);
+      if (found != gutils->invertedPointers.end()) {
+        auto placeholder = cast<PHINode>(&*found->second);
+        gutils->invertedPointers.erase(found);
+        gutils->replaceAWithB(
+            placeholder, UndefValue::get(placeholder->getType()));
+        gutils->erase(placeholder);
+      }
+      if (Mode == DerivativeMode::ReverseModeGradient ||
+          Mode == DerivativeMode::ForwardModeSplit)
+        eraseIfUnused(call, /*erase*/ true, /*check*/ false);
+      return;
+    }
+
     FnTypeInfo nextTypeInfo(called);
 
     if (called) {

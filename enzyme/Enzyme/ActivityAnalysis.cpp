@@ -2843,12 +2843,9 @@ bool ActivityAnalyzer::isInstructionInactiveFromOrigin(TypeResults const &TR,
                      << *inst << "\n";
       return true;
     }
-    if (!isa<Constant>(callVal) && isConstantValue(TR, callVal)) {
-      if (EnzymePrintActivity)
-        llvm::errs() << "constant(" << (int)directions << ") up-constfn "
-                     << *inst << " - " << *callVal << "\n";
-      return true;
-    }
+    // An inactive function pointer does not make the call inactive: active
+    // arguments can still flow through it. The argument analysis below decides
+    // activity; derivative generation diagnoses a missing function shadow.
   }
   // Intrinsics known always to be inactive
   if (auto II = dyn_cast<IntrinsicInst>(inst)) {
