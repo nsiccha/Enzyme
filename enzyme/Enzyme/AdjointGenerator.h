@@ -5272,8 +5272,8 @@ public:
       if (found != gutils->invertedPointers.end()) {
         auto placeholder = cast<PHINode>(&*found->second);
         gutils->invertedPointers.erase(found);
-        gutils->replaceAWithB(
-            placeholder, UndefValue::get(placeholder->getType()));
+        gutils->replaceAWithB(placeholder,
+                              UndefValue::get(placeholder->getType()));
         gutils->erase(placeholder);
       }
       if (Mode == DerivativeMode::ReverseModeGradient ||
