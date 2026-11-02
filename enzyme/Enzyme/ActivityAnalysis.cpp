@@ -2818,8 +2818,6 @@ bool ActivityAnalyzer::isInstructionInactiveFromOrigin(TypeResults const &TR,
       return true;
     }
     // Calls to print/assert/cxa guard are definitionally inactive
-    llvm::Value *callVal;
-    callVal = op->getCalledOperand();
     StringRef funcName = getFuncNameFromCall(op);
     auto called = getFunctionFromCall(op);
 
