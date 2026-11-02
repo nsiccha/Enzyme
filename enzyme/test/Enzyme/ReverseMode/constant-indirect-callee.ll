@@ -104,6 +104,11 @@ define double @reverse_local_input(ptr %fn, double %x) {
 ; CHECK-NOT: @exit
 ; CHECK: fmul fast double {{.*}}, %x
 ; CHECK: ret
+; CHECK-LABEL: define internal {{.*}} @augmented_buffer(
+; CHECK-NOT: @exit
+; CHECK: call i32 %fn(
+; CHECK-NOT: @exit
+; CHECK: ret
 ; CHECK-LABEL: define internal {{.*}} @diffeinactive_buffer(
 ; CHECK-NOT: @exit
 ; CHECK: call i32 %fn(
@@ -111,8 +116,3 @@ define double @reverse_local_input(ptr %fn, double %x) {
 ; CHECK: ret
 ; CHECK-LABEL: define internal {{.*}} @diffelocal_input(
 ; CHECK: call void @exit(i32 1)
-; CHECK-LABEL: define internal {{.*}} @augmented_buffer(
-; CHECK-NOT: @exit
-; CHECK: call i32 %fn(
-; CHECK-NOT: @exit
-; CHECK: ret
