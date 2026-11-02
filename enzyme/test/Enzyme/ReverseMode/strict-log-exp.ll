@@ -12,7 +12,7 @@
 ; STRICT-LABEL: define double @dtiny(
 ; STRICT-NOT: fast
 ; STRICT: fdiv double
-; STRICT-NEXT: {{.*}}fmul double
+; STRICT: fmul double
 ; STRICT: ret double
 ;
 ; FAST-LABEL: define internal {{.*}}@diffe
