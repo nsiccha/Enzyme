@@ -29,6 +29,7 @@ define double @inactive(ptr %fn, double %x, double %y) {
 
 declare double @__enzyme_autodiff(...)
 declare double @__enzyme_fwddiff(...)
+declare { ptr, double } @__enzyme_augmentfwd(...)
 
 define double @reverse_scalar(ptr %fn, double %x) {
   %r = call double (...) @__enzyme_autodiff(ptr @scalar, metadata !"enzyme_const", ptr %fn, double %x)
@@ -55,6 +56,11 @@ define double @reverse_inactive(ptr %fn, double %x, double %y) {
   ret double %r
 }
 
+define { ptr, double } @augment_buffer(ptr %fn, ptr %x, ptr %dx) {
+  %result = call { ptr, double } (...) @__enzyme_augmentfwd(ptr @buffer, metadata !"enzyme_const", ptr %fn, ptr %x, ptr %dx)
+  ret { ptr, double } %result
+}
+
 ; CHECK: No derivative available for indirect call through an inactive function pointer
 ; CHECK-LABEL: define internal {{.*}} @diffescalar(
 ; CHECK: call void @exit(i32 1)
@@ -67,4 +73,9 @@ define double @reverse_inactive(ptr %fn, double %x, double %y) {
 ; CHECK-LABEL: define internal {{.*}} @diffeinactive(
 ; CHECK-NOT: @exit
 ; CHECK: fmul fast double {{.*}}, %x
+; CHECK: ret
+; CHECK-LABEL: define internal {{.*}} @augmented_buffer(
+; CHECK-NOT: @exit
+; CHECK: call i32 %fn(
+; CHECK-NOT: @exit
 ; CHECK: ret
