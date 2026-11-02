@@ -90,6 +90,15 @@ if int(config.llvm_ver) == 16:
   newPM += " -opaque-pointers=0"
   oldPM += " -opaque-pointers=0"
 
+# Most existing IR checks describe the historical fast-math derivative mode.
+# Request that mode explicitly; default-mode regressions use the unmodified
+# loader so they also check the command-line option's default value.
+config.substitutions.append(('%defaultLoadEnzyme', newPM))
+oldPM += " -enzyme-fast-math=true"
+newPM += " -enzyme-fast-math=true"
+oldPMOP += " -enzyme-fast-math=true"
+newPMOP += " -enzyme-fast-math=true"
+
 config.substitutions.append(('%loadEnzyme', oldPM if int(config.llvm_ver) < 16 else newPM))
 config.substitutions.append(('%newLoadEnzyme', newPM))
 config.substitutions.append(('%OPloadEnzyme', oldPMOP if int(config.llvm_ver) < 16 else newPMOP))
