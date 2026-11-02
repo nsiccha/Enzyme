@@ -27,6 +27,26 @@ define double @inactive(ptr %fn, double %x, double %y) {
   ret double %result
 }
 
+define double @inactive_buffer(ptr %fn, double %x, ptr %y) {
+  %out = alloca double
+  store double 0.0, ptr %out
+  %status = call i32 %fn(ptr %y, ptr %out) nounwind nofree
+  %r = load double, ptr %out
+  %xx = fmul double %x, %x
+  %result = fadd double %xx, %r
+  ret double %result
+}
+
+define double @local_input(ptr %fn, double %x) {
+  %input = alloca double
+  store double %x, ptr %input
+  %out = alloca double
+  store double 0.0, ptr %out
+  %status = call i32 %fn(ptr %input, ptr %out) nounwind nofree
+  %r = load double, ptr %out
+  ret double %r
+}
+
 declare double @__enzyme_autodiff(...)
 declare double @__enzyme_fwddiff(...)
 declare { ptr, double } @__enzyme_augmentfwd(...)
@@ -61,6 +81,16 @@ define { ptr, double } @augment_buffer(ptr %fn, ptr %x, ptr %dx) {
   ret { ptr, double } %result
 }
 
+define double @reverse_inactive_buffer(ptr %fn, double %x, ptr %y) {
+  %r = call double (...) @__enzyme_autodiff(ptr @inactive_buffer, metadata !"enzyme_const", ptr %fn, double %x, metadata !"enzyme_const", ptr %y)
+  ret double %r
+}
+
+define double @reverse_local_input(ptr %fn, double %x) {
+  %r = call double (...) @__enzyme_autodiff(ptr @local_input, metadata !"enzyme_const", ptr %fn, double %x)
+  ret double %r
+}
+
 ; CHECK: No derivative available for indirect call through an inactive function pointer
 ; CHECK-LABEL: define internal {{.*}} @diffescalar(
 ; CHECK: call void @exit(i32 1)
@@ -74,6 +104,13 @@ define { ptr, double } @augment_buffer(ptr %fn, ptr %x, ptr %dx) {
 ; CHECK-NOT: @exit
 ; CHECK: fmul fast double {{.*}}, %x
 ; CHECK: ret
+; CHECK-LABEL: define internal {{.*}} @diffeinactive_buffer(
+; CHECK-NOT: @exit
+; CHECK: call i32 %fn(
+; CHECK-NOT: @exit
+; CHECK: ret
+; CHECK-LABEL: define internal {{.*}} @diffelocal_input(
+; CHECK: call void @exit(i32 1)
 ; CHECK-LABEL: define internal {{.*}} @augmented_buffer(
 ; CHECK-NOT: @exit
 ; CHECK: call i32 %fn(

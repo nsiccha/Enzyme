@@ -2681,6 +2681,53 @@ bool ActivityAnalyzer::isConstantValue(TypeResults const &TR, Value *Val) {
   return false;
 }
 
+bool ActivityAnalyzer::isLocalMemoryInactiveForCall(TypeResults const &TR,
+                                                    Value *val,
+                                                    CallInst *call) {
+  Value *base = getBaseObject(val);
+  if (!isa<AllocaInst>(base) && !isAllocationCall(base, TLI))
+    return false;
+
+  // The call may read and write its local buffers. Prove that no other use
+  // supplies active data, without assuming the buffers themselves inactive:
+  // that would incorrectly discard an active value stored into an input Ref.
+  SmallVector<Value *, 8> todo = {base};
+  SmallPtrSet<Value *, 8> seen;
+  while (!todo.empty()) {
+    Value *ptr = todo.pop_back_val();
+    if (!seen.insert(ptr).second)
+      continue;
+    for (auto &use : ptr->uses()) {
+      auto user = use.getUser();
+      if (user == call)
+        continue;
+      if (auto load = dyn_cast<LoadInst>(user)) {
+        if (load->getPointerOperand() == ptr)
+          continue;
+      }
+      if (auto store = dyn_cast<StoreInst>(user)) {
+        if (store->getPointerOperand() == ptr &&
+            isConstantValue(TR, store->getValueOperand()))
+          continue;
+        return false;
+      }
+      if (isa<GetElementPtrInst>(user) || isa<BitCastInst>(user) ||
+          isa<AddrSpaceCastInst>(user)) {
+        todo.push_back(cast<Value>(user));
+        continue;
+      }
+      if (auto intrinsic = dyn_cast<IntrinsicInst>(user)) {
+        if (intrinsic->isLifetimeStartOrEnd() ||
+            isa<DbgInfoIntrinsic>(intrinsic))
+          continue;
+      }
+      // Other calls, escapes, and writes require their own activity proof.
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Is the instruction guaranteed to be inactive because of its operands
 bool ActivityAnalyzer::isInstructionInactiveFromOrigin(TypeResults const &TR,
                                                        llvm::Value *val,
@@ -2872,9 +2919,12 @@ bool ActivityAnalyzer::isInstructionInactiveFromOrigin(TypeResults const &TR,
     return false;
   } else if (auto ci = dyn_cast<CallInst>(inst)) {
     bool seenuse = false;
+    bool inactiveCallee =
+        !getFunctionFromCall(ci) && isConstantValue(TR, ci->getCalledOperand());
 
     propagateArgumentInformation(TLI, *ci, [&](Value *a) {
-      if (!isConstantValue(TR, a)) {
+      if (!isConstantValue(TR, a) &&
+          !(inactiveCallee && isLocalMemoryInactiveForCall(TR, a, ci))) {
         seenuse = true;
         if (EnzymePrintActivity)
           llvm::errs() << "nonconstant(" << (int)directions << ")  up-call "

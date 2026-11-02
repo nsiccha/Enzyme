@@ -229,6 +229,10 @@ private:
   bool isInstructionInactiveFromOrigin(TypeResults const &TR, llvm::Value *val,
                                        bool considerValue);
 
+  /// Can a local buffer passed to this call receive active data elsewhere?
+  bool isLocalMemoryInactiveForCall(TypeResults const &TR, llvm::Value *val,
+                                    llvm::CallInst *call);
+
 public:
   enum class UseActivity {
     // No Additional use activity info
