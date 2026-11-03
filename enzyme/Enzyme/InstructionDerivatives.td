@@ -1213,12 +1213,19 @@ def : BinopPattern<(Op $x, $y), "FMul", 0, 0,
                     ],
                     (ForwardFromSummedReverse)
                   >;
+// The tangent of x / y is (dx - (dy / y) * x) / y. (dx * y - dy * x) / (y * y) would
+// form y * y, which underflows to zero for |y| < 1.5e-154 (and overflows for
+// |y| > 1.3e154), so a representable tangent came out Inf or NaN, and each nested
+// derivative through a division squared the divisor once more. dy / y is the relative
+// tangent of y, which stays in range however tiny or huge y is, and is exactly zero
+// when dy is, so unlike dy * (x / y) it stays right when the primal quotient overflows
+// or underflows.
 def : BinopPattern<(Op $x, $y), "FDiv", 0, 0,
                     [
                       (CheckedDiv (DiffeRet), $y),
                       (FNeg (CheckedMul (CheckedDiv (DiffeRet), $y), (FDiv $x, $y)))
                     ],
-                    (CheckedDiv (FSub (SelectIfActive $x, (FMul (Shadow $x), $y), (Zero $x)), (SelectIfActive $y, (FMul (Shadow $y), $x), (Zero $y))), (FMul $y, $y))
+                    (CheckedDiv (FSub (SelectIfActive $x, (Shadow $x), (Zero $x)), (SelectIfActive $y, (CheckedMul (CheckedDiv (Shadow $y), $y), $x), (Zero $y))), $y)
                   >;
 
 def : BinopPattern<(Op $x, $y), "FRem", 0, 0,
