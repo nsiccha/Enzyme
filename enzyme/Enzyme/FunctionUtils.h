@@ -75,6 +75,18 @@ extern llvm::cl::opt<bool> EnzymeAlwaysInlineDiff;
 // an error, or write to inaccesible memory.
 bool DetectReadonlyOrThrow(llvm::Module &M);
 
+/// Whether F, outside paths that throw, writes only memory that did not exist
+/// before the call (as an enzyme_LocalReadOnlyOrThrow function may) and
+/// storage owned by its pointer arguments: through a pointer loaded at a
+/// constant offset from an argument, as Julia writes an array argument's
+/// elements. Those (argument number, offset) pairs are returned in writes. F
+/// itself never writes its arguments' own memory, so the pointers it loads
+/// from them are the ones its caller passed; whether the storage they name
+/// existed before the call is for that caller to show.
+bool getArgumentOwnedStorageWrites(
+    llvm::Function &F, llvm::TargetLibraryInfo &TLI,
+    llvm::SmallVectorImpl<std::pair<unsigned, int64_t>> &writes);
+
 class PreProcessCache {
 public:
   PreProcessCache();

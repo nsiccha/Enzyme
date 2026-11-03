@@ -96,6 +96,9 @@
 
 using namespace llvm;
 
+// Enzyme.cpp: whether read-only-or-throw inference runs.
+extern llvm::cl::opt<bool> EnzymeDetectReadThrow;
+
 extern "C" {
 llvm::cl::opt<bool>
     EnzymePrint("enzyme-print", cl::init(false), cl::Hidden,
@@ -241,44 +244,71 @@ struct CacheAnalysis {
     if (auto fresh = dyn_cast<CallInst>(obj))
       return OrigDT.dominates(callsite, fresh) && isNoAlias(fresh);
     auto ld = dyn_cast<LoadInst>(obj);
-    if (!ld || !ld->isSimple() || !ld->getType()->isPointerTy())
+    if (!ld)
       return false;
-    const auto &DL = I->getModule()->getDataLayout();
-    int64_t offset = 0;
-    auto base =
-        GetPointerBaseWithConstantOffset(ld->getPointerOperand(), offset, DL);
-    // The header may come from a merge of allocations made on different
-    // paths, as Julia allocates a broadcast's output on each of its branches.
-    // Every incoming header must then be such an allocation.
-    SmallVector<Value *, 2> headers;
-    if (auto PN = dyn_cast<PHINode>(base)) {
-      for (auto &V : PN->incoming_values())
-        headers.push_back(V->stripPointerCasts());
-    } else if (auto SI = dyn_cast<SelectInst>(base)) {
-      headers.push_back(SI->getTrueValue()->stripPointerCasts());
-      headers.push_back(SI->getFalseValue()->stripPointerCasts());
-    } else {
-      headers.push_back(base);
-    }
-    for (auto header : headers) {
-      auto alloc = dyn_cast<CallInst>(header);
-      if (!alloc || !OrigDT.dominates(callsite, alloc) || !isNoAlias(alloc))
+    SmallVector<CallInst *, 2> allocs;
+    if (!getFreshPointerAllocations(ld, allocs))
+      return false;
+    for (auto alloc : allocs)
+      if (!OrigDT.dominates(callsite, alloc))
         return false;
-      auto F = alloc->getCalledFunction();
-      if (!F || !F->hasFnAttribute("enzyme_fresh_pointer"))
-        return false;
-      int64_t field;
-      if (F->getFnAttribute("enzyme_fresh_pointer")
-              .getValueAsString()
-              .getAsInteger(10, field) ||
-          field < 0 || field != offset)
-        return false;
+    for (auto alloc : allocs)
       // The cache is keyed by the load alone, which holds only while the
       // load has a single base allocation.
       if (isAllocWrittenBeforeLoad(
               OrigLI, AA, TLI, alloc, ld,
-              headers.size() == 1 ? &allocWrittenBeforeLoad : nullptr))
+              allocs.size() == 1 ? &allocWrittenBeforeLoad : nullptr))
         return false;
+    return true;
+  }
+
+  // getArgumentOwnedStorageWrites per callee: whether the query succeeded,
+  // and the (argument, offset) pairs it returned.
+  DenseMap<Function *,
+           std::pair<bool, SmallVector<std::pair<unsigned, int64_t>, 2>>>
+      argumentOwnedWrites;
+
+  // Whether call writes only memory created during it and storage owned by
+  // arguments that are allocations made after callsite, such as Julia's
+  // _mapreducedim! filling the result array that reducedim_initarray just
+  // returned. Each such argument must be a fresh allocation the callsite
+  // dominates (getFreshPointerHeaderAllocations) whose fresh field, the one
+  // the callee writes through, is unchanged up to the call. That storage did
+  // not exist when the callsite read its operands. As in
+  // writesToNewOwnedStorage, the callsite must be outside loops. This reads
+  // the callee's body like read-only-or-throw inference
+  // (DetectReadonlyOrThrowFn), so -enzyme-detect-readthrow=0 disables it too.
+  bool writesOnlyStorageOfNewArguments(CallBase *call, CallInst *callsite) {
+    if (!EnzymeDetectReadThrow)
+      return false;
+    if (OrigLI.getLoopFor(callsite->getParent()))
+      return false;
+    auto Callee = call->getCalledFunction();
+    if (!Callee || Callee->empty() ||
+        Callee->getCallingConv() != call->getCallingConv() ||
+        hasSretLikeArgument(call))
+      return false;
+    auto found = argumentOwnedWrites.find(Callee);
+    if (found == argumentOwnedWrites.end()) {
+      SmallVector<std::pair<unsigned, int64_t>, 2> writes;
+      bool ok = getArgumentOwnedStorageWrites(*Callee, TLI, writes);
+      found =
+          argumentOwnedWrites.try_emplace(Callee, ok, std::move(writes)).first;
+    }
+    if (!found->second.first)
+      return false;
+    for (auto &write : found->second.second) {
+      if (write.first >= call->arg_size())
+        return false;
+      SmallVector<CallInst *, 2> allocs;
+      if (!getFreshPointerHeaderAllocations(call->getArgOperand(write.first),
+                                            write.second, allocs))
+        return false;
+      for (auto alloc : allocs)
+        if (!OrigDT.dominates(callsite, alloc) ||
+            isFreshPointerFieldWrittenBefore(OrigLI, AA, alloc, write.second,
+                                             call))
+          return false;
     }
     return true;
   }
@@ -741,7 +771,8 @@ struct CacheAnalysis {
       // existing memory; such a call is handled below like any other write.
       if (auto CB = dyn_cast<CallBase>(inst2))
         if (isReadOnlyOrThrow(CB) ||
-            (isLocalReadOnlyOrThrow(CB) && !hasSretLikeArgument(CB)))
+            (isLocalReadOnlyOrThrow(CB) && !hasSretLikeArgument(CB)) ||
+            writesOnlyStorageOfNewArguments(CB, callsite_op))
           return false;
 
       if (writesToNewOwnedStorage(inst2, callsite_op))
@@ -1935,6 +1966,9 @@ void clearFunctionAttributes(Function *f) {
       "enzyme_ta_norecur",
       "enzyme_ReadOnlyOrThrow",
       "enzyme_LocalReadOnlyOrThrow",
+      // DetectReadonlyOrThrow may infer it for a function returning a fresh
+      // allocation; a derivative returns other values.
+      "enzyme_fresh_pointer",
   };
 
   for (auto attr : strfnattrs) {

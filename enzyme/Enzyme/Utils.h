@@ -1232,6 +1232,38 @@ bool isAllocWrittenBeforeLoad(llvm::LoopInfo &LI, llvm::AAResults &AA,
                               llvm::Instruction *alloc_call, llvm::LoadInst *ld,
                               AllocWrittenBeforeLoadCache *cache);
 
+/// An allocator may initialize a field of the object it returns with a pointer
+/// to fresh storage the object owns; its enzyme_fresh_pointer attribute gives
+/// that field's byte offset. Whether ld loads such a field: its pointer is a
+/// constant offset from a header that is a noalias call to such an allocator
+/// declaring that offset, or a phi or select merging only such calls (Julia
+/// allocates a broadcast's output on each of its branches). On success the
+/// allocations are appended to allocs. That the field still holds the
+/// allocator's pointer at ld is a separate question, which
+/// isAllocWrittenBeforeLoad answers for each allocation.
+bool getFreshPointerAllocations(
+    llvm::LoadInst *ld, llvm::SmallVectorImpl<llvm::CallInst *> &allocs);
+
+/// Whether alloc is a noalias call to an allocator declaring a fresh field
+/// (enzyme_fresh_pointer); field receives that field's byte offset.
+bool getFreshPointerField(llvm::CallInst *alloc, int64_t &field);
+
+/// Whether header, with pointer casts stripped, is a noalias call to an
+/// allocator declaring offset as its fresh field, or a phi or select merging
+/// only such calls (see getFreshPointerAllocations). On success the
+/// allocations are appended to allocs.
+bool getFreshPointerHeaderAllocations(
+    llvm::Value *header, int64_t offset,
+    llvm::SmallVectorImpl<llvm::CallInst *> &allocs);
+
+/// Whether an instruction between alloc, a call getFreshPointerField accepts,
+/// and before (exclusive) may change the pointer in alloc's fresh field. A
+/// write through that pointer does not: it writes the storage the field names,
+/// not the field.
+bool isFreshPointerFieldWrittenBefore(llvm::LoopInfo &LI, llvm::AAResults &AA,
+                                      llvm::CallInst *alloc, int64_t offset,
+                                      llvm::Instruction *before);
+
 // A more advanced version of writesToMemoryReadBy, where the writing
 // instruction comes after the reading function. Specifically, even if the two
 // instructions may access the same location, this variant checks whether

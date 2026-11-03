@@ -4891,6 +4891,98 @@ bool isAllocWrittenBeforeLoad(LoopInfo &LI, AAResults &AA,
   return alloc_written;
 }
 
+bool getFreshPointerField(CallInst *alloc, int64_t &field) {
+  if (!isNoAlias(alloc))
+    return false;
+  auto F = alloc->getCalledFunction();
+  if (!F || !F->hasFnAttribute("enzyme_fresh_pointer"))
+    return false;
+  return !F->getFnAttribute("enzyme_fresh_pointer")
+              .getValueAsString()
+              .getAsInteger(10, field) &&
+         field >= 0;
+}
+
+bool getFreshPointerHeaderAllocations(Value *header, int64_t offset,
+                                      SmallVectorImpl<CallInst *> &allocs) {
+  header = header->stripPointerCasts();
+  SmallVector<Value *, 2> headers;
+  if (auto PN = dyn_cast<PHINode>(header)) {
+    for (auto &V : PN->incoming_values())
+      headers.push_back(V->stripPointerCasts());
+  } else if (auto SI = dyn_cast<SelectInst>(header)) {
+    headers.push_back(SI->getTrueValue()->stripPointerCasts());
+    headers.push_back(SI->getFalseValue()->stripPointerCasts());
+  } else {
+    headers.push_back(header);
+  }
+  size_t start = allocs.size();
+  for (auto V : headers) {
+    auto alloc = dyn_cast<CallInst>(V);
+    int64_t field;
+    if (!alloc || !getFreshPointerField(alloc, field) || field != offset)
+      break;
+    allocs.push_back(alloc);
+  }
+  if (allocs.size() - start == headers.size())
+    return true;
+  allocs.resize(start);
+  return false;
+}
+
+bool getFreshPointerAllocations(LoadInst *ld,
+                                SmallVectorImpl<CallInst *> &allocs) {
+  if (!ld->isSimple() || !ld->getType()->isPointerTy())
+    return false;
+  const auto &DL = ld->getModule()->getDataLayout();
+  int64_t offset = 0;
+  auto base =
+      GetPointerBaseWithConstantOffset(ld->getPointerOperand(), offset, DL);
+  return getFreshPointerHeaderAllocations(base, offset, allocs);
+}
+
+bool isFreshPointerFieldWrittenBefore(LoopInfo &LI, AAResults &AA,
+                                      CallInst *alloc, int64_t offset,
+                                      Instruction *before) {
+  const auto &DL = alloc->getModule()->getDataLayout();
+  // The header from its start through the field: a superset of the field.
+  MemoryLocation field(
+      alloc, LocationSize::precise(
+                 offset + DL.getPointerSize(cast<PointerType>(alloc->getType())
+                                                ->getAddressSpace())));
+  bool written = false;
+  allInstructionsBetween(LI, alloc, before, [&](Instruction *I) -> bool {
+    if (I == before || !I->mayWriteToMemory())
+      return /*earlyBreak*/ false;
+    if (auto CB = dyn_cast<CallBase>(I))
+      if (isReadOnlyOrThrow(CB))
+        return /*earlyBreak*/ false;
+    // A write through a pointer loaded from this allocation's fresh field
+    // writes the storage the field names, which is separate from the header
+    // (Julia's inline array data follows the header fields): until some other
+    // write changes the field, which this walk checks, the field names that
+    // storage. A load through a merge of headers is left to alias analysis.
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(I))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(I))
+      ptr = MI->getRawDest();
+    if (ptr)
+      if (auto ld = dyn_cast<LoadInst>(getBaseObject(ptr))) {
+        SmallVector<CallInst *, 2> owners;
+        if (getFreshPointerAllocations(ld, owners) && owners.size() == 1 &&
+            owners[0] == alloc)
+          return /*earlyBreak*/ false;
+      }
+    if (isModSet(AA.getModRefInfo(I, field))) {
+      written = true;
+      return /*earlyBreak*/ true;
+    }
+    return /*earlyBreak*/ false;
+  });
+  return written;
+}
+
 // Return true if guaranteed not to alias
 // Return false if guaranteed to alias [with possible offset depending on flag].
 // Return {} if no information is given.
