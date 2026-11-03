@@ -3049,7 +3049,7 @@ bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
 
   if (loadPtr && storePtr)
     if (auto alias = arePointersGuaranteedNoAlias(TLI, AA, DT, LI, loadPtr,
-                                                  storePtr, true, cache))
+                                                  storePtr, true, cache, TR))
       if (*alias)
         return false;
 
@@ -4864,10 +4864,10 @@ bool notCaptured(llvm::Value *V, llvm::TargetLibraryInfo *TLI) {
 // Whether an instruction between alloc_call and ld may write memory that ld
 // reads. alloc_call is ld's base object, so the answer depends on ld alone and
 // is kept in cache when one is given.
-static bool isAllocWrittenBeforeLoad(LoopInfo &LI, AAResults &AA,
-                                     TargetLibraryInfo &TLI,
-                                     Instruction *alloc_call, LoadInst *ld,
-                                     AllocWrittenBeforeLoadCache *cache) {
+bool isAllocWrittenBeforeLoad(LoopInfo &LI, AAResults &AA,
+                              TargetLibraryInfo &TLI, Instruction *alloc_call,
+                              LoadInst *ld,
+                              AllocWrittenBeforeLoadCache *cache) {
   if (cache) {
     auto found = cache->find(ld);
     if (found != cache->end())
@@ -4903,7 +4903,8 @@ arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
                              llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                              llvm::Value *op0, llvm::Value *op1,
                              bool offsetAllowed,
-                             AllocWrittenBeforeLoadCache *cache) {
+                             AllocWrittenBeforeLoadCache *cache,
+                             const TypeResults *TR) {
   auto lhs = getBaseObject(op0, offsetAllowed);
   auto rhs = getBaseObject(op1, offsetAllowed);
 
@@ -5025,6 +5026,16 @@ arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
                                           /*includebin*/ true)) {
                 worklist.push_back(U);
               } else if (auto LI = dyn_cast<LoadInst>(U)) {
+                // Only values which may contain an address can expose the
+                // allocation's initialized pointers. Capturing an array size
+                // (for example in a bounds-error argument) does not expose its
+                // backing buffer. Use Enzyme's inferred type, not LLVM's value
+                // type: an integer load can carry a pointer through ptrtoint.
+                if (TR) {
+                  auto type = TR->query(LI)[{-1}];
+                  if (type == BaseType::Integer || type.isFloat())
+                    continue;
+                }
                 alloc_loads.push_back(LI);
               }
             }

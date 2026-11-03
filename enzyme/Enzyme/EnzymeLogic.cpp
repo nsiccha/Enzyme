@@ -196,6 +196,44 @@ struct CacheAnalysis {
         subsequent_calls_may_write(subsequent_calls_may_write),
         overwritten_args(overwritten_args), mode(mode), omp(omp) {}
 
+  // An allocator may initialize a field with a pointer to fresh owned storage.
+  // The attribute gives that field's byte offset. A later write through that
+  // pointer cannot overwrite data read by a call which preceded its creation.
+  // Restrict this proof to callsites outside loops: otherwise a later dynamic
+  // execution of the call could have seen the same allocation.
+  bool writesToNewOwnedStorage(Instruction *I, CallInst *callsite) {
+    if (OrigLI.getLoopFor(callsite->getParent()))
+      return false;
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(I))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(I))
+      ptr = MI->getRawDest();
+    if (!ptr)
+      return false;
+    auto ld = dyn_cast<LoadInst>(getBaseObject(ptr));
+    if (!ld || !ld->isSimple() || !ld->getType()->isPointerTy())
+      return false;
+    const auto &DL = I->getModule()->getDataLayout();
+    int64_t offset = 0;
+    auto base =
+        GetPointerBaseWithConstantOffset(ld->getPointerOperand(), offset, DL);
+    auto alloc = dyn_cast<CallInst>(base);
+    if (!alloc || !OrigDT.dominates(callsite, alloc) || !isNoAlias(alloc))
+      return false;
+    auto F = alloc->getCalledFunction();
+    if (!F || !F->hasFnAttribute("enzyme_fresh_pointer"))
+      return false;
+    int64_t field;
+    if (F->getFnAttribute("enzyme_fresh_pointer")
+            .getValueAsString()
+            .getAsInteger(10, field) ||
+        field < 0 || field != offset)
+      return false;
+    return !isAllocWrittenBeforeLoad(OrigLI, AA, TLI, alloc, ld,
+                                     &allocWrittenBeforeLoad);
+  }
+
   /// Whether the memory at obj may be overwritten after this function
   /// returns. Unknown writes (subsequent_calls_may_write) may overwrite any
   /// memory not local to this function. Otherwise the caller only wrote to
@@ -645,6 +683,9 @@ struct CacheAnalysis {
         return false;
 
       if (!inst2->mayWriteToMemory())
+        return false;
+
+      if (writesToNewOwnedStorage(inst2, callsite_op))
         return false;
 
       // A write to uncaptured local memory is not an unknown write: the callee

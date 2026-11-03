@@ -1227,6 +1227,11 @@ bool writesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
 /// the answers here instead of rescanning the function for every pair.
 using AllocWrittenBeforeLoadCache = llvm::DenseMap<llvm::LoadInst *, bool>;
 
+bool isAllocWrittenBeforeLoad(llvm::LoopInfo &LI, llvm::AAResults &AA,
+                              llvm::TargetLibraryInfo &TLI,
+                              llvm::Instruction *alloc_call, llvm::LoadInst *ld,
+                              AllocWrittenBeforeLoadCache *cache);
+
 // A more advanced version of writesToMemoryReadBy, where the writing
 // instruction comes after the reading function. Specifically, even if the two
 // instructions may access the same location, this variant checks whether
@@ -2695,7 +2700,8 @@ arePointersGuaranteedNoAlias(llvm::TargetLibraryInfo &TLI, llvm::AAResults &AA,
                              llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                              llvm::Value *op0, llvm::Value *op1,
                              bool offsetAllowed = false,
-                             AllocWrittenBeforeLoadCache *cache = nullptr);
+                             AllocWrittenBeforeLoadCache *cache = nullptr,
+                             const TypeResults *TR = nullptr);
 
 /// MPI routines recognized by Enzyme, keyed by their lowercase,
 /// underscore-free base name and mapped to the canonical C name (without the
