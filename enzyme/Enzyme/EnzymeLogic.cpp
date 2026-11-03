@@ -196,11 +196,37 @@ struct CacheAnalysis {
         subsequent_calls_may_write(subsequent_calls_may_write),
         overwritten_args(overwritten_args), mode(mode), omp(omp) {}
 
-  // An allocator may initialize a field with a pointer to fresh owned storage.
-  // The attribute gives that field's byte offset. A later write through that
-  // pointer cannot overwrite data read by a call which preceded its creation.
-  // Restrict this proof to callsites outside loops: otherwise a later dynamic
-  // execution of the call could have seen the same allocation.
+  // Whether call may write through an sret-like pointer argument: the only
+  // existing memory a local read-only-or-throw function may write
+  // (DetectReadonlyOrThrowFn). Without a known callee, assume it may.
+  static bool hasSretLikeArgument(CallBase *call) {
+    auto Callee = call->getCalledFunction();
+    for (size_t i = 0; i < call->arg_size(); i++) {
+      if (!call->getArgOperand(i)->getType()->isPointerTy())
+        continue;
+      if (!Callee || call->paramHasAttr(i, Attribute::StructRet) ||
+          i >= Callee->arg_size() ||
+          Callee->getAttribute(i + AttributeList::FirstArgIndex,
+                               "enzymejl_returnRoots")
+              .isValid() ||
+          Callee->getAttribute(i + AttributeList::FirstArgIndex,
+                               "enzymejl_sret_union_bytes")
+              .isValid())
+        return true;
+    }
+    return false;
+  }
+
+  // Whether I only writes storage created after callsite, which therefore
+  // cannot hold data the call read. That storage is either a noalias
+  // allocation the call dominates, written directly (a box or tuple a later
+  // statement fills), or fresh owned storage such an allocation's header
+  // points to: an allocator may initialize a field with a pointer to fresh
+  // owned storage, and its enzyme_fresh_pointer attribute gives that field's
+  // byte offset. A header merged from several such allocations qualifies, a
+  // merge with any other object does not. Restrict this proof to callsites
+  // outside loops: otherwise a
+  // later dynamic execution of the call could have seen the same allocation.
   bool writesToNewOwnedStorage(Instruction *I, CallInst *callsite) {
     if (OrigLI.getLoopFor(callsite->getParent()))
       return false;
@@ -211,27 +237,50 @@ struct CacheAnalysis {
       ptr = MI->getRawDest();
     if (!ptr)
       return false;
-    auto ld = dyn_cast<LoadInst>(getBaseObject(ptr));
+    Value *obj = getBaseObject(ptr);
+    if (auto fresh = dyn_cast<CallInst>(obj))
+      return OrigDT.dominates(callsite, fresh) && isNoAlias(fresh);
+    auto ld = dyn_cast<LoadInst>(obj);
     if (!ld || !ld->isSimple() || !ld->getType()->isPointerTy())
       return false;
     const auto &DL = I->getModule()->getDataLayout();
     int64_t offset = 0;
     auto base =
         GetPointerBaseWithConstantOffset(ld->getPointerOperand(), offset, DL);
-    auto alloc = dyn_cast<CallInst>(base);
-    if (!alloc || !OrigDT.dominates(callsite, alloc) || !isNoAlias(alloc))
-      return false;
-    auto F = alloc->getCalledFunction();
-    if (!F || !F->hasFnAttribute("enzyme_fresh_pointer"))
-      return false;
-    int64_t field;
-    if (F->getFnAttribute("enzyme_fresh_pointer")
-            .getValueAsString()
-            .getAsInteger(10, field) ||
-        field < 0 || field != offset)
-      return false;
-    return !isAllocWrittenBeforeLoad(OrigLI, AA, TLI, alloc, ld,
-                                     &allocWrittenBeforeLoad);
+    // The header may come from a merge of allocations made on different
+    // paths, as Julia allocates a broadcast's output on each of its branches.
+    // Every incoming header must then be such an allocation.
+    SmallVector<Value *, 2> headers;
+    if (auto PN = dyn_cast<PHINode>(base)) {
+      for (auto &V : PN->incoming_values())
+        headers.push_back(V->stripPointerCasts());
+    } else if (auto SI = dyn_cast<SelectInst>(base)) {
+      headers.push_back(SI->getTrueValue()->stripPointerCasts());
+      headers.push_back(SI->getFalseValue()->stripPointerCasts());
+    } else {
+      headers.push_back(base);
+    }
+    for (auto header : headers) {
+      auto alloc = dyn_cast<CallInst>(header);
+      if (!alloc || !OrigDT.dominates(callsite, alloc) || !isNoAlias(alloc))
+        return false;
+      auto F = alloc->getCalledFunction();
+      if (!F || !F->hasFnAttribute("enzyme_fresh_pointer"))
+        return false;
+      int64_t field;
+      if (F->getFnAttribute("enzyme_fresh_pointer")
+              .getValueAsString()
+              .getAsInteger(10, field) ||
+          field < 0 || field != offset)
+        return false;
+      // The cache is keyed by the load alone, which holds only while the
+      // load has a single base allocation.
+      if (isAllocWrittenBeforeLoad(
+              OrigLI, AA, TLI, alloc, ld,
+              headers.size() == 1 ? &allocWrittenBeforeLoad : nullptr))
+        return false;
+    }
+    return true;
   }
 
   /// Whether the memory at obj may be overwritten after this function
@@ -684,6 +733,16 @@ struct CacheAnalysis {
 
       if (!inst2->mayWriteToMemory())
         return false;
+
+      // A call that writes no memory which existed before it, except on paths
+      // that throw, cannot overwrite what the callee read. writesToMemoryReadBy
+      // makes the same exception for a load in this function. The local
+      // variant also allows writes through sret-like arguments, which name
+      // existing memory; such a call is handled below like any other write.
+      if (auto CB = dyn_cast<CallBase>(inst2))
+        if (isReadOnlyOrThrow(CB) ||
+            (isLocalReadOnlyOrThrow(CB) && !hasSretLikeArgument(CB)))
+          return false;
 
       if (writesToNewOwnedStorage(inst2, callsite_op))
         return false;
