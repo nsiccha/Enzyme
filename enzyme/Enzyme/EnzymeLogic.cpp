@@ -252,21 +252,50 @@ struct CacheAnalysis {
     for (auto alloc : allocs)
       if (!OrigDT.dominates(callsite, alloc))
         return false;
+    int64_t offset = 0;
+    getPointerFieldOwner(ld->getPointerOperand(), offset,
+                         oldFunc->getParent()->getDataLayout());
     for (auto alloc : allocs)
       // The cache is keyed by the load alone, which holds only while the
       // load has a single base allocation.
-      if (isAllocWrittenBeforeLoad(
-              OrigLI, AA, TLI, alloc, ld,
-              allocs.size() == 1 ? &allocWrittenBeforeLoad : nullptr))
+      if (isAllocWrittenBeforeLoad(OrigLI, AA, TLI, alloc, ld,
+                                   allocs.size() == 1 ? &allocWrittenBeforeLoad
+                                                      : nullptr) &&
+          isFreshPointerFieldWrittenBefore(OrigLI, AA, alloc, offset, ld,
+                                           writesOnlyItsOwnMemory))
         return false;
     return true;
   }
 
-  // getArgumentOwnedStorageWrites per callee: whether the query succeeded,
-  // and the (argument, offset) pairs it returned.
-  DenseMap<Function *,
-           std::pair<bool, SmallVector<std::pair<unsigned, int64_t>, 2>>>
-      argumentOwnedWrites;
+  // Whether call writes only memory created during it and stack slots, so no
+  // allocation that existed before it (see isFreshPointerFieldWrittenBefore):
+  // a local read-only-or-throw call whose sret-like arguments, through which
+  // it may write, are stack slots.
+  static bool writesOnlyItsOwnMemory(CallBase *call) {
+    if (!isLocalReadOnlyOrThrow(call))
+      return false;
+    auto Callee = call->getCalledFunction();
+    for (size_t i = 0; i < call->arg_size(); i++) {
+      Value *arg = call->getArgOperand(i);
+      if (!arg->getType()->isPointerTy() || isa<AllocaInst>(getBaseObject(arg)))
+        continue;
+      if (!Callee || call->paramHasAttr(i, Attribute::StructRet) ||
+          i >= Callee->arg_size() ||
+          Callee
+              ->getAttribute(i + AttributeList::FirstArgIndex,
+                             "enzymejl_returnRoots")
+              .isValid() ||
+          Callee
+              ->getAttribute(i + AttributeList::FirstArgIndex,
+                             "enzymejl_sret_union_bytes")
+              .isValid())
+        return false;
+    }
+    return true;
+  }
+
+  // getArgumentOwnedStorageWrites answers per callee.
+  ArgumentOwnedWritesCache argumentOwnedWrites;
 
   // Whether call writes only memory created during it and storage owned by
   // arguments that are allocations made after callsite, such as Julia's
@@ -288,16 +317,11 @@ struct CacheAnalysis {
         Callee->getCallingConv() != call->getCallingConv() ||
         hasSretLikeArgument(call))
       return false;
-    auto found = argumentOwnedWrites.find(Callee);
-    if (found == argumentOwnedWrites.end()) {
-      SmallVector<std::pair<unsigned, int64_t>, 2> writes;
-      bool ok = getArgumentOwnedStorageWrites(*Callee, TLI, writes);
-      found =
-          argumentOwnedWrites.try_emplace(Callee, ok, std::move(writes)).first;
-    }
-    if (!found->second.first)
+    ArgumentOwnedWrites writes;
+    if (!getArgumentOwnedStorageWrites(*Callee, TLI, writes,
+                                       argumentOwnedWrites))
       return false;
-    for (auto &write : found->second.second) {
+    for (auto &write : writes) {
       if (write.first >= call->arg_size())
         return false;
       SmallVector<CallInst *, 2> allocs;
@@ -307,10 +331,63 @@ struct CacheAnalysis {
       for (auto alloc : allocs)
         if (!OrigDT.dominates(callsite, alloc) ||
             isFreshPointerFieldWrittenBefore(OrigLI, AA, alloc, write.second,
-                                             call))
+                                             call, writesOnlyItsOwnMemory))
           return false;
     }
     return true;
+  }
+
+  // Names the first write after callsite that may write memory the callee
+  // read through pointers it loaded (subsequent_calls_may_write), with the
+  // object it writes and, for storage named by a loaded pointer, the object
+  // that pointer was loaded from.
+  static void emitUnknownWrite(CallInst *callsite, Instruction *write) {
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(write))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(write))
+      ptr = MI->getRawDest();
+    if (!ptr) {
+      EmitWarning("UncacheableArg", *callsite, "Callsite ", *callsite,
+                  " followed by unknown write ", *write);
+      return;
+    }
+    Value *obj = getBaseObject(ptr);
+    Value *owner = obj;
+    if (auto ld = dyn_cast<LoadInst>(obj))
+      owner = getBaseObject(ld->getPointerOperand());
+    EmitWarning("UncacheableArg", *callsite, "Callsite ", *callsite,
+                " followed by unknown write ", *write, " to ", *obj,
+                " owned by ", *owner);
+  }
+
+  // Whether obj, the base object of a callsite operand, is a pointer this
+  // function received: an argument, or a field of an aggregate argument (as
+  // Julia passes a kernel's arrays, all in one struct). Such a pointer cannot
+  // point to an object this function creates. BasicAA concludes that for an
+  // argument, but does not look through extractvalue.
+  static bool isReceivedPointer(Value *obj) {
+    while (auto EVI = dyn_cast<ExtractValueInst>(obj))
+      obj = EVI->getAggregateOperand();
+    return isa<Argument>(obj);
+  }
+
+  // Whether I writes only an object this function creates: a stack slot, or
+  // the result of a noalias call such as an allocation. A pointer the
+  // function received (isReceivedPointer) cannot point to it.
+  static bool writesOnlyCreatedObject(Instruction *I) {
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(I))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(I))
+      ptr = MI->getRawDest();
+    if (!ptr)
+      return false;
+    Value *obj = getBaseObject(ptr);
+    if (isa<AllocaInst>(obj))
+      return true;
+    auto call = dyn_cast<CallBase>(obj);
+    return call && isNoAlias(call);
   }
 
   /// Whether the memory at obj may be overwritten after this function
@@ -764,6 +841,12 @@ struct CacheAnalysis {
       if (!inst2->mayWriteToMemory())
         return false;
 
+      // Memory only the callee's own runtime can access, such as what
+      // julia.write_barrier records, is not memory the call read.
+      if (auto CB = dyn_cast<CallBase>(inst2))
+        if (CB->onlyAccessesInaccessibleMemory())
+          return false;
+
       // A call that writes no memory which existed before it, except on paths
       // that throw, cannot overwrite what the callee read. writesToMemoryReadBy
       // makes the same exception for a load in this function. The local
@@ -781,8 +864,12 @@ struct CacheAnalysis {
       // A write to uncaptured local memory is not an unknown write: the callee
       // can only reach that memory through an argument, which is marked
       // overwritten below.
-      if (!writesOnlyUncapturedLocalMemory(inst2, TLI))
+      if (!writesOnlyUncapturedLocalMemory(inst2, TLI)) {
+        if (!next_subsequent_inst_may_write)
+          emitUnknownWrite(callsite_op, inst2);
         next_subsequent_inst_may_write = true;
+      }
+      const bool writesCreatedObject = writesOnlyCreatedObject(inst2);
       for (unsigned i = 0; i < args.size(); ++i) {
         if (!args_safe[i])
           continue;
@@ -797,8 +884,10 @@ struct CacheAnalysis {
           continue;
 
         if (!callsite_op->getArgOperand(i)->getType()->isPointerTy() ||
-            llvm::isModSet(AA.getModRefInfo(
-                inst2, MemoryLocation::getForArgument(callsite_op, i, TLI)))) {
+            ((!writesCreatedObject || !isReceivedPointer(objs[i])) &&
+             llvm::isModSet(AA.getModRefInfo(
+                 inst2,
+                 MemoryLocation::getForArgument(callsite_op, i, TLI))))) {
           if (!isa<ConstantInt>(callsite_op->getArgOperand(i)) &&
               !isa<UndefValue>(callsite_op->getArgOperand(i)))
             EmitWarning("UncacheableArg", *callsite_op, "Callsite ",

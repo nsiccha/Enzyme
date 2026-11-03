@@ -4891,6 +4891,28 @@ bool isAllocWrittenBeforeLoad(LoopInfo &LI, AAResults &AA,
   return alloc_written;
 }
 
+bool isJuliaArrayResize(StringRef name) {
+  if (startsWith(name, "ijl_"))
+    name = name.substr(1);
+  return name == "jl_array_grow_end" || name == "jl_array_grow_beg" ||
+         name == "jl_array_grow_at" || name == "jl_array_del_end" ||
+         name == "jl_array_del_beg" || name == "jl_array_del_at" ||
+         name == "jl_array_sizehint" || name == "jl_array_ptr_1d_push" ||
+         name == "jl_array_ptr_1d_append";
+}
+
+Value *getPointerFieldOwner(Value *ptr, int64_t &offset, const DataLayout &DL) {
+  Value *base = GetPointerBaseWithConstantOffset(ptr, offset, DL);
+  while (auto CI = dyn_cast<CallInst>(base)) {
+    if (getFuncNameFromCall(CI) != "julia.pointer_from_objref")
+      break;
+    int64_t more = 0;
+    base = GetPointerBaseWithConstantOffset(CI->getArgOperand(0), more, DL);
+    offset += more;
+  }
+  return base;
+}
+
 bool getFreshPointerField(CallInst *alloc, int64_t &field) {
   if (!isNoAlias(alloc))
     return false;
@@ -4936,32 +4958,150 @@ bool getFreshPointerAllocations(LoadInst *ld,
     return false;
   const auto &DL = ld->getModule()->getDataLayout();
   int64_t offset = 0;
-  auto base =
-      GetPointerBaseWithConstantOffset(ld->getPointerOperand(), offset, DL);
+  auto base = getPointerFieldOwner(ld->getPointerOperand(), offset, DL);
   return getFreshPointerHeaderAllocations(base, offset, allocs);
 }
 
-bool isFreshPointerFieldWrittenBefore(LoopInfo &LI, AAResults &AA,
-                                      CallInst *alloc, int64_t offset,
-                                      Instruction *before) {
+// Calls f on every instruction that may run after an execution of def and
+// before the next execution of use, given that def dominates use: those on
+// paths from def to use that do not run def again. In a loop containing both,
+// the instructions after use in one iteration therefore do not count, unlike
+// for allInstructionsBetween: the next iteration runs def again before use.
+// f returning true stops the walk. Returns false, without calling f, when
+// def does not dominate use (a path from the entry reaches use without it).
+static bool
+forInstructionsFromDefToUse(Instruction *def, Instruction *use,
+                            llvm::function_ref<bool(Instruction *)> f) {
+  BasicBlock *defBB = def->getParent();
+  BasicBlock *useBB = use->getParent();
+  if (defBB == useBB) {
+    if (!def->comesBefore(use))
+      return false;
+    for (auto I = def->getNextNode(); I != use; I = I->getNextNode())
+      if (f(I))
+        break;
+    return true;
+  }
+  // Blocks that reach use without passing def's block; reaching the entry
+  // that way means def does not dominate use.
+  SmallPtrSet<BasicBlock *, 16> back;
+  SmallVector<BasicBlock *, 16> todo(pred_begin(useBB), pred_end(useBB));
+  while (!todo.empty()) {
+    auto BB = todo.pop_back_val();
+    if (BB == defBB || !back.insert(BB).second)
+      continue;
+    if (pred_empty(BB))
+      return false;
+    todo.append(pred_begin(BB), pred_end(BB));
+  }
+  if (pred_empty(useBB))
+    return false;
+  // Blocks def's block reaches without passing it again.
+  SmallPtrSet<BasicBlock *, 16> fwd;
+  todo.append(succ_begin(defBB), succ_end(defBB));
+  while (!todo.empty()) {
+    auto BB = todo.pop_back_val();
+    if (BB == defBB || !fwd.insert(BB).second)
+      continue;
+    todo.append(succ_begin(BB), succ_end(BB));
+  }
+  for (auto I = def->getNextNode(); I; I = I->getNextNode())
+    if (f(I))
+      return true;
+  for (auto BB : fwd) {
+    if (BB == useBB || !back.count(BB))
+      continue;
+    for (auto &I : *BB)
+      if (f(&I))
+        return true;
+  }
+  // All of use's block when a cycle avoiding def's block returns to it, else
+  // the part before use.
+  for (auto &I : *useBB) {
+    if (&I == use && !back.count(useBB))
+      break;
+    if (f(&I))
+      return true;
+  }
+  return true;
+}
+
+namespace {
+// State shared by the walks of one isFreshPointerFieldWrittenBefore query,
+// which proves other allocations' fields unchanged too (see below).
+struct FreshFieldQuery {
+  LoopInfo &LI;
+  AAResults &AA;
+  llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory;
+  // Allocations whose field is being proven unchanged; meeting one again
+  // answers conservatively.
+  SmallPtrSet<CallInst *, 4> active;
+  // Whether the storage a load names is proven fresh, per load.
+  DenseMap<LoadInst *, bool> freshLoads;
+};
+} // namespace
+
+static bool isFreshPointerFieldWrittenBefore(FreshFieldQuery &Q,
+                                             CallInst *alloc, int64_t offset,
+                                             Instruction *before);
+
+// Whether ld loads the fresh field of allocations other than alloc, each
+// still holding the allocator's pointer, so that the storage it names is new
+// memory distinct from alloc and from everything else that existed before.
+static bool loadsOtherFreshStorage(FreshFieldQuery &Q, LoadInst *ld,
+                                   CallInst *alloc) {
+  auto found = Q.freshLoads.find(ld);
+  if (found != Q.freshLoads.end())
+    return found->second;
+  SmallVector<CallInst *, 2> owners;
+  bool fresh = getFreshPointerAllocations(ld, owners) &&
+               !llvm::is_contained(owners, alloc);
+  if (fresh) {
+    int64_t offset = 0;
+    getPointerFieldOwner(ld->getPointerOperand(), offset,
+                         ld->getModule()->getDataLayout());
+    for (auto owner : owners)
+      if (Q.active.count(owner) ||
+          isFreshPointerFieldWrittenBefore(Q, owner, offset, ld)) {
+        fresh = false;
+        break;
+      }
+  }
+  return Q.freshLoads[ld] = fresh;
+}
+
+static bool isFreshPointerFieldWrittenBefore(FreshFieldQuery &Q,
+                                             CallInst *alloc, int64_t offset,
+                                             Instruction *before) {
   const auto &DL = alloc->getModule()->getDataLayout();
   // The header from its start through the field: a superset of the field.
   MemoryLocation field(
       alloc, LocationSize::precise(
                  offset + DL.getPointerSize(cast<PointerType>(alloc->getType())
                                                 ->getAddressSpace())));
+  Q.active.insert(alloc);
   bool written = false;
-  allInstructionsBetween(LI, alloc, before, [&](Instruction *I) -> bool {
+  auto visit = [&](Instruction *I) -> bool {
     if (I == before || !I->mayWriteToMemory())
       return /*earlyBreak*/ false;
-    if (auto CB = dyn_cast<CallBase>(I))
-      if (isReadOnlyOrThrow(CB))
+    if (auto CB = dyn_cast<CallBase>(I)) {
+      if (isReadOnlyOrThrow(CB) ||
+          (Q.writesOnlyNewMemory && Q.writesOnlyNewMemory(CB)))
         return /*earlyBreak*/ false;
+      // Resizing this array leaves its field naming storage made for it, the
+      // old or storage the resize allocates.
+      if (isJuliaArrayResize(getFuncNameFromCall(CB)) && CB->arg_size() > 0 &&
+          getBaseObject(CB->getArgOperand(0)) == alloc)
+        return /*earlyBreak*/ false;
+    }
     // A write through a pointer loaded from this allocation's fresh field
     // writes the storage the field names, which is separate from the header
     // (Julia's inline array data follows the header fields): until some other
     // write changes the field, which this walk checks, the field names that
-    // storage. A load through a merge of headers is left to alias analysis.
+    // storage. A write into the fresh storage of another allocation, whose
+    // field is proven unchanged in turn, cannot reach this header either, as
+    // when a loop fills one new array with others it allocates and fills. A
+    // load through a merge of headers is left to alias analysis.
     Value *ptr = nullptr;
     if (auto SI = dyn_cast<StoreInst>(I))
       ptr = SI->getPointerOperand();
@@ -4973,14 +5113,29 @@ bool isFreshPointerFieldWrittenBefore(LoopInfo &LI, AAResults &AA,
         if (getFreshPointerAllocations(ld, owners) && owners.size() == 1 &&
             owners[0] == alloc)
           return /*earlyBreak*/ false;
+        if (loadsOtherFreshStorage(Q, ld, alloc))
+          return /*earlyBreak*/ false;
       }
-    if (isModSet(AA.getModRefInfo(I, field))) {
+    if (isModSet(Q.AA.getModRefInfo(I, field))) {
       written = true;
       return /*earlyBreak*/ true;
     }
     return /*earlyBreak*/ false;
-  });
+  };
+  // An allocation dominates the uses of its result, the usual case; a header
+  // merged from several allocations takes the conservative walk.
+  if (!forInstructionsFromDefToUse(alloc, before, visit))
+    allInstructionsBetween(Q.LI, alloc, before, visit);
+  Q.active.erase(alloc);
   return written;
+}
+
+bool isFreshPointerFieldWrittenBefore(
+    LoopInfo &LI, AAResults &AA, CallInst *alloc, int64_t offset,
+    Instruction *before,
+    llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory) {
+  FreshFieldQuery Q{LI, AA, writesOnlyNewMemory, {}, {}};
+  return isFreshPointerFieldWrittenBefore(Q, alloc, offset, before);
 }
 
 // Return true if guaranteed not to alias

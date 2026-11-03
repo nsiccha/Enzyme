@@ -1244,6 +1244,20 @@ bool isAllocWrittenBeforeLoad(llvm::LoopInfo &LI, llvm::AAResults &AA,
 bool getFreshPointerAllocations(
     llvm::LoadInst *ld, llvm::SmallVectorImpl<llvm::CallInst *> &allocs);
 
+/// Whether name is one of Julia's runtime functions that resize the array they
+/// take first (push!, append!, resize! and friends on Julia 1.10): they write
+/// only that array's header and the storage it owns, which they may replace
+/// with storage they allocate.
+bool isJuliaArrayResize(llvm::StringRef name);
+
+/// The object whose field ptr points to, with that field's byte offset in
+/// offset: GetPointerBaseWithConstantOffset, which also looks through
+/// julia.pointer_from_objref. Julia takes an object's address that way to
+/// read its fields for a foreign call, such as an array's data pointer for a
+/// BLAS routine.
+llvm::Value *getPointerFieldOwner(llvm::Value *ptr, int64_t &offset,
+                                  const llvm::DataLayout &DL);
+
 /// Whether alloc is a noalias call to an allocator declaring a fresh field
 /// (enzyme_fresh_pointer); field receives that field's byte offset.
 bool getFreshPointerField(llvm::CallInst *alloc, int64_t &field);
@@ -1259,10 +1273,12 @@ bool getFreshPointerHeaderAllocations(
 /// Whether an instruction between alloc, a call getFreshPointerField accepts,
 /// and before (exclusive) may change the pointer in alloc's fresh field. A
 /// write through that pointer does not: it writes the storage the field names,
-/// not the field.
-bool isFreshPointerFieldWrittenBefore(llvm::LoopInfo &LI, llvm::AAResults &AA,
-                                      llvm::CallInst *alloc, int64_t offset,
-                                      llvm::Instruction *before);
+/// not the field. Neither does a call that writes only memory created during
+/// it, as writesOnlyNewMemory may show (alloc existed before the call).
+bool isFreshPointerFieldWrittenBefore(
+    llvm::LoopInfo &LI, llvm::AAResults &AA, llvm::CallInst *alloc,
+    int64_t offset, llvm::Instruction *before,
+    llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory = nullptr);
 
 // A more advanced version of writesToMemoryReadBy, where the writing
 // instruction comes after the reading function. Specifically, even if the two
