@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <memory>
 
 #include <llvm/Config/llvm-config.h>
 #define private public
@@ -46,6 +47,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/InstVisitor.h"
 
+#include "PersistentPtrSet.h"
 #include "TypeAnalysis/TypeAnalysis.h"
 #include "Utils.h"
 
@@ -88,20 +90,25 @@ private:
   /// Analyze down based off uses
   static constexpr uint8_t DOWN = 2;
 
+  // A hypothesis starts from a snapshot of what its creator knows, and every
+  // value and instruction of a function can pass through these sets. They share
+  // their structure across copies, so that the cost of a hypothesis follows
+  // what it learns and not the size of the function.
+
   /// Instructions that don't propagate adjoints
   /// These instructions could return an active pointer, but
   /// do not propagate adjoints themselves
-  llvm::SmallPtrSet<llvm::Instruction *, 4> ConstantInstructions;
+  PersistentPtrSet<llvm::Instruction> ConstantInstructions;
 
   /// Instructions that could propagate adjoints
-  llvm::SmallPtrSet<llvm::Instruction *, 20> ActiveInstructions;
+  PersistentPtrSet<llvm::Instruction> ActiveInstructions;
 
   /// Values that do not contain derivative information, either
   /// directly or as a pointer to
-  llvm::SmallPtrSet<llvm::Value *, 4> ConstantValues;
+  PersistentPtrSet<llvm::Value> ConstantValues;
 
   /// Values that may contain derivative information
-  llvm::SmallPtrSet<llvm::Value *, 2> ActiveValues;
+  PersistentPtrSet<llvm::Value> ActiveValues;
 
   /// Intermediate pointers which are created by inactive instructions
   /// but are marked as active values to inductively determine their
@@ -122,8 +129,11 @@ public:
       DIFFE_TYPE ActiveReturns)
       : PPC(PPC), AA(AA_), notForAnalysis(notForAnalysis_), TLI(TLI_),
         ActiveReturns(ActiveReturns), directions(UP | DOWN),
-        ConstantValues(ConstantValues.begin(), ConstantValues.end()),
-        ActiveValues(ActiveValues.begin(), ActiveValues.end()) {
+        MemorySearch(std::make_shared<MemorySearchCandidates>()) {
+    for (auto V : ConstantValues)
+      this->ConstantValues.insert(V);
+    for (auto V : ActiveValues)
+      this->ActiveValues.insert(V);
     InsertConstValueRecursionHandler = nullptr;
   }
 
@@ -137,13 +147,72 @@ public:
   bool isConstantValue(TypeResults const &TR, llvm::Value *val);
 
 private:
-  llvm::DenseMap<llvm::Instruction *, llvm::SmallPtrSet<llvm::Value *, 4>>
-      ReEvaluateValueIfInactiveInst;
-  llvm::DenseMap<llvm::Value *, llvm::SmallPtrSet<llvm::Value *, 4>>
-      ReEvaluateValueIfInactiveValue;
+  /// What to evaluate again once a key is shown to be inactive. A key can
+  /// already be known inactive when it gets its entry; such an entry runs the
+  /// next time a hypothesis that also knows the key is imported. So that an
+  /// import need not visit everything the hypothesis knows to find them, this
+  /// remembers the keys that may be in that state.
+  template <typename KeyT, typename ItemT> class ReEvaluationMap {
+    llvm::DenseMap<KeyT *, llvm::SmallPtrSet<ItemT *, 4>> Entries;
+    llvm::SmallPtrSet<KeyT *, 4> KeysToRecheck;
 
-  llvm::DenseMap<llvm::Value *, llvm::SmallPtrSet<llvm::Instruction *, 4>>
-      ReEvaluateInstIfInactiveValue;
+  public:
+    llvm::SmallPtrSet<ItemT *, 4> &operator[](KeyT *Key) {
+      KeysToRecheck.insert(Key);
+      return Entries[Key];
+    }
+    auto begin() { return Entries.begin(); }
+    auto end() { return Entries.end(); }
+    auto find(KeyT *Key) { return Entries.find(Key); }
+    bool count(KeyT *Key) const { return Entries.count(Key); }
+    /// Removes the entry of Key and returns what it held.
+    llvm::SmallPtrSet<ItemT *, 4>
+    take(typename decltype(Entries)::iterator It) {
+      auto Items = std::move(It->second);
+      Entries.erase(It);
+      return Items;
+    }
+    /// Empties and returns the keys to check, which the caller keeps or gives
+    /// back through keepForRecheck.
+    llvm::SmallPtrSet<KeyT *, 4> takeKeysToRecheck() {
+      auto Keys = std::move(KeysToRecheck);
+      KeysToRecheck.clear();
+      return Keys;
+    }
+    void keepForRecheck(KeyT *Key) { KeysToRecheck.insert(Key); }
+  };
+
+  ReEvaluationMap<llvm::Instruction, llvm::Value> ReEvaluateValueIfInactiveInst;
+  ReEvaluationMap<llvm::Value, llvm::Value> ReEvaluateValueIfInactiveValue;
+  ReEvaluationMap<llvm::Value, llvm::Instruction> ReEvaluateInstIfInactiveValue;
+
+  /// The instructions that a search of memory has to consider. Which ones those
+  /// are depends only on the function, so an analyzer and its hypotheses share
+  /// one list, built the first time a search runs.
+  struct MemorySearchCandidates {
+    bool Built = false;
+    /// In the order of the function's blocks and of each block.
+    llvm::SmallVector<llvm::Instruction *, 0> Instructions;
+    /// The range of Instructions that belongs to a block.
+    llvm::DenseMap<llvm::BasicBlock *, std::pair<unsigned, unsigned>> Blocks;
+  };
+  std::shared_ptr<MemorySearchCandidates> MemorySearch;
+
+  /// Whether a search of memory can learn anything from this instruction,
+  /// whichever value it searches for.
+  bool isMemorySearchCandidate(llvm::Instruction *I);
+  const MemorySearchCandidates &
+  getMemorySearchCandidates(TypeResults const &TR);
+  /// Calls F for the candidates that can run after Inst, in the order
+  /// allFollowersOf visits them.
+  void
+  forEachMemorySearchFollower(TypeResults const &TR, llvm::Instruction *Inst,
+                              llvm::function_ref<bool(llvm::Instruction *)> F);
+
+  /// Runs the entries whose key this analyzer already knows to be inactive,
+  /// when the hypothesis being imported knows it too.
+  void runDeferredReEvaluations(TypeResults const &TR,
+                                ActivityAnalyzer &Hypothesis);
 
   void InsertConstantInstruction(TypeResults const &TR, llvm::Instruction *I);
   llvm::SmallVector<llvm::Value *, 1> *InsertConstValueRecursionHandler;
@@ -158,7 +227,8 @@ private:
         ConstantInstructions(Other.ConstantInstructions),
         ActiveInstructions(Other.ActiveInstructions),
         ConstantValues(Other.ConstantValues), ActiveValues(Other.ActiveValues),
-        DeducingPointers(Other.DeducingPointers) {
+        DeducingPointers(Other.DeducingPointers),
+        MemorySearch(Other.MemorySearch) {
     assert(directions != 0);
     assert((directions & Other.directions) == directions);
     assert((directions & Other.directions) != 0);
@@ -168,34 +238,36 @@ private:
   /// Import known constants from an existing analyzer
   void insertConstantsFrom(TypeResults const &TR,
                            ActivityAnalyzer &Hypothesis) {
-    for (auto I : Hypothesis.ConstantInstructions) {
-      InsertConstantInstruction(TR, I);
-    }
-    for (auto V : Hypothesis.ConstantValues) {
-      InsertConstantValue(TR, V);
-    }
+    Hypothesis.ConstantInstructions.forEachMissingFrom(
+        ConstantInstructions,
+        [&](llvm::Instruction *I) { InsertConstantInstruction(TR, I); });
+    Hypothesis.ConstantValues.forEachMissingFrom(
+        ConstantValues, [&](llvm::Value *V) { InsertConstantValue(TR, V); });
+    runDeferredReEvaluations(TR, Hypothesis);
   }
 
   /// Import known data from an existing analyzer
   void insertAllFrom(TypeResults const &TR, ActivityAnalyzer &Hypothesis,
                      llvm::Value *Orig, llvm::Value *Orig2 = nullptr) {
     insertConstantsFrom(TR, Hypothesis);
-    for (auto I : Hypothesis.ActiveInstructions) {
-      bool inserted = ActiveInstructions.insert(I).second;
-      if (inserted && directions == 3 && EnzymeEnableRecursiveHypotheses) {
-        ReEvaluateInstIfInactiveValue[Orig].insert(I);
-        if (Orig2 && Orig2 != Orig)
-          ReEvaluateInstIfInactiveValue[Orig2].insert(I);
-      }
-    }
-    for (auto V : Hypothesis.ActiveValues) {
-      bool inserted = ActiveValues.insert(V).second;
-      if (inserted && directions == 3 && EnzymeEnableRecursiveHypotheses) {
-        ReEvaluateValueIfInactiveValue[Orig].insert(V);
-        if (Orig2 && Orig2 != Orig)
-          ReEvaluateValueIfInactiveValue[Orig2].insert(V);
-      }
-    }
+    Hypothesis.ActiveInstructions.forEachMissingFrom(
+        ActiveInstructions, [&](llvm::Instruction *I) {
+          ActiveInstructions.insert(I);
+          if (directions == 3 && EnzymeEnableRecursiveHypotheses) {
+            ReEvaluateInstIfInactiveValue[Orig].insert(I);
+            if (Orig2 && Orig2 != Orig)
+              ReEvaluateInstIfInactiveValue[Orig2].insert(I);
+          }
+        });
+    Hypothesis.ActiveValues.forEachMissingFrom(
+        ActiveValues, [&](llvm::Value *V) {
+          ActiveValues.insert(V);
+          if (directions == 3 && EnzymeEnableRecursiveHypotheses) {
+            ReEvaluateValueIfInactiveValue[Orig].insert(V);
+            if (Orig2 && Orig2 != Orig)
+              ReEvaluateValueIfInactiveValue[Orig2].insert(V);
+          }
+        });
 
     for (auto &pair : Hypothesis.ReEvaluateValueIfInactiveInst) {
       ReEvaluateValueIfInactiveValue[pair.first].insert(pair.second.begin(),
