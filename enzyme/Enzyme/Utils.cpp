@@ -5361,6 +5361,9 @@ llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
       case SRetRootMovement::SRetPointerToRootPointer: {
         Value *outloc = constantInBoundsGEPHelper(B, jltype, sret, path);
         outloc = B.CreateLoad(ty, outloc);
+        outloc = B.CreatePointerCast(
+            outloc,
+            getPointerType(StructType::get(outloc->getContext(), {}), Tracked));
         B.CreateStore(outloc, loc);
         break;
       }
@@ -5373,7 +5376,10 @@ llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
         break;
       }
       case SRetRootMovement::RootPointerToSRetValue: {
-        loc = B.CreateLoad(ty, loc);
+        loc = B.CreateLoad(
+            getPointerType(StructType::get(loc->getContext(), {}), Tracked),
+            loc);
+        loc = B.CreatePointerCast(loc, ty);
         val = B.CreateInsertValue(val, loc, path);
         break;
       }
@@ -5385,7 +5391,10 @@ llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
       }
       case SRetRootMovement::RootPointerToSRetPointer: {
         Value *outloc = constantInBoundsGEPHelper(B, jltype, sret, path);
-        loc = B.CreateLoad(ty, loc);
+        loc = B.CreateLoad(
+            getPointerType(StructType::get(loc->getContext(), {}), Tracked),
+            loc);
+        loc = B.CreatePointerCast(loc, ty);
         extracted.push_back(loc);
         B.CreateStore(loc, outloc);
         break;

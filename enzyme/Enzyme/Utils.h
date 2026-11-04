@@ -2937,6 +2937,14 @@ convertSRetTypeFromString(llvm::StringRef str, llvm::LLVMContext *C = nullptr) {
     elts.push_back(llvm::Type::getInt64Ty(*C));
     return llvm::StructType::get(*C, elts);
   }
+  if (str == "test_type7") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 2> elts;
+    elts.push_back(
+        getPointerType(llvm::Type::getInt8Ty(*C), AddressSpace::Tracked));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
   size_t idx;
   bool failed = str.consumeInteger(10, idx);
   (void)failed;
