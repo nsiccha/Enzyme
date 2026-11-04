@@ -5035,9 +5035,9 @@ struct FreshFieldQuery {
   llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory;
   // Allocations whose field is being proven unchanged; meeting one again
   // answers conservatively.
-  SmallPtrSet<CallInst *, 4> active;
+  SmallPtrSet<CallInst *, 4> active{};
   // Whether the storage a load names is proven fresh, per load.
-  DenseMap<LoadInst *, bool> freshLoads;
+  DenseMap<LoadInst *, bool> freshLoads{};
 };
 } // namespace
 
@@ -5134,7 +5134,7 @@ bool isFreshPointerFieldWrittenBefore(
     LoopInfo &LI, AAResults &AA, CallInst *alloc, int64_t offset,
     Instruction *before,
     llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory) {
-  FreshFieldQuery Q{LI, AA, writesOnlyNewMemory, {}, {}};
+  FreshFieldQuery Q{LI, AA, writesOnlyNewMemory};
   return isFreshPointerFieldWrittenBefore(Q, alloc, offset, before);
 }
 
