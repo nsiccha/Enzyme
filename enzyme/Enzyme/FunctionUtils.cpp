@@ -2379,6 +2379,13 @@ bool DetectReadonlyOrThrowFn(
           continue;
 
       if (auto CI = dyn_cast<CallBase>(&I)) {
+        // A callee may initialize memory reachable from its result. Keeping
+        // the result itself uncaptured does not prove those writes invisible:
+        // F can load a pointer from it and return that pointer. Preserve the
+        // local distinction for a used result, including for calls whose
+        // classification is still pending below.
+        if (!isReadOnlyOrThrow(CI) && !CI->use_empty())
+          local = true;
         if (isLocalReadOnlyOrThrow(CI)) {
           // A local read-only-or-throw callee may still write through its
           // sret-like arguments, and those writes land in memory of ours.
