@@ -2868,6 +2868,18 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     Value *ret =
         (idx < 0) ? tape : BuilderQ.CreateExtractValue(tape, {(unsigned)idx});
 
+    // A value read back from the tape has the type of the value that was
+    // stored there. Say so, as a lookup of a cached value does: differentiating
+    // this function again otherwise meets an integer of unknown type, which may
+    // be a pointer, so it counts as active and its arithmetic has no derivative.
+    MDNode *tapeValueType = nullptr;
+    if (isa<Instruction>(malloc))
+      if (auto *origInst = isOriginal(malloc)) {
+        TypeTree TT = TR.query(origInst);
+        if (TT.isKnown())
+          tapeValueType = TT.toMD(malloc->getContext());
+      }
+
     if (ret->getType()->isEmptyTy()) {
       if (auto inst = dyn_cast_or_null<Instruction>(malloc)) {
         if (inst->getType() != ret->getType()) {
@@ -3046,6 +3058,10 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
       }
       assert(malloc->getType() == ret->getType());
 
+      if (tapeValueType)
+        if (auto *retInst = dyn_cast<Instruction>(ret))
+          retInst->setMetadata("enzyme_type", tapeValueType);
+
       if (replace) {
         auto found = newToOriginalFn.find(malloc);
         if (found != newToOriginalFn.end()) {
@@ -3098,6 +3114,9 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                                << " idx=" << idx << " - tape=" << *tape << "\n";
                 }
                 assert(li->getType() == replacewith->getType());
+                if (tapeValueType)
+                  if (auto *replaceInst = dyn_cast<Instruction>(replacewith))
+                    replaceInst->setMetadata("enzyme_type", tapeValueType);
                 li->replaceAllUsesWith(replacewith);
               } else {
                 auto phi =
