@@ -2922,25 +2922,27 @@ public:
       Value *dif[2] = {constantval0 ? nullptr : diffe(orig_op0, Builder2),
                        constantval1 ? nullptr : diffe(orig_op1, Builder2)};
 
-      for (int i = 0; i < 2; ++i) {
-        if (containsOnlyAtMostTopBit(BO.getOperand(i), eFT, dl, &FT) &&
-            dif[1 - i] && !dif[i]) {
-          auto isZero = Builder2.CreateICmpEQ(
-              gutils->getNewFromOriginal(BO.getOperand(i)),
-              Constant::getNullValue(BO.getType()));
-          auto rule = [&](Value *idiff) {
-            auto ext = Builder2.CreateBitCast(idiff, FT);
-            auto neg = Builder2.CreateFNeg(ext);
-            neg = CreateSelect(Builder2, isZero, ext, neg);
-            neg = Builder2.CreateBitCast(neg, BO.getType());
-            return neg;
-          };
-          auto bc = applyChainRule(BO.getOperand(1 - i)->getType(), Builder2,
-                                   rule, dif[1 - i]);
-          setDiffe(&BO, bc, Builder2);
-          return;
+      // If ^ against 0b10000000000 and a float the result is a float
+      if (FT)
+        for (int i = 0; i < 2; ++i) {
+          if (containsOnlyAtMostTopBit(BO.getOperand(i), eFT, dl, &FT) &&
+              dif[1 - i] && !dif[i]) {
+            auto isZero = Builder2.CreateICmpEQ(
+                gutils->getNewFromOriginal(BO.getOperand(i)),
+                Constant::getNullValue(BO.getType()));
+            auto rule = [&](Value *idiff) {
+              auto ext = Builder2.CreateBitCast(idiff, FT);
+              auto neg = Builder2.CreateFNeg(ext);
+              neg = CreateSelect(Builder2, isZero, ext, neg);
+              neg = Builder2.CreateBitCast(neg, BO.getType());
+              return neg;
+            };
+            auto bc = applyChainRule(BO.getOperand(1 - i)->getType(), Builder2,
+                                     rule, dif[1 - i]);
+            setDiffe(&BO, bc, Builder2);
+            return;
+          }
         }
-      }
       if (looseTypeAnalysis) {
         forwardModeInvertedPointerFallback(BO);
         llvm::errs() << "warning: binary operator is integer and constant: "
