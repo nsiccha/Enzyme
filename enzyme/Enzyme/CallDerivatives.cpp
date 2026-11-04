@@ -4650,6 +4650,10 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         return true;
       }
       eraseIfUnused(call);
+      // Freeing a constant pointer is still a primal side effect. Forward mode
+      // must not fall through to the reverse-only deallocation handling,
+      // which can remove this free (including frees of integer loop caches).
+      return true;
     }
     auto callval = call.getCalledOperand();
 
