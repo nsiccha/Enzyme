@@ -4,6 +4,7 @@
 
 declare void @__enzyme_autodiff(...)
 declare noalias ptr @enzyme_allocator(i64) #0
+declare void @free(ptr)
 declare void @consume(ptr) readonly nofree "enzyme_inactive"
 
 define internal double @sqdist(ptr %arr, double %m) {
@@ -29,7 +30,7 @@ exit:
 
 define double @f(ptr %arr, double %m) {
 entry:
-  %obj = call noalias ptr @enzyme_allocator(i64 16)
+  %obj = call noalias ptr @enzyme_allocator(i64 16), !enzyme_deallocator_fn !0
   %input = load ptr, ptr %arr
   store ptr %input, ptr %obj
   %buffer = load ptr, ptr %obj
@@ -57,7 +58,9 @@ entry:
   ret void
 }
 
-attributes #0 = { inaccessiblememonly "enzyme_allocator"="0" "enzyme_fresh_pointer"="0" "enzyme_inactive" }
+attributes #0 = { inaccessiblememonly "enzyme_allocator"="0" "enzyme_deallocator"="-1" "enzyme_fresh_pointer"="0" "enzyme_inactive" }
+
+!0 = !{ptr @free}
 
 ; CHECK: define internal {{.*}} @augmented_sqdist(
 ; CHECK: call {{.*}} @malloc(
