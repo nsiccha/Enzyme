@@ -97,6 +97,11 @@ llvm::cl::opt<bool> EnzymeLoopInvariantCache(
     "enzyme-loop-invariant-cache", cl::init(true), cl::Hidden,
     cl::desc("Attempt to hoist cache outside of loop"));
 
+llvm::cl::opt<bool> EnzymeRecomputeBranchPredicates(
+    "enzyme-recompute-branch-predicates", cl::init(true), cl::Hidden,
+    cl::desc("Decide which edge into a merge the forward pass took from "
+             "recomputed branch conditions rather than a cache"));
+
 llvm::cl::opt<bool> EnzymeInactiveDynamic(
     "enzyme-inactive-dynamic", cl::init(true), cl::Hidden,
     cl::desc("Force wholy inactive dynamic loops to have 0 iter reverse pass"));
@@ -8405,6 +8410,253 @@ static bool safeToRecomputeOnAllPaths(Value *cond, BasicBlock *ctx,
   return true;
 }
 
+bool GradientUtils::branchByRecomputedPredicates(
+    BasicBlock *ctx, IRBuilder<> &BuilderM,
+    const std::map<BasicBlock *,
+                   std::vector<std::pair</*pred*/ BasicBlock *,
+                                         /*successor*/ BasicBlock *>>>
+        &targetToPreds,
+    const std::map<std::pair<BasicBlock *, BasicBlock *>,
+                   std::set<BasicBlock *>> &done,
+    const std::map<BasicBlock *, PHINode *> *replacePHIs) {
+  if (!EnzymeRecomputeBranchPredicates)
+    return false;
+  // Outside a loop the cache is a single slot, which later passes fold into
+  // the branches that fill it. Inside one it holds an entry per iteration.
+  if (!LI.getLoopFor(ctx))
+    return false;
+  // The conditions are looked up as reverse-pass values.
+  if (isOriginalBlock(*BuilderM.GetInsertBlock()))
+    return false;
+
+  // The region: the source of every edge on a path into a target, up to the
+  // first block on each path that dominates ctx. That block is the same on
+  // every path, the root, and the forward pass ran it whenever it ran ctx.
+  SmallSetVector<BasicBlock *, 8> region;
+  for (const auto &pair : done)
+    region.insert(pair.first.first);
+  if (region.size() > 64)
+    return false;
+  BasicBlock *root = nullptr;
+  for (auto B : region)
+    if (DT.dominates(B, ctx)) {
+      if (root)
+        return false;
+      root = B;
+    }
+  if (!root)
+    return false;
+
+  // Every path from root to a target edge must lie in one iteration of every
+  // loop around it: no block but root may be a loop header (the walk that
+  // built `done` does not follow backedges), and the order below must exist.
+  for (auto B : region) {
+    auto term = B->getTerminator();
+    if (!term || (!isAnyBranch(term) && !isa<SwitchInst>(term)))
+      return false;
+    if (B != root)
+      if (auto L = LI.getLoopFor(B))
+        if (L->getHeader() == B)
+          return false;
+  }
+  std::map<BasicBlock *, unsigned> inDegree;
+  for (const auto &pair : done)
+    if (region.count(pair.first.second) && pair.first.second != root)
+      inDegree[pair.first.second]++;
+    else if (pair.first.second == root)
+      return false;
+  SmallVector<BasicBlock *, 8> order;
+  order.push_back(root);
+  for (size_t i = 0; i < order.size(); ++i) {
+    BasicBlock *B = order[i];
+    SmallPtrSet<BasicBlock *, 4> succs;
+    for (BasicBlock *S : successors(B))
+      if (done.count(std::make_pair(B, S)) && region.count(S) &&
+          succs.insert(S).second)
+        if (--inDegree[S] == 0)
+          order.push_back(S);
+  }
+  if (order.size() != region.size())
+    return false;
+
+  // Every condition is evaluated on every path into ctx, also on paths on
+  // which the forward pass never computed it, so it must be safe to compute
+  // there, and from recomputed values only: a cache of a value the forward
+  // pass computed on some paths only would be read where it was never
+  // written. Values of blocks that dominate ctx ran whenever ctx ran.
+  const ValueToValueMapTy noAvailable;
+  for (auto B : region) {
+    auto term = B->getTerminator();
+    Value *cond = nullptr;
+    if (isConditionalBranch(term))
+      cond = getBranchCondition(term);
+    else if (auto SI = dyn_cast<SwitchInst>(term))
+      cond = SI->getCondition();
+    if (!cond)
+      continue;
+    if (!safeToRecomputeOnAllPaths(cond, ctx, DT))
+      return false;
+    SmallVector<Instruction *, 8> todo;
+    SmallPtrSet<Instruction *, 8> seen;
+    if (auto I = dyn_cast<Instruction>(cond))
+      todo.push_back(I);
+    while (!todo.empty()) {
+      auto I = todo.pop_back_val();
+      if (!seen.insert(I).second)
+        continue;
+      if (DT.dominates(I->getParent(), ctx))
+        continue;
+      if (!legalRecompute(I, noAvailable, &BuilderM) ||
+          !shouldRecompute(I, noAvailable, &BuilderM))
+        return false;
+      for (auto &op : I->operands())
+        if (auto OI = dyn_cast<Instruction>(op))
+          todo.push_back(OI);
+    }
+  }
+  if (replacePHIs)
+    for (const auto &pair : *replacePHIs)
+      if (targetToPreds.find(pair.first) == targetToPreds.end())
+        return false;
+
+  // Replay the forward decisions: reach[B] holds iff the forward pass ran B in
+  // this execution of the region. Conjunctions and disjunctions are selects,
+  // so a condition of a block that did not run never decides anything.
+  LLVMContext &C = BuilderM.getContext();
+  Value *True = ConstantInt::getTrue(C);
+  Value *False = ConstantInt::getFalse(C);
+  std::map<BasicBlock *, Value *> conds;
+  auto edgeTaken = [&](BasicBlock *B, BasicBlock *S) -> Value * {
+    auto term = B->getTerminator();
+    if (isUnconditionalBranch(term))
+      return True;
+    auto found = conds.find(B);
+    Value *cond;
+    if (found != conds.end())
+      cond = found->second;
+    else {
+      Value *orig = isConditionalBranch(term)
+                        ? getBranchCondition(term)
+                        : cast<SwitchInst>(term)->getCondition();
+      cond = conds[B] = lookupM(orig, BuilderM);
+    }
+    if (isConditionalBranch(term)) {
+      bool to0 = term->getSuccessor(0) == S, to1 = term->getSuccessor(1) == S;
+      if (to0 && to1)
+        return True;
+      return to0 ? cond : BuilderM.CreateNot(cond);
+    }
+    auto SI = cast<SwitchInst>(term);
+    Value *taken = False;
+    Value *isDefault = True;
+    for (auto c : SI->cases()) {
+      Value *eq = BuilderM.CreateICmpEQ(cond, c.getCaseValue());
+      isDefault = BuilderM.CreateSelect(eq, False, isDefault);
+      if (c.getCaseSuccessor() == S)
+        taken = BuilderM.CreateSelect(eq, True, taken);
+    }
+    if (SI->getDefaultDest() == S)
+      taken = BuilderM.CreateSelect(isDefault, True, taken);
+    return taken;
+  };
+  std::map<BasicBlock *, Value *> reach;
+  reach[root] = True;
+  for (auto B : order) {
+    if (B != root) {
+      Value *r = False;
+      // Each distinct edge once: a switch can list a successor many times.
+      SmallPtrSet<BasicBlock *, 4> seenPreds;
+      for (BasicBlock *P : predecessors(B)) {
+        if (!seenPreds.insert(P).second)
+          continue;
+        if (!done.count(std::make_pair(P, B)) || !reach.count(P))
+          continue;
+        r = BuilderM.CreateSelect(
+            BuilderM.CreateSelect(reach[P], edgeTaken(P, B), False), True, r);
+      }
+      reach[B] = r;
+    }
+  }
+  // Number the targets in the order the region reaches their edges, so the
+  // emitted code does not depend on where blocks happen to be allocated.
+  std::map<BasicBlock *, size_t> position;
+  for (size_t i = 0; i < order.size(); ++i)
+    position[order[i]] = i;
+  auto edgeRank = [&](const std::pair<BasicBlock *, BasicBlock *> &edge) {
+    size_t succ = 0;
+    auto term = edge.first->getTerminator();
+    while (succ < term->getNumSuccessors() &&
+           term->getSuccessor(succ) != edge.second)
+      ++succ;
+    return std::make_pair(position[edge.first], succ);
+  };
+  SmallVector<std::pair<std::pair<size_t, size_t>, BasicBlock *>, 4> ranked;
+  for (const auto &pair : targetToPreds) {
+    auto best = edgeRank(pair.second.front());
+    for (const auto &edge : pair.second)
+      best = std::min(best, edgeRank(edge));
+    ranked.push_back(std::make_pair(best, pair.first));
+  }
+  std::sort(ranked.begin(), ranked.end());
+  SmallVector<BasicBlock *, 4> targets;
+  std::map<BasicBlock *, Value *> targetTaken;
+  for (const auto &rankedTarget : ranked) {
+    BasicBlock *target = rankedTarget.second;
+    const auto &preds = targetToPreds.find(target)->second;
+    SmallVector<std::pair<BasicBlock *, BasicBlock *>, 4> edges;
+    for (const auto &edge : preds)
+      if (std::find(edges.begin(), edges.end(), edge) == edges.end())
+        edges.push_back(edge);
+    std::sort(edges.begin(), edges.end(),
+              [&](const std::pair<BasicBlock *, BasicBlock *> &a,
+                  const std::pair<BasicBlock *, BasicBlock *> &b) {
+                return edgeRank(a) < edgeRank(b);
+              });
+    Value *t = False;
+    for (const auto &edge : edges)
+      t = BuilderM.CreateSelect(
+          BuilderM.CreateSelect(reach[edge.first],
+                                edgeTaken(edge.first, edge.second), False),
+          True, t);
+    targets.push_back(target);
+    targetTaken[target] = t;
+  }
+
+  if (replacePHIs == nullptr) {
+    assert(BuilderM.GetInsertBlock()->size() == 0 ||
+           !isAnyBranch(&BuilderM.GetInsertBlock()->back()));
+    if (targets.size() == 1) {
+      BuilderM.CreateBr(targets[0]);
+    } else if (targets.size() == 2) {
+      BuilderM.CreateCondBr(targetTaken[targets[1]], targets[1], targets[0]);
+    } else {
+      IntegerType *T =
+          targets.size() < 256 ? Type::getInt8Ty(C) : Type::getInt32Ty(C);
+      Value *which = ConstantInt::get(T, targets.size() - 1);
+      for (size_t i = targets.size() - 1; i-- > 0;)
+        which = BuilderM.CreateSelect(targetTaken[targets[i]],
+                                      ConstantInt::get(T, i), which);
+      auto swit =
+          BuilderM.CreateSwitch(which, targets.back(), targets.size() - 1);
+      for (unsigned i = 0; i < targets.size() - 1; ++i)
+        swit->addCase(ConstantInt::get(T, i), targets[i]);
+    }
+  } else {
+    for (const auto &pair : *replacePHIs) {
+      Value *val = targetTaken[pair.first];
+      if (&*BuilderM.GetInsertPoint() == pair.second) {
+        if (pair.second->getNextNode())
+          BuilderM.SetInsertPoint(pair.second->getNextNode());
+        else
+          BuilderM.SetInsertPoint(pair.second->getParent());
+      }
+      pair.second->replaceAllUsesWith(val);
+      pair.second->eraseFromParent();
+    }
+  }
+  return true;
+}
+
 void GradientUtils::branchToCorrespondingTarget(
     BasicBlock *ctx, IRBuilder<> &BuilderM,
     const std::map<BasicBlock *,
@@ -8917,6 +9169,14 @@ fast:;
   return;
 
 nofast:;
+
+  // Two or three targets split by one or two branches are handled above; any
+  // other merge is decided from its branch conditions when they can be
+  // recomputed, and only otherwise from a cache of the edge taken, which in a
+  // loop costs one entry per iteration.
+  if (branchByRecomputedPredicates(ctx, BuilderM, targetToPreds, done,
+                                   replacePHIs))
+    return;
 
   // if freeing reverseblocks must exist
   assert(reverseBlocks.size());

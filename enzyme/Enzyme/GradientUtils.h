@@ -615,6 +615,25 @@ public:
       const std::map<llvm::BasicBlock *, llvm::PHINode *> *replacePHIs =
           nullptr);
 
+private:
+  /// branchToCorrespondingTarget for any number of targets, without a cache:
+  /// replays the forward pass's branch decisions between the nearest block
+  /// dominating `ctx` and the edges into the targets from their recomputed
+  /// conditions. `done` maps each edge of that region to the targets reachable
+  /// through it. Returns false, emitting nothing, when some condition would
+  /// have to be cached or is unsafe to evaluate on paths the forward pass did
+  /// not take, or when the region is not an acyclic part of one iteration.
+  bool branchByRecomputedPredicates(
+      llvm::BasicBlock *ctx, llvm::IRBuilder<> &BuilderM,
+      const std::map<llvm::BasicBlock *,
+                     std::vector<std::pair</*pred*/ llvm::BasicBlock *,
+                                           /*successor*/ llvm::BasicBlock *>>>
+          &targetToPreds,
+      const std::map<std::pair<llvm::BasicBlock *, llvm::BasicBlock *>,
+                     std::set<llvm::BasicBlock *>> &done,
+      const std::map<llvm::BasicBlock *, llvm::PHINode *> *replacePHIs);
+
+public:
   void getReverseBuilder(llvm::IRBuilder<> &Builder2, bool original = true);
 
   void getForwardBuilder(llvm::IRBuilder<> &Builder2);
