@@ -691,6 +691,8 @@ void EnzymeFixupJuliaCallingConvention(Function *F, bool sret_jlvalue) {
                                "enzymejl_returnRoots_v"));
   }
 
+  bool hadJuliaSRet = srets.size() == 1;
+
   // Regular julia function, needing no intervention
   if (srets.size() == 1) {
     assert(*srets.begin() == 0);
@@ -926,6 +928,37 @@ void EnzymeFixupJuliaCallingConvention(Function *F, bool sret_jlvalue) {
   for (auto attr : Attrs.getAttributes(AttributeList::FunctionIndex))
     NewAttrs = NewAttrs.addAttribute(F->getContext(),
                                      AttributeList::FunctionIndex, attr);
+
+  // Dead argument elimination can remove a Julia function's returnRoots before
+  // this pass restores it beside the original sret. The removed indexes refer
+  // to the original ABI, where returnRoots is argument 1. Restore that entry
+  // without changing the indexes of any other removed arguments.
+  if (hadJuliaSRet && roots_AT && rroots.empty() &&
+      NewAttrs.hasAttribute(AttributeList::FunctionIndex,
+                            "enzyme_parmremove")) {
+    auto removed = NewAttrs.getAttribute(AttributeList::FunctionIndex,
+                                         "enzyme_parmremove");
+    SmallVector<StringRef, 1> indexes;
+    removed.getValueAsString().split(indexes, ",");
+    std::string remaining;
+    for (auto index : indexes) {
+      uint64_t value;
+      bool invalid = index.getAsInteger(10, value);
+      (void)invalid;
+      assert(!invalid);
+      if (value == 1)
+        continue;
+      if (!remaining.empty())
+        remaining += ",";
+      remaining += index.str();
+    }
+    NewAttrs = NewAttrs.removeAttribute(
+        F->getContext(), AttributeList::FunctionIndex, "enzyme_parmremove");
+    if (!remaining.empty())
+      NewAttrs =
+          NewAttrs.addAttribute(F->getContext(), AttributeList::FunctionIndex,
+                                "enzyme_parmremove", remaining);
+  }
   if (sretTy || roots_AT)
     NewAttrs = allowArgumentMemoryWrites(F->getContext(), NewAttrs);
 
