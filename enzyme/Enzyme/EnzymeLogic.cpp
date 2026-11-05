@@ -66,6 +66,7 @@
 #include "llvm/IR/Verifier.h"
 
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 
@@ -265,19 +266,67 @@ struct CacheAnalysis {
     return false;
   }
 
-  // Whether I only writes storage created after callsite, which therefore
-  // cannot hold data the call read. That storage is either a noalias
+  std::map<std::pair<CallInst *, CallInst *>, bool> unexposedAllocations;
+
+  // Whether no use of alloc, including pointers loaded transitively from it,
+  // can expose its storage to callsite. Reject passing even a nocapture
+  // argument: the call could read through it or return one of its fields.
+  // Uses that cannot reach callsite are irrelevant, but a use after the call
+  // in a loop can reach the next iteration and must count. Following loads
+  // also catches publication of the owned buffer without its header.
+  bool allocationUnexposedToCall(CallInst *alloc, CallInst *callsite) {
+    auto key = std::make_pair(alloc, callsite);
+    auto found = unexposedAllocations.find(key);
+    if (found != unexposedAllocations.end())
+      return found->second;
+    SmallVector<Value *, 16> todo{alloc};
+    SmallPtrSet<Value *, 32> seen;
+    while (!todo.empty()) {
+      auto V = todo.pop_back_val();
+      if (!seen.insert(V).second)
+        continue;
+      for (auto U : V->users()) {
+        auto I = dyn_cast<Instruction>(U);
+        if (!I)
+          return unexposedAllocations[key] = false;
+        if (!isPotentiallyReachable(I, callsite, nullptr, &OrigDT, &OrigLI))
+          continue;
+        if (isa<CmpInst>(I) || isa<BranchInst>(I) || isa<SwitchInst>(I))
+          continue;
+        if (auto SI = dyn_cast<StoreInst>(I)) {
+          if (SI->getValueOperand() != V)
+            continue;
+        } else if (auto MI = dyn_cast<MemIntrinsic>(I)) {
+          if (auto MT = dyn_cast<MemTransferInst>(MI)) {
+            if (MT->getRawSource() == V)
+              return unexposedAllocations[key] = false;
+          }
+          if (MI->getRawDest() == V)
+            continue;
+        } else if (isPointerArithmeticInst(I) || isa<LoadInst>(I) ||
+                   isa<SelectInst>(I) || isa<ExtractValueInst>(I) ||
+                   isa<InsertValueInst>(I)) {
+          todo.push_back(I);
+          continue;
+        }
+        return unexposedAllocations[key] = false;
+      }
+    }
+    return unexposedAllocations[key] = true;
+  }
+
+  // Whether I only writes storage the call could not reach: created after
+  // callsite, or still unexposed to it. That storage is either a noalias
   // allocation the call dominates, written directly (a box or tuple a later
   // statement fills), or fresh owned storage such an allocation's header
   // points to: an allocator may initialize a field with a pointer to fresh
   // owned storage, and its enzyme_fresh_pointer attribute gives that field's
   // byte offset. A header merged from several such allocations qualifies, a
-  // merge with any other object does not. Restrict this proof to callsites
-  // outside loops: otherwise a
-  // later dynamic execution of the call could have seen the same allocation.
+  // merge with any other object does not. The allocation-order proof requires
+  // a callsite outside loops: a later dynamic execution could otherwise have
+  // seen the allocation. The use proof includes such later executions.
   bool writesToNewOwnedStorage(Instruction *I, CallInst *callsite) {
-    if (OrigLI.getLoopFor(callsite->getParent()))
-      return false;
+    bool callOutsideLoop = !OrigLI.getLoopFor(callsite->getParent());
     Value *ptr = nullptr;
     if (auto SI = dyn_cast<StoreInst>(I))
       ptr = SI->getPointerOperand();
@@ -287,7 +336,8 @@ struct CacheAnalysis {
       return false;
     Value *obj = getBaseObject(ptr);
     if (auto fresh = dyn_cast<CallInst>(obj))
-      return OrigDT.dominates(callsite, fresh) && isNoAlias(fresh);
+      return callOutsideLoop && OrigDT.dominates(callsite, fresh) &&
+             isNoAlias(fresh);
     auto ld = dyn_cast<LoadInst>(obj);
     if (!ld)
       return false;
@@ -295,7 +345,8 @@ struct CacheAnalysis {
     if (!getFreshPointerAllocations(ld, allocs))
       return false;
     for (auto alloc : allocs)
-      if (!OrigDT.dominates(callsite, alloc))
+      if (!(callOutsideLoop && OrigDT.dominates(callsite, alloc)) &&
+          !allocationUnexposedToCall(alloc, callsite))
         return false;
     int64_t offset = 0;
     getPointerFieldOwner(ld->getPointerOperand(), offset,

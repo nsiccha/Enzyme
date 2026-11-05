@@ -1,6 +1,6 @@
 ; RUN: if [ %llvmver -ge 15 ]; then %opt < %s %OPnewLoadEnzyme -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg)" -enzyme-preopt=false -S | FileCheck %s; fi
 
-; An allocation before the callee may have been exposed to that call.
+; An earlier allocation with no publication before the call is still private.
 
 ; A split callee reads through an array header. A later write goes through
 ; a fresh buffer pointer loaded from another allocation's header.
@@ -47,5 +47,8 @@ entry:
 
 attributes #0 = { inaccessiblememonly "enzyme_allocator"="0" "enzyme_fresh_pointer"="0" "enzyme_inactive" }
 
-; CHECK: define internal {{.*}} @augmented_sqdist(
-; CHECK: call {{.*}} @malloc(
+; CHECK: define internal void @augmented_sqdist(
+; CHECK-NOT: malloc
+; CHECK: }
+; CHECK: define internal { double } @diffesqdist(
+; CHECK: %y_unwrap = load double
