@@ -162,6 +162,51 @@ static bool writesOnlyUncapturedLocalMemory(Instruction *I,
   return false;
 }
 
+// What the writes that follow a call in its caller may store
+// (subsequent_calls_may_write): the called function cannot see them, so they
+// may overwrite memory it read. 0 means no such writes, and every other value
+// means some, so code that reads the value as a bool stays conservative.
+// SubsequentWriteAny (what `true` meant) covers any write.
+// SubsequentWritePointers covers stores of pointer values only, such as a
+// pointer stored back into the object it was loaded from. Such a store cannot
+// overwrite memory that holds integers or floats: in C that is strict
+// aliasing, and Julia keeps object references only where its garbage
+// collector looks for them, never inside numeric data. Stores of numbers stay
+// Any: Julia may reinterpret floating-point data as integers in place.
+enum : uint8_t {
+  SubsequentWriteAny = 1,
+  SubsequentWritePointers = 2,
+};
+
+// The kind of subsequent write that I is.
+static uint8_t subsequentWriteKind(Instruction *I) {
+  if (auto SI = dyn_cast<StoreInst>(I))
+    if (SI->getValueOperand()->getType()->isPointerTy())
+      return SubsequentWritePointers;
+  return SubsequentWriteAny;
+}
+
+// writes with the writes of kind added. Any absorbs the other kinds, so equal
+// meanings make equal cache keys.
+static uint8_t addSubsequentWrite(uint8_t writes, uint8_t kind) {
+  writes |= kind;
+  return (writes & SubsequentWriteAny) ? SubsequentWriteAny : writes;
+}
+
+// Whether memory known to hold values of type CT cannot hold a pointer.
+static bool holdsNoPointers(ConcreteType CT) {
+  return CT == BaseType::Integer || CT.isFloat();
+}
+
+// Whether writes may overwrite memory read as values of type read.
+static bool subsequentWritesMayOverwrite(uint8_t writes, ConcreteType read) {
+  if (writes == 0)
+    return false;
+  if (writes & SubsequentWriteAny)
+    return true;
+  return !holdsNoPointers(read);
+}
+
 struct CacheAnalysis {
 
   const ValueMap<const CallInst *, SmallPtrSet<const CallInst *, 1>>
@@ -176,7 +221,7 @@ struct CacheAnalysis {
   DominatorTree &OrigDT;
   TargetLibraryInfo &TLI;
   const SmallPtrSetImpl<BasicBlock *> &unnecessaryBlocks;
-  const bool subsequent_calls_may_write;
+  const uint8_t subsequent_calls_may_write;
   const std::vector<bool> &overwritten_args;
   DerivativeMode mode;
   std::map<Value *, bool> seen;
@@ -190,7 +235,7 @@ struct CacheAnalysis {
       TypeResults &TR, AAResults &AA, Function *oldFunc, ScalarEvolution &SE,
       LoopInfo &OrigLI, DominatorTree &OrigDT, TargetLibraryInfo &TLI,
       const SmallPtrSetImpl<BasicBlock *> &unnecessaryBlocks,
-      bool subsequent_calls_may_write,
+      uint8_t subsequent_calls_may_write,
       const std::vector<bool> &overwritten_args, DerivativeMode mode, bool omp)
       : allocationsWithGuaranteedFree(allocationsWithGuaranteedFree),
         rematerializableAllocations(rematerializableAllocations), TR(TR),
@@ -390,15 +435,26 @@ struct CacheAnalysis {
     return call && isNoAlias(call);
   }
 
-  /// Whether the memory at obj may be overwritten after this function
-  /// returns. Unknown writes (subsequent_calls_may_write) may overwrite any
-  /// memory not local to this function. Otherwise the caller only wrote to
-  /// its own uncaptured memory, which this function can only reach through an
+  /// Whether the memory at obj, read as values of type read, may be
+  /// overwritten after this function returns. Unknown writes
+  /// (subsequent_calls_may_write) may overwrite any memory not local to this
+  /// function, except that stores of pointers only cannot overwrite memory
+  /// read as integers or floats. Otherwise the caller only wrote to its own
+  /// uncaptured memory, which this function can only reach through an
   /// argument, so only an argument marked overwritten can be.
-  bool is_origin_overwritten(Value *obj) {
-    if (subsequent_calls_may_write)
+  bool is_origin_overwritten(Value *obj,
+                             ConcreteType read = BaseType::Unknown) {
+    if (subsequentWritesMayOverwrite(subsequent_calls_may_write, read))
       return is_value_mustcache_from_origin(obj);
     return is_overwritten_argument(obj);
+  }
+
+  /// The one type of all memory that pointer p points to, or Unknown when
+  /// that memory may hold values of different types.
+  ConcreteType pointeeType(Value *p) {
+    if (!p->getType()->isPointerTy())
+      return BaseType::Unknown;
+    return TR.query(p)[{0, -1}];
   }
 
   std::map<Value *, bool> seen_argument;
@@ -598,7 +654,7 @@ struct CacheAnalysis {
       return false;
 
     // Check if pointer operand is overwritten after this function returns.
-    bool can_modref = is_origin_overwritten(obj);
+    bool can_modref = is_origin_overwritten(obj, TR.query(&li)[{-1}]);
 
     if (!can_modref && checkFunction) {
       allFollowersOf(&li, [&](Instruction *inst2) {
@@ -715,7 +771,7 @@ struct CacheAnalysis {
     return can_modref_map;
   }
 
-  std::pair<bool, std::vector<bool>>
+  std::pair<uint8_t, std::vector<bool>>
   compute_overwritten_args_for_one_callsite(CallInst *callsite_op) {
     auto Fn = getFunctionFromCall(callsite_op);
     if (!Fn)
@@ -773,6 +829,8 @@ struct CacheAnalysis {
     SmallVector<Value *, 4> args;
     SmallVector<Value *, 4> objs;
     SmallVector<bool, 4> args_safe;
+    // Whether each argument points to memory known to hold no pointers.
+    SmallVector<bool, 4> args_no_pointers;
 
     // First, we need to propagate the uncacheable status from the parent
     // function to the callee.
@@ -787,7 +845,10 @@ struct CacheAnalysis {
 
       objs.push_back(obj);
 
-      bool init_safe = !is_origin_overwritten(obj);
+      ConcreteType read = pointeeType(callsite_op->getArgOperand(i));
+      args_no_pointers.push_back(holdsNoPointers(read));
+
+      bool init_safe = !is_origin_overwritten(obj, read);
       if (!init_safe) {
         auto CD = TR.query(obj)[{-1}];
         if (CD == BaseType::Integer || CD.isFloat())
@@ -803,7 +864,7 @@ struct CacheAnalysis {
       args_safe.push_back(init_safe);
     }
 
-    bool next_subsequent_inst_may_write = subsequent_calls_may_write;
+    uint8_t next_subsequent_inst_may_write = subsequent_calls_may_write;
 
     // Second, we check for memory modifications that can occur in the
     // continuation of the
@@ -861,13 +922,18 @@ struct CacheAnalysis {
       if (writesToNewOwnedStorage(inst2, callsite_op))
         return false;
 
+      const uint8_t kind = subsequentWriteKind(inst2);
+
       // A write to uncaptured local memory is not an unknown write: the callee
       // can only reach that memory through an argument, which is marked
-      // overwritten below.
+      // overwritten below. An unknown write adds its kind: after stores of
+      // pointers only, the callee may keep numbers it reads.
       if (!writesOnlyUncapturedLocalMemory(inst2, TLI)) {
-        if (!next_subsequent_inst_may_write)
+        uint8_t next = addSubsequentWrite(next_subsequent_inst_may_write, kind);
+        if (next != next_subsequent_inst_may_write &&
+            !(next_subsequent_inst_may_write & SubsequentWriteAny))
           emitUnknownWrite(callsite_op, inst2);
-        next_subsequent_inst_may_write = true;
+        next_subsequent_inst_may_write = next;
       }
       const bool writesCreatedObject = writesOnlyCreatedObject(inst2);
       for (unsigned i = 0; i < args.size(); ++i) {
@@ -881,6 +947,11 @@ struct CacheAnalysis {
 
         auto CD = TR.query(args[i])[{-1}];
         if (CD == BaseType::Integer || CD.isFloat())
+          continue;
+
+        // A store of a pointer does not overwrite memory that holds no
+        // pointers (see SubsequentWritePointers).
+        if (kind == SubsequentWritePointers && args_no_pointers[i])
           continue;
 
         if (!callsite_op->getArgOperand(i)->getType()->isPointerTy() ||
@@ -943,9 +1014,9 @@ struct CacheAnalysis {
   //   the set of uncacheable arguments for each callsite inside the function. A
   //   pointer argument is uncacheable at a callsite if the memory pointed to
   //   might be modified after that callsite.
-  std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+  std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
   compute_overwritten_args_for_callsites() {
-    std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+    std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
         overwritten_args_map;
 
     for (auto &B : *oldFunc) {
@@ -964,7 +1035,8 @@ struct CacheAnalysis {
           // For all other calls, we compute the uncacheable args for this
           // callsite.
           overwritten_args_map.insert(
-              std::pair<CallInst *, std::pair<bool, const std::vector<bool>>>(
+              std::pair<CallInst *,
+                        std::pair<uint8_t, const std::vector<bool>>>(
                   op, compute_overwritten_args_for_one_callsite(op)));
         }
       }
@@ -2302,7 +2374,8 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
     RequestContext context, Function *todiff, DIFFE_TYPE retType,
     ArrayRef<DIFFE_TYPE> constant_args, TypeAnalysis &TA, bool returnUsed,
     bool shadowReturnUsed, const FnTypeInfo &oldTypeInfo_,
-    bool subsequent_calls_may_write, const std::vector<bool> _overwritten_args,
+    uint8_t subsequent_calls_may_write,
+    const std::vector<bool> _overwritten_args,
     const std::vector<bool> &nowrite_shadows, bool forceAnonymousTape,
     bool runtimeActivity, bool strongZero, unsigned width, bool AtomicAdd,
     bool omp) {
@@ -2785,7 +2858,7 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
                    *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
                    subsequent_calls_may_write, _overwritten_argsPP,
                    DerivativeMode::ReverseModePrimal, omp);
-  const std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map = CA.compute_overwritten_args_for_callsites();
   gutils->overwritten_args_map_ptr = &overwritten_args_map;
 
@@ -4612,7 +4685,7 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
                    *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
                    key.subsequent_calls_may_write, _overwritten_argsPP,
                    key.mode, omp);
-  const std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map =
           (augmenteddata) ? augmenteddata->overwritten_args_map
                           : CA.compute_overwritten_args_for_callsites();
@@ -4992,7 +5065,8 @@ Function *EnzymeLogic::CreateForwardDiff(
     ArrayRef<DIFFE_TYPE> constant_args, TypeAnalysis &TA, bool returnUsed,
     DerivativeMode mode, bool freeMemory, bool runtimeActivity, bool strongZero,
     unsigned width, llvm::Type *additionalArg, const FnTypeInfo &oldTypeInfo_,
-    bool subsequent_calls_may_write, const std::vector<bool> _overwritten_args,
+    uint8_t subsequent_calls_may_write,
+    const std::vector<bool> _overwritten_args,
     const AugmentedReturn *augmenteddata, bool omp) {
 
   TimeTraceScope timeScope("CreateForwardDiff", todiff->getName());
@@ -5304,7 +5378,7 @@ Function *EnzymeLogic::CreateForwardDiff(
         PPC.FAM.getResult<ScalarEvolutionAnalysis>(*gutils->oldFunc),
         *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
         subsequent_calls_may_write, _overwritten_argsPP, mode, omp);
-    const std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+    const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
         overwritten_args_map = CA.compute_overwritten_args_for_callsites();
     gutils->overwritten_args_map_ptr = &overwritten_args_map;
     can_modref_map = std::make_unique<const std::map<Instruction *, bool>>(

@@ -2355,8 +2355,8 @@ classifyAtomicModifyOp(llvm::Function *op, unsigned &opArgNo, llvm::Type *&FT) {
 
 bool AdjointGenerator::handleKnownCallDerivatives(
     CallInst &call, Function *called, StringRef funcName,
-    bool subsequent_calls_may_write, const std::vector<bool> &overwritten_args,
-    CallInst *const newCall) {
+    uint8_t subsequent_calls_may_write,
+    const std::vector<bool> &overwritten_args, CallInst *const newCall) {
   bool subretused = false;
   bool shadowReturnUsed = false;
   DIFFE_TYPE subretType =

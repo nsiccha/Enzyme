@@ -112,7 +112,7 @@ public:
   //! returned struct
   std::map<AugmentedStruct, int> returns;
 
-  std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+  std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map;
 
   std::map<llvm::Instruction *, bool> can_modref_map;
@@ -129,7 +129,7 @@ public:
       llvm::Function *fn, llvm::Type *tapeType,
       std::map<std::pair<llvm::Instruction *, CacheType>, int> tapeIndices,
       std::map<AugmentedStruct, int> returns,
-      std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+      std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
           overwritten_args_map,
       std::map<llvm::Instruction *, bool> can_modref_map,
       const std::vector<DIFFE_TYPE> &constant_args, bool shadowReturnUsed)
@@ -161,7 +161,7 @@ struct ReverseCacheKey {
   llvm::Function *todiff;
   DIFFE_TYPE retType;
   const std::vector<DIFFE_TYPE> constant_args;
-  bool subsequent_calls_may_write;
+  uint8_t subsequent_calls_may_write;
   std::vector<bool> overwritten_args;
   bool returnUsed;
   bool shadowReturnUsed;
@@ -463,7 +463,7 @@ public:
     llvm::Function *fn;
     DIFFE_TYPE retType;
     const std::vector<DIFFE_TYPE> constant_args;
-    bool subsequent_calls_may_write;
+    uint8_t subsequent_calls_may_write;
     std::vector<bool> overwritten_args;
     std::vector<bool> nowrite_shadows;
     bool returnUsed;
@@ -595,7 +595,7 @@ public:
       RequestContext context, llvm::Function *todiff, DIFFE_TYPE retType,
       llvm::ArrayRef<DIFFE_TYPE> constant_args, TypeAnalysis &TA,
       bool returnUsed, bool shadowReturnUsed, const FnTypeInfo &typeInfo,
-      bool subsequent_calls_may_write,
+      uint8_t subsequent_calls_may_write,
       const std::vector<bool> _overwritten_args,
       const std::vector<bool> &nowrite_shadows, bool forceAnonymousTape,
       bool runtimeActivity, bool strongZero, unsigned width, bool AtomicAdd,
@@ -607,7 +607,7 @@ public:
     llvm::Function *todiff;
     DIFFE_TYPE retType;
     const std::vector<DIFFE_TYPE> constant_args;
-    bool subsequent_calls_may_write;
+    uint8_t subsequent_calls_may_write;
     std::vector<bool> overwritten_args;
     bool returnUsed;
     DerivativeMode mode;
@@ -740,7 +740,7 @@ public:
                     bool returnValue, DerivativeMode mode, bool freeMemory,
                     bool runtimeActivity, bool strongZero, unsigned width,
                     llvm::Type *additionalArg, const FnTypeInfo &typeInfo,
-                    bool subsequent_calls_may_write,
+                    uint8_t subsequent_calls_may_write,
                     const std::vector<bool> _overwritten_args,
                     const AugmentedReturn *augmented, bool omp = false);
 

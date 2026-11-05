@@ -62,7 +62,7 @@ private:
   TypeResults &TR = gutils->TR;
   std::function<unsigned(llvm::Instruction *, CacheType, llvm::IRBuilder<> &)>
       getIndex;
-  const std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map;
   const AugmentedReturn *augmentedReturn;
   const std::map<llvm::ReturnInst *, llvm::StoreInst *> *replacedReturns;
@@ -80,7 +80,8 @@ public:
       std::function<unsigned(llvm::Instruction *, CacheType,
                              llvm::IRBuilder<> &)>
           getIndex,
-      const std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+      const std::map<llvm::CallInst *,
+                     std::pair<uint8_t, const std::vector<bool>>>
           overwritten_args_map,
       const AugmentedReturn *augmentedReturn,
       const std::map<llvm::ReturnInst *, llvm::StoreInst *> *replacedReturns,
@@ -4488,7 +4489,7 @@ public:
 
     auto found_ow = overwritten_args_map.find(&call);
     assert(found_ow != overwritten_args_map.end());
-    const bool subsequent_calls_may_write = found_ow->second.first;
+    const uint8_t subsequent_calls_may_write = found_ow->second.first;
     const std::vector<bool> &overwritten_args = found_ow->second.second;
 
     IRBuilder<> BuilderZ(gutils->getNewFromOriginal(&call));
@@ -5248,7 +5249,7 @@ public:
 
   void recursivelyHandleSubfunction(llvm::CallInst &call,
                                     llvm::Function *called,
-                                    bool subsequent_calls_may_write,
+                                    uint8_t subsequent_calls_may_write,
                                     const std::vector<bool> &overwritten_args,
                                     bool shadowReturnUsed,
                                     DIFFE_TYPE subretType, bool subretused) {
@@ -6640,7 +6641,7 @@ public:
 
   bool handleKnownCallDerivatives(llvm::CallInst &call, llvm::Function *called,
                                   llvm::StringRef funcName,
-                                  bool subsequent_calls_may_write,
+                                  uint8_t subsequent_calls_may_write,
                                   const std::vector<bool> &overwritten_args,
                                   llvm::CallInst *const newCall);
 
@@ -6691,7 +6692,7 @@ public:
     assert(overwritten_args_map.find(&call) != overwritten_args_map.end() ||
            Mode == DerivativeMode::ForwardMode ||
            Mode == DerivativeMode::ForwardModeError);
-    const bool subsequent_calls_may_write =
+    const uint8_t subsequent_calls_may_write =
         (Mode == DerivativeMode::ForwardMode ||
          Mode == DerivativeMode::ForwardModeError)
             ? false
