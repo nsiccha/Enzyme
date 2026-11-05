@@ -2657,6 +2657,103 @@ void GradientUtils::ensureLookupCached(Instruction *inst, bool shouldFree,
   storeInstructionInCache(lctx, inst, cache, TBAA);
 }
 
+bool GradientUtils::isIterationInvariant(const Value *V, const Loop *L,
+                                         unsigned depth) {
+  auto I = dyn_cast<Instruction>(V);
+  if (!I || !L->contains(I->getParent()))
+    return true;
+  // Bound the walk through operands; giving up only keeps the per-iteration
+  // cache.
+  if (depth > 8)
+    return false;
+
+  if (auto LI = dyn_cast<LoadInst>(I)) {
+    // An unordered load reads what the last write to its location stored. Its
+    // value is the same in every iteration if the location is, and no
+    // instruction executed during the loop (one of its instructions, or a
+    // callee of one) writes there.
+    if (!LI->isUnordered())
+      return false;
+    if (!isIterationInvariant(LI->getPointerOperand(), L, depth + 1))
+      return false;
+    auto found = loopWriters.find(L);
+    if (found == loopWriters.end()) {
+      SmallVector<Instruction *, 4> writers;
+      for (auto BB : L->blocks())
+        for (auto &W : *BB) {
+          if (!W.mayWriteToMemory())
+            continue;
+          // As for the uncacheable-load analysis, a fence orders other
+          // threads' accesses and writes nothing itself.
+          if (isa<FenceInst>(&W))
+            continue;
+          writers.push_back(&W);
+        }
+      found = loopWriters.emplace(L, std::move(writers)).first;
+    }
+    const Value *base = getBaseObject(LI->getPointerOperand());
+    for (auto W : found->second) {
+      // A write through the object the load reads from counts as a write of
+      // what it reads, whatever alias analysis concludes from attributes (it
+      // takes a store through a `noalias readonly` argument to write nothing).
+      const Value *dest = nullptr;
+      if (auto SI = dyn_cast<StoreInst>(W))
+        dest = SI->getPointerOperand();
+      else if (auto RMW = dyn_cast<AtomicRMWInst>(W))
+        dest = RMW->getPointerOperand();
+      else if (auto CX = dyn_cast<AtomicCmpXchgInst>(W))
+        dest = CX->getPointerOperand();
+      else if (auto MI = dyn_cast<MemIntrinsic>(W))
+        dest = MI->getDest();
+      if (dest && getBaseObject(dest) == base)
+        return false;
+      if (writesToMemoryReadBy(&TR, *OrigAA, TLI, const_cast<LoadInst *>(LI),
+                               W))
+        return false;
+    }
+    return true;
+  }
+
+  // Instructions that compute their result from their operands alone.
+  if (!isa<GetElementPtrInst>(I) && !isa<CastInst>(I) &&
+      !isa<BinaryOperator>(I) && !isa<CmpInst>(I) &&
+      !isa<ExtractValueInst>(I) && !isa<SelectInst>(I))
+    return false;
+  for (auto &op : I->operands())
+    if (!isIterationInvariant(op, L, depth + 1))
+      return false;
+  return true;
+}
+
+BasicBlock *
+GradientUtils::iterationInvariantCacheScope(const Instruction *orig) {
+  assert(orig->getParent()->getParent() == oldFunc);
+  auto found = iterationInvariantScopes.find(orig);
+  if (found != iterationInvariantScopes.end())
+    return found->second;
+
+  BasicBlock *scope = nullptr;
+  // Per-thread caches of OpenMP outlined regions keep their own layout.
+  if (EnzymeLoopInvariantCache && !omp) {
+    const Loop *outermost = nullptr;
+    for (const Loop *L = OrigLI->getLoopFor(orig->getParent()); L;
+         L = L->getParentLoop()) {
+      if (!isIterationInvariant(orig, L))
+        break;
+      outermost = L;
+    }
+    // Preprocessing gives every loop a preheader, which lies in the loops
+    // around `outermost` and no others, so a cache scoped there has one entry
+    // per entry of `outermost`. Every execution of `orig` in that entry
+    // stores the same value into it.
+    if (outermost)
+      if (auto preheader = outermost->getLoopPreheader())
+        scope = cast<BasicBlock>(getNewFromOriginal(preheader));
+  }
+  iterationInvariantScopes[orig] = scope;
+  return scope;
+}
+
 Value *GradientUtils::fixLCSSA(Instruction *inst, BasicBlock *forwardBlock,
                                bool legalInBlock) {
   assert(inst->getName() != "<badref>");
@@ -2885,7 +2982,8 @@ static Value *rebuildUncachedTapeArg(GradientUtils &gutils,
 }
 
 Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
-                                      int idx, bool replace) {
+                                      int idx, bool replace,
+                                      const Instruction *orig) {
   assert(malloc);
   assert(BuilderQ.GetInsertBlock()->getParent() == newFunc);
   assert(isOriginalBlock(*BuilderQ.GetInsertBlock()));
@@ -2894,6 +2992,22 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     assert(!tape);
     return malloc;
   }
+
+  // The block whose loops index this cache, when the value does not change
+  // across iterations of some loops around it (iterationInvariantCacheScope).
+  // The augmented pass, which writes the tape, and the reverse pass, which
+  // reads it, decide this from the same original instruction. A cache that
+  // already exists keeps its own scope.
+  BasicBlock *hoisted = nullptr;
+  if (!orig)
+    if (auto inst = dyn_cast<Instruction>(malloc))
+      orig = isOriginal(inst);
+  if (orig)
+    hoisted = iterationInvariantCacheScope(orig);
+  if (hoisted)
+    if (auto found = findInMap(scopeMap, malloc))
+      if (found->second.Block != hoisted)
+        hoisted = nullptr;
 
 #ifndef NDEBUG
   if (auto CI = dyn_cast<CallInst>(malloc)) {
@@ -3009,6 +3123,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     if (auto inst = dyn_cast<Instruction>(malloc))
       ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0,
                          inst->getParent());
+    if (hoisted)
+      ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0, hoisted);
     if (auto found = findInMap(scopeMap, malloc)) {
       ctx = found->second;
     }
@@ -3053,7 +3169,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                                 /*inForwardPass*/ true, nullptr,
                                 LimitContext(
                                     /*ReverseLimit*/ reverseBlocks.size() > 0,
-                                    BuilderQ.GetInsertBlock()))
+                                    hoisted ? hoisted
+                                            : BuilderQ.GetInsertBlock()))
                                 .size();
              i < limit; ++i) {
           if (!isa<PointerType>(innerType)) {
@@ -3122,7 +3239,7 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
       }
 
       LimitContext lctx(/*ReverseLimit*/ reverseBlocks.size() > 0,
-                        BuilderQ.GetInsertBlock());
+                        hoisted ? hoisted : BuilderQ.GetInsertBlock());
       AllocaInst *cache =
           createCacheForScope(lctx, innerType, "mdyncache_fromtape",
                               ((DiffeGradientUtils *)this)->FreeMemory, false);
@@ -3356,6 +3473,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     if (auto inst = dyn_cast<Instruction>(malloc))
       ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0,
                          inst->getParent());
+    if (hoisted)
+      ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0, hoisted);
     if (auto found = findInMap(scopeMap, malloc)) {
       ctx = found->second;
     }
@@ -3395,7 +3514,7 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     ensureLookupCached(
         cast<Instruction>(malloc),
         /*shouldFree=*/reverseBlocks.size() > 0,
-        /*scope*/ nullptr,
+        /*scope*/ hoisted,
         cast<Instruction>(malloc)->getMetadata(LLVMContext::MD_tbaa));
     auto found2 = scopeMap.find(malloc);
     assert(found2 != scopeMap.end());
@@ -3422,7 +3541,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                               /*inForwardPass*/ true, nullptr,
                               LimitContext(
                                   /*ReverseLimit*/ reverseBlocks.size() > 0,
-                                  BuilderQ.GetInsertBlock()))
+                                  hoisted ? hoisted
+                                          : BuilderQ.GetInsertBlock()))
                               .size();
            i < limit; ++i) {
         innerType = innerType->getPointerElementType();
@@ -8177,6 +8297,24 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
           }
         }
     }
+  }
+
+  // A value the same in every iteration of some loops around it is cached
+  // once per entry of the outermost such loop, as cacheForReverse does, which
+  // takes over a cache made here and must find it in that scope: the reverse
+  // pass looks up the shadow of a load before it visits the load. So the
+  // shadow of a load is scoped as the load is.
+  if (scopeI == inst->getParent() && scopeMap.find(inst) == scopeMap.end()) {
+    const Instruction *origForScope = isOriginal(inst);
+    if (!origForScope)
+      for (const auto &pair : invertedPointers)
+        if (pair.second == inst) {
+          origForScope = dyn_cast<LoadInst>(pair.first);
+          break;
+        }
+    if (origForScope)
+      if (auto hoisted = iterationInvariantCacheScope(origForScope))
+        scopeI = hoisted;
   }
 
   ensureLookupCached(inst, /*shouldFree*/ true, scopeI,

@@ -410,8 +410,36 @@ public:
       std::map<std::pair<llvm::Instruction *, CacheType>, int> &mapping,
       llvm::IRBuilder<> &);
 
+  /// `orig`, when given, is the instruction of the original function whose
+  /// value (or shadow) `malloc` is; it chooses the loops that index the cache
+  /// (iterationInvariantCacheScope). Without it, `malloc` itself is used when
+  /// it is an original instruction.
   llvm::Value *cacheForReverse(llvm::IRBuilder<> &BuilderQ, llvm::Value *malloc,
-                               int idx, bool replace = true);
+                               int idx, bool replace = true,
+                               const llvm::Instruction *orig = nullptr);
+
+  /// The block whose loops index the cache of `orig`, an instruction of the
+  /// original function, or null to keep one entry per iteration of every loop
+  /// around it. A value that is the same in every iteration of some loops
+  /// around it (a load through an address those loops do not change, of
+  /// memory no instruction in them may write) is cached once per entry of the
+  /// outermost such loop: the result is that loop's preheader in newFunc.
+  /// The answer depends on the original function only, so the augmented
+  /// forward pass and the reverse pass that reads its tape agree on it.
+  llvm::BasicBlock *iterationInvariantCacheScope(const llvm::Instruction *orig);
+
+private:
+  /// Whether `V` has one value in all iterations of `L` (a loop of the
+  /// original function) within one execution of `L`.
+  bool isIterationInvariant(const llvm::Value *V, const llvm::Loop *L,
+                            unsigned depth = 0);
+  /// Instructions of a loop of the original function that may write memory.
+  std::map<const llvm::Loop *, llvm::SmallVector<llvm::Instruction *, 4>>
+      loopWriters;
+  std::map<const llvm::Instruction *, llvm::BasicBlock *>
+      iterationInvariantScopes;
+
+public:
 
   llvm::ArrayRef<llvm::WeakTrackingVH> getTapeValues() const {
     return addedTapeVals;

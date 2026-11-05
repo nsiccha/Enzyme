@@ -614,7 +614,8 @@ public:
           if (vd[{-1}].isPossiblePointer()) {
             Value *newip = gutils->cacheForReverse(
                 BuilderZ, placeholder,
-                getIndex(&I, CacheType::Shadow, BuilderZ));
+                getIndex(&I, CacheType::Shadow, BuilderZ), /*replace*/ true,
+                /*orig*/ &I);
             assert(newip->getType() == type);
             gutils->invertedPointers.insert(std::make_pair(
                 (const Value *)&I, InvertedPointerVH(gutils, newip)));
@@ -681,7 +682,8 @@ public:
                                          DerivativeMode::ReverseModeGradient,
                                          oldUnreachable)) {
                 gutils->cacheForReverse(
-                    BuilderZ, newip, getIndex(&I, CacheType::Shadow, BuilderZ));
+                    BuilderZ, newip, getIndex(&I, CacheType::Shadow, BuilderZ),
+                    /*replace*/ true, /*orig*/ &I);
               }
               placeholder->replaceAllUsesWith(newip);
               gutils->erase(placeholder);
@@ -704,7 +706,8 @@ public:
               if (can_modref) {
                 newip = gutils->cacheForReverse(
                     BuilderZ, placeholder,
-                    getIndex(&I, CacheType::Shadow, BuilderZ));
+                    getIndex(&I, CacheType::Shadow, BuilderZ),
+                    /*replace*/ true, /*orig*/ &I);
                 assert(newip->getType() == type);
                 gutils->invertedPointers.insert(std::make_pair(
                     (const Value *)&I, InvertedPointerVH(gutils, newip)));

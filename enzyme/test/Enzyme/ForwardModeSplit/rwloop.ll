@@ -119,11 +119,10 @@ attributes #9 = { noreturn nounwind }
 
 ; CHECK: define internal double @fwddiffealldiv(double* noalias nocapture %a, double* nocapture %"a'", i32* noalias nocapture %N, i8* %tapeArg)
 ; CHECK-NEXT: entry:
-; CHECK-NEXT:   %0 = bitcast i8* %tapeArg to { i1, i32*, double** }*
-; CHECK-NEXT:   %truetape = load { i1, i32*, double** }, { i1, i32*, double** }* %0
-; CHECK-DAG:   %[[i1:.+]] = extractvalue { i1, i32*, double** } %truetape, 1
-; CHECK-DAG:   %[[i2:.+]] = extractvalue { i1, i32*, double** } %truetape, 2
-; CHECK-DAG:   %cmp233 = extractvalue { i1, i32*, double** } %truetape, 0
+; CHECK-NEXT:   %0 = bitcast i8* %tapeArg to { i1, i32, double** }*
+; CHECK-NEXT:   %truetape = load { i1, i32, double** }, { i1, i32, double** }* %0
+; CHECK-DAG:   %[[i2:.+]] = extractvalue { i1, i32, double** } %truetape, 2
+; CHECK-DAG:   %cmp233 = extractvalue { i1, i32, double** } %truetape, 0
 ; CHECK-NEXT:   br label %for.cond1.preheader
 
 ; CHECK: for.cond1.preheader:                              ; preds = %for.cond.cleanup3, %entry
@@ -134,8 +133,7 @@ attributes #9 = { noreturn nounwind }
 
 ; CHECK: for.body4.lr.ph:                                  ; preds = %for.cond1.preheader
 ; CHECK-NEXT:   %[[i3:.+]] = mul nuw nsw i64 %iv, 10
-; CHECK-NEXT:   %[[i4:.+]] = getelementptr inbounds i32, i32* %[[i1]], i64 %iv
-; CHECK-NEXT:   %[[i5:.+]] = load i32, i32* %[[i4]], align 4, !invariant.group !
+; CHECK-NEXT:   %[[i5:.+]] = extractvalue { i1, i32, double** } %truetape, 1
 ; CHECK-NEXT:   %[[i6:.+]] = sext i32 %[[i5]] to i64
 ; CHECK-NEXT:   br label %for.body4
 

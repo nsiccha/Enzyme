@@ -1,5 +1,9 @@
-; RUN: if [ %llvmver -lt 16 ]; then %opt < %s %loadEnzyme -enzyme-preopt=false -enzyme-detect-readthrow=0 -enzyme -mem2reg -S | FileCheck %s; fi
-; RUN: %opt < %s %newLoadEnzyme -enzyme-preopt=false -enzyme-detect-readthrow=0 -passes="enzyme,function(mem2reg)" -S | FileCheck %s
+; This tests the order of extractions from a loop cache in split mode. The
+; pointer loaded in the loop is the same in every iteration, so by default it is
+; cached once (loopinvariantcache.ll); -enzyme-loop-invariant-cache=0 keeps the
+; cache per iteration.
+; RUN: if [ %llvmver -lt 16 ]; then %opt < %s %loadEnzyme -enzyme-preopt=false -enzyme-detect-readthrow=0 -enzyme-loop-invariant-cache=0 -enzyme -mem2reg -S | FileCheck %s; fi
+; RUN: %opt < %s %newLoadEnzyme -enzyme-preopt=false -enzyme-detect-readthrow=0 -enzyme-loop-invariant-cache=0 -passes="enzyme,function(mem2reg)" -S | FileCheck %s
 
 define void @outer(i8* %tmp71, i8* %tmp72, i8* %tmp73, i8* %tmp74) {
 bb:
