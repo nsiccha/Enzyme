@@ -670,12 +670,33 @@ bool GradientUtils::isReplayedOnceLatch(const Instruction *term,
       if (pred != BB)
         return false;
 
+    // A latch that never runs keeps the full replay. Every other latch's loop
+    // gets a context in forceAugmentedReturns.
+    if (notForAnalysis.count(const_cast<BasicBlock *>(BB)))
+      return false;
     Loop *NL = LI.getLoopFor(getNewFromOriginal(BB));
     if (!NL)
       return false;
-    auto self = const_cast<GradientUtils *>(this);
-    if (self->computeLoopLimit(NL).first != self->SE.getCouldNotCompute())
-      return false;
+    // Whether scalar evolution cannot compute the loop's limit. Once the loop
+    // has a context, take the answer getContext recorded, which is the one
+    // the reverse pass uses, and do not query scalar evolution again:
+    // forceAugmentedReturns creates every loop's context and then inserts
+    // placeholder phis without incoming values, one of which can stand among
+    // the leading phis of a block (before an allocation that starts the
+    // block). LLVM 20's loop guards (LoopGuards::collectFromPHI, reached from
+    // howFarToZero) read the first incoming block of each leading phi of a
+    // block above the loop, so a trip-count query from then on reads
+    // uninitialized memory. Without a context, newFunc is still the clone of
+    // oldFunc, without placeholders.
+    auto context = loopContexts.find(NL);
+    if (context != loopContexts.end()) {
+      if (!context->second.dynamic)
+        return false;
+    } else {
+      auto self = const_cast<GradientUtils *>(this);
+      if (self->computeLoopLimit(NL).first != self->SE.getCouldNotCompute())
+        return false;
+    }
     if (!assumeDynamicLoopOfSizeOne(NL))
       return false;
 
