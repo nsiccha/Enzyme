@@ -363,6 +363,8 @@ attributes #6 = { nounwind }
 ; CHECK-NEXT:   %"add56'de.0" = phi float [ %[[v19]], %invertfor.cond.cleanup.loopexit ], [ %[[v22]], %incinvertfor.body ]
 ; CHECK-NEXT:   %"iv'ac.0" = phi i64 [ %_unwrap, %invertfor.cond.cleanup.loopexit ], [ %[[v23]], %incinvertfor.body ]
 ; CHECK-NEXT:   call void @llvm.nvvm.barrier0()
+; CHECK-NEXT:   %[[conv13_unwrap53]] = zext i32 %0 to i64
+; CHECK-NEXT:   %[[idxprom_unwrap54]] = zext i32 %1 to i64
 ; CHECK-NEXT:   br label %invertfor.body44
 
 ; CHECK: invertfor.body44:                                 ; preds = %incinvertfor.body44, %invertfor.cond.cleanup43
@@ -401,11 +403,9 @@ attributes #6 = { nounwind }
 ; CHECK: invertfor.body44_phimerge_phimerge:
 ; CHECK-NEXT:   %[[v33:.+]] = phi {{(fast )?}}float [ %[[_unwrap51]], %invertfor.body44_phimerge_phirc ], [ 0.000000e+00, %invertfor.body44_phimerge ]
 ; CHECK-NEXT:   %[[m1diffe:.+]] = fmul fast float %"add56'de.1", %[[v33]]
-; CHECK-NEXT:   %[[conv13_unwrap53]] = zext i32 %0 to i64
 ; CHECK-NEXT:   %"arrayidx54101'ipg_unwrap" = getelementptr inbounds [16 x [16 x float]], [16 x [16 x float]] addrspace(3)* @_ZZ22gpu_square_matrix_multPfS_S_mE6tile_b_shadow, i64 0, i64 %[[idxprom_unwrap20]], i64 %[[conv13_unwrap53]]
 ; CHECK-NEXT:   %"arrayidx54'ipc_unwrap" = addrspacecast float addrspace(3)* %"arrayidx54101'ipg_unwrap" to float*
 ; CHECK-NEXT:   %{{.+}} = atomicrmw fadd float* %"arrayidx54'ipc_unwrap", float %[[m1diffe]] monotonic
-; CHECK-NEXT:   %[[idxprom_unwrap54]] = zext i32 %1 to i64
 ; CHECK-NEXT:   %"arrayidx4999'ipg_unwrap" = getelementptr inbounds [16 x [16 x float]], [16 x [16 x float]] addrspace(3)* @_ZZ22gpu_square_matrix_multPfS_S_mE6tile_a_shadow, i64 0, i64 %[[idxprom_unwrap54]], i64 %[[idxprom_unwrap20]]
 ; CHECK-NEXT:   %"arrayidx49'ipc_unwrap" = addrspacecast float addrspace(3)* %"arrayidx4999'ipg_unwrap" to float*
 ; CHECK-NEXT:   %{{.+}} = atomicrmw fadd float* %"arrayidx49'ipc_unwrap", float %[[m0diffe]] monotonic

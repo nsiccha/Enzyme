@@ -428,6 +428,29 @@ public:
   /// forward pass and the reverse pass that reads its tape agree on it.
   llvm::BasicBlock *iterationInvariantCacheScope(const llvm::Instruction *orig);
 
+  /// The reverse block in which `inst` can be recomputed once per entry of the
+  /// reverse of the innermost loop that BuilderM's block belongs to, or null if
+  /// it must be recomputed where it is used. `inst` must be defined in a loop
+  /// around that loop or in no loop, and that loop must have one exit, which
+  /// `inst` dominates.
+  llvm::BasicBlock *
+  reverseLoopEntryForRecompute(llvm::Instruction *inst,
+                               llvm::IRBuilder<> &BuilderM,
+                               const llvm::ValueToValueMapTy &available);
+
+  /// Whether `inst` and everything it is computed from are recomputed the same
+  /// way from any position after `origExit`'s reverse block: plain operations
+  /// of the original function, whose only phis are induction variables of loops
+  /// around `origExit`, and memory the reverse pass does not rematerialize.
+  bool recomputesAnywhereInReverse(llvm::Instruction *inst,
+                                   const llvm::BasicBlock *origExit,
+                                   llvm::IRBuilder<> &BuilderM,
+                                   unsigned depth = 0);
+
+  /// The answers of recomputesAnywhereInReverse.
+  std::map<std::pair<const llvm::Instruction *, const llvm::BasicBlock *>, bool>
+      recomputableAtLoopEntry;
+
 private:
   /// Whether `V` has one value in all iterations of `L` (a loop of the
   /// original function) within one execution of `L`.

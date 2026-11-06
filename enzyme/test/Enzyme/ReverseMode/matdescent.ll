@@ -320,7 +320,6 @@ attributes #19 = { builtin nounwind }
 ; CHECK-NEXT:   %arrayidx8_unwrap = getelementptr inbounds double, double* %vec, i64 %"iv1'ac.0"
 ; CHECK-NEXT:   %a5_unwrap = load double, double* %arrayidx8_unwrap
 ; CHECK-NEXT:   %[[m1diffea4:.+]] = fmul fast double %[[add12de:.+]], %a5_unwrap
-; CHECK-NEXT:   %i2000_unwrap = mul nuw nsw i64 %"iv'ac.0", 2000
 ; CHECK-NEXT:   %a3_unwrap = add nuw nsw i64 %"iv1'ac.0", %i2000_unwrap
 ; CHECK-NEXT:   %[[arrayidx6ipg:.+]] = getelementptr inbounds double, double* %"mat'", i64 %a3_unwrap
 ; CHECK-NEXT:   %[[l8:.+]] = load double, double* %[[arrayidx6ipg]], align 8
@@ -336,6 +335,7 @@ attributes #19 = { builtin nounwind }
 ; CHECK: invertfor.cond.cleanup3:
 ; CHECK-NEXT:   %"add12'de.1" = phi double [ 0.000000e+00, %incinvertfor.body ], [ 0.000000e+00, %invertfor.body20 ]
 ; CHECK-NEXT:   %"iv'ac.0" = phi i64 [ %1, %incinvertfor.body ], [ 2000, %invertfor.body20 ]
+; CHECK-NEXT:   %i2000_unwrap = mul nuw nsw i64 %"iv'ac.0", 2000
 ; CHECK-NEXT:   %[[arrayidxipg6:.+]] = getelementptr inbounds double, double* %[[outipc]], i64 %"iv'ac.0"
 ; CHECK-NEXT:   %[[lipg8:.+]] = load double, double* %[[arrayidxipg6]], align 8
 ; CHECK-NEXT:   store double 0.000000e+00, double* %[[arrayidxipg6]], align 8

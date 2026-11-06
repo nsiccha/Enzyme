@@ -149,7 +149,6 @@ declare dso_local void @__enzyme_autodiff(i8*, ...)
 ; CHECK-NEXT:   %_unwrap = load double, double* %arrayidx11_unwrap, align 8, !tbaa !2
 ; CHECK-NEXT:   %[[m0diffe:.+]] = fmul fast double %[[i11]], %_unwrap
 ; CHECK-NEXT:   %[[i12:.+]] = fadd fast double %[[de21]], %[[m0diffe]]
-; CHECK-NEXT:   %mul_unwrap = mul i64 %"iv'ac.0", %N
 ; CHECK-NEXT:   %add_unwrap = add i64 %"iv1'ac.0", %mul_unwrap
 ; CHECK-NEXT:   %arrayidx10_unwrap = getelementptr inbounds double, double* %L, i64 %add_unwrap
 ; CHECK-NEXT:   %[[_unwrap3:.+]] = load double, double* %arrayidx10_unwrap, align 8, !tbaa !2
@@ -171,6 +170,7 @@ declare dso_local void @__enzyme_autodiff(i8*, ...)
 ; CHECK-NEXT:   br label %invertfor.body8
 
 ; CHECK: invertif.end.loopexit:                            ; preds = %invertif.end
+; CHECK-NEXT:   %mul_unwrap = mul i64 %"iv'ac.0", %N
 ; CHECK-NEXT:   %[[_unwrap7]] = add i64 %"iv'ac.0", -2
 ; CHECK-NEXT:   br label %invertfor.body8
 
