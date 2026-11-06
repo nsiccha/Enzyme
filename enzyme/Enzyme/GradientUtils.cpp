@@ -862,6 +862,9 @@ BasicBlock *GradientUtils::isOriginal(const BasicBlock *newinst) const {
   return cast_or_null<BasicBlock>(isOriginal((const Value *)newinst));
 }
 
+static bool safeToRecomputeOnAllPaths(Value *cond, BasicBlock *ctx,
+                                      DominatorTree &DT);
+
 Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
                               const ValueToValueMapTy &available,
                               UnwrapMode unwrapMode, BasicBlock *scope,
@@ -2077,10 +2080,23 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
               goto endCheck;
             }
             auto bi2 = cast<Instruction>(subblock->getTerminator());
-            auto cond2 = getOp(getBranchCondition(bi2));
-            if (cond2 == nullptr) {
-              assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
-              goto endCheck;
+            // Only the forward paths into bi2's two successors ran `subblock`.
+            // Computing its condition cond2 here, before the branch on cond1,
+            // also recomputes it on the path to the third incoming block, from
+            // values the forward pass never computed there. That is only safe
+            // when every instruction it is recomputed from may be speculated;
+            // a recomputed call can throw on those values (Julia's `sqrt` does
+            // for a negative argument). Otherwise compute cond2 in `bsplit`
+            // below, which only the reverse of the two paths reaches.
+            bool cond2BeforeSplit = safeToRecomputeOnAllPaths(
+                getBranchCondition(bi2), phi->getParent(), DT);
+            Value *cond2 = nullptr;
+            if (cond2BeforeSplit) {
+              cond2 = getOp(getBranchCondition(bi2));
+              if (cond2 == nullptr) {
+                assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
+                goto endCheck;
+              }
             }
 
             SmallVector<BasicBlock *, 3> predBlocks = {bi2->getSuccessor(0),
@@ -2097,10 +2113,37 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
             SmallVector<BasicBlock *, 2> blocks;
             SmallVector<BasicBlock *, 2> endingBlocks;
 
-            BasicBlock *last = oldB;
-
             BasicBlock *bret = BasicBlock::Create(
                 val->getContext(), oldB->getName() + "_phimerge", newFunc);
+
+            BasicBlock *bsplit = BasicBlock::Create(
+                val->getContext(), oldB->getName() + "_phisplt", newFunc);
+            bsplit->moveAfter(oldB);
+            if (inReverseBlocks)
+              reverseBlocks[fwd].push_back(bsplit);
+            reverseBlockToPrimal[bsplit] = fwd;
+            BasicBlock *splitEnd = bsplit;
+            if (!cond2BeforeSplit) {
+              BasicBlock *condBlock = BuilderM.GetInsertBlock();
+              for (auto pair : unwrap_cache[condBlock])
+                unwrap_cache[bsplit].insert(pair);
+              for (auto pair : lookup_cache[condBlock])
+                lookup_cache[bsplit].insert(pair);
+              auto condIP = BuilderM.saveIP();
+              BuilderM.SetInsertPoint(bsplit);
+              cond2 = getOp(getBranchCondition(bi2));
+              // Computing cond2 may itself have split `bsplit`: branch on it
+              // where that computation ended.
+              splitEnd = BuilderM.GetInsertBlock();
+              BuilderM.restoreIP(condIP);
+              if (cond2 == nullptr) {
+                eraseBlocks({bsplit}, bret);
+                assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
+                goto endCheck;
+              }
+            }
+
+            BasicBlock *last = splitEnd;
 
             for (size_t i = 0; i < predBlocks.size(); i++) {
               BasicBlock *valparent = (i < 2) ? subblock : block;
@@ -2117,9 +2160,14 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
               reverseBlockToPrimal[blocks[i]] = fwd;
               IRBuilder<> B(blocks[i]);
 
-              for (auto pair : unwrap_cache[oldB])
+              // The reverse of bi2's two successors is entered from
+              // `splitEnd`, so it may reuse what computing cond2 there
+              // computed.
+              BasicBlock *cacheFrom =
+                  (i < 2 && !cond2BeforeSplit) ? splitEnd : oldB;
+              for (auto pair : unwrap_cache[cacheFrom])
                 unwrap_cache[blocks[i]].insert(pair);
-              for (auto pair : lookup_cache[oldB])
+              for (auto pair : lookup_cache[cacheFrom])
                 lookup_cache[blocks[i]].insert(pair);
               auto PB = *done[std::make_pair(valparent, predBlocks[i])].begin();
 
@@ -2150,7 +2198,11 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
                     getOpFull(BuilderM, phi->getIncomingValueForBlock(PB), PB));
 
               if (!vals[i]) {
-                eraseBlocks(blocks, bret);
+                // `bsplit` last: the value blocks may use what it computed.
+                SmallVector<BasicBlock *, 4> toErase(blocks.begin(),
+                                                     blocks.end());
+                toErase.push_back(bsplit);
+                eraseBlocks(toErase, bret);
                 assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
                 goto endCheck;
               }
@@ -2161,12 +2213,6 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
 
             bret->moveAfter(last);
 
-            BasicBlock *bsplit = BasicBlock::Create(
-                val->getContext(), oldB->getName() + "_phisplt", newFunc);
-            bsplit->moveAfter(oldB);
-            if (inReverseBlocks)
-              reverseBlocks[fwd].push_back(bsplit);
-            reverseBlockToPrimal[bsplit] = fwd;
             BuilderM.CreateCondBr(
                 cond1,
                 (done[std::make_pair(block, bi1->getSuccessor(0))].size() == 1)
@@ -2176,7 +2222,7 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
                     ? blocks[2]
                     : bsplit);
 
-            BuilderM.SetInsertPoint(bsplit);
+            BuilderM.SetInsertPoint(splitEnd);
             BuilderM.CreateCondBr(cond2, blocks[0], blocks[1]);
 
             BuilderM.SetInsertPoint(bret);
