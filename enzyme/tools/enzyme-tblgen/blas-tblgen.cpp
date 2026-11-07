@@ -1764,6 +1764,34 @@ void emit_dag(bool forward, Twine resultVarName, const DagInit *ruleDag,
     return;
   }
   if (Def->isSubClassOf("BlasCall")) {
+    // A BlasCall with an asserting inactive argument only refuses the case its
+    // shadows select (e.g. an active beta in gemm's forward rule): raise the
+    // error and build no call. A call without that argument would have the
+    // wrong arity, which the declaration's attributor then reads out of range.
+    for (size_t i = 0; i < ruleDag->getNumArgs(); i++) {
+      auto argDag = dyn_cast<DagInit>(ruleDag->getArg(i));
+      if (!argDag)
+        continue;
+      auto argDef = cast<DefInit>(argDag->getOperator())->getDef();
+      if ((argDef->getName() == "InactiveArgSpec" ||
+           argDef->isSubClassOf("InactiveArgSpec")) &&
+          argDef->getValueAsBit("asserting")) {
+        if (forward)
+          emit_if_rule_condition(pattern, ruleDag, "", "      ", os);
+        os << "        {\n";
+        os << "            std::string s;\n";
+        os << "            llvm::raw_string_ostream ss(s);\n";
+        os << "            ss << \"in Mode: \" << to_string(Mode) << \"\\n\";\n";
+        os << "            ss << \"cannot handle blas argument within "
+           << pattern.getName() << " of \" << call;\n";
+        os << "            EmitNoDerivativeError(ss.str(), call, gutils, "
+              "Builder2);\n";
+        os << "        }\n";
+        if (forward)
+          os << "        }\n";
+        return;
+      }
+    }
     if (forward)
       emit_if_rule_condition(pattern, ruleDag, "", "      ", os);
     const auto dfnc_name = Def->getValueAsString("s");
