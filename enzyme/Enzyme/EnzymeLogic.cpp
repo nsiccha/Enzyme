@@ -2087,17 +2087,52 @@ bool legalCombinedForwardReverse(
   if (!legal)
     return false;
 
+  // What moves is placed after the combined call in the reverse block of the
+  // call, so it runs only when the call runs. An instruction moves only if
+  // every path to it passes through the call.
+  auto dominatedByCall = [&](Instruction *inst) {
+    if (gutils->OrigDT->dominates(origop->getParent(), inst->getParent()))
+      return true;
+    if (EnzymePrintPerf) {
+      if (called)
+        llvm::errs() << " [dom] failed to replace function "
+                     << (called->getName()) << " due to " << *inst << "\n";
+      else
+        llvm::errs() << " [dom] failed to replace function " << (*calledValue)
+                     << " due to " << *inst << "\n";
+    }
+    return false;
+  };
+
+  unsigned reachableReturns = 0;
+  bool movesReturn = false;
   allFollowersOf(origop, [&](Instruction *inst) {
     if (auto ri = dyn_cast<ReturnInst>(inst)) {
       auto find = replacedReturns.find(ri);
       if (find != replacedReturns.end()) {
-        postCreate.push_back(find->second);
+        ++reachableReturns;
+        // The store of the primal return value moves only when the returned
+        // value moves. Otherwise it stays in the forward pass, which runs
+        // whether or not the call does.
+        if (usetree.count(ri)) {
+          if (!dominatedByCall(ri)) {
+            legal = false;
+            return true;
+          }
+          movesReturn = true;
+          postCreate.push_back(find->second);
+        }
         return false;
       }
     }
 
     if (usetree.count(inst) == 0 || unnecessaryInstructions.count(inst))
       return false;
+    if (!dominatedByCall(inst)) {
+      legal = false;
+      // Early exit
+      return true;
+    }
     if (inst->getParent() != origop->getParent()) {
       // Don't move a writing instruction (may change speculatable/etc things)
       if (inst->mayWriteToMemory()) {
@@ -2134,6 +2169,22 @@ bool legalCombinedForwardReverse(
 
   if (!legal)
     return false;
+
+  // A moved store of the return value runs after the call whichever return
+  // the forward pass took, so it must be the only return the call reaches.
+  if (movesReturn && reachableReturns > 1) {
+    if (EnzymePrintPerf) {
+      if (called)
+        llvm::errs() << " [ret] failed to replace function "
+                     << (called->getName()) << " due to " << reachableReturns
+                     << " reachable returns\n";
+      else
+        llvm::errs() << " [ret] failed to replace function " << (*calledValue)
+                     << " due to " << reachableReturns
+                     << " reachable returns\n";
+    }
+    return false;
+  }
 
   if (EnzymePrintPerf) {
     if (called)
