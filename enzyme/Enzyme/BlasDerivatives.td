@@ -214,13 +214,25 @@ def lacpy : CallBlasPattern<(Op $layout, $uplo, $m, $n, $A, $lda, $B, $ldb),
                   )
                   >;
 
+// A := (cto / cfrom) * A, on the part of A that $type selects
+// (the whole matrix, a triangle, a Hessenberg or band part).
+// The map is linear in A, so with cfrom and cto inactive its tangent and its
+// adjoint both scale the shadow of A the same way. The reverse rules of gemm,
+// symm, syrk, lacpy and potrf emit lascl, so this rule is also what makes their
+// reverse passes differentiable in forward mode (Forward over Reverse).
 def lascl : CallBlasPattern<(Op $layout, $type, $kl, $ku, $cfrom, $cto, $m, $n, $A, $lda, $info),
                   ["A"],[cblas_layout, uplo, len, len, fp, fp, len, len, mld<["m", "n"]>, info],
                   [
                   (AssertingInactiveArg), // cfrom
                   (AssertingInactiveArg), // cto
-                  (AssertingInactiveArg)  // A
-                  ]
+                  /* A */ (BlasCall<"lascl"> $layout, $type, $kl, $ku, $cfrom, $cto, $m, $n, (Shadow $A), Alloca<1>)
+                  ],
+                  // FWD: dA = (cto / cfrom) dA, refusing an active cfrom or cto
+                  (Seq<[], [], 1>
+                    (BlasCall<"axpy"> (AssertingInactiveArg), (Shadow $cfrom), $A, (Shadow $A)),
+                    (BlasCall<"axpy"> (AssertingInactiveArg), (Shadow $cto), $A, (Shadow $A)),
+                    (BlasCall<"lascl"> $layout, $type, $kl, $ku, $cfrom, $cto, $m, $n, (Shadow $A), Alloca<1>)
+                  )
                   >;
 
 // y = alpha * x + y
