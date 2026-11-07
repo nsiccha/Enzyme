@@ -5388,6 +5388,12 @@ Function *EnzymeLogic::CreateForwardDiff(
     if (EmitNoDerivativeError(ss.str(), todiff, context)) {
       auto newFunc = gutils->newFunc;
       delete gutils;
+      // Later calls get this function from ForwardCachedFunctions without a
+      // request of their own, so raise the error in its body too, as
+      // CreateAugmentedPrimal does. Otherwise they reach its bare unreachable.
+      IRBuilder<> b(&*newFunc->getEntryBlock().begin());
+      RequestContext context2{nullptr, &b};
+      EmitNoDerivativeError(ss.str(), todiff, context2);
       return newFunc;
     }
     llvm::errs() << "mod: " << *todiff->getParent() << "\n";
