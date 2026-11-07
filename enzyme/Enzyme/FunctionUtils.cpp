@@ -304,7 +304,16 @@ void RecursivelyReplaceAddressSpace(
     if (auto ASC = dyn_cast<AddrSpaceCastInst>(inst)) {
       auto AS = cast<PointerType>(rep->getType())->getAddressSpace();
       if (AS == ASC->getDestAddressSpace()) {
-        ASC->replaceAllUsesWith(rep);
+        // With typed pointers an addrspacecast may also change the pointee
+        // type (instcombine folds a bitcast into it, as Julia's
+        // `addrspacecast T* %slot to i8 addrspace(11)*` for jl_object_id_),
+        // so the moved pointer needs a bitcast to the cast's type.
+        Value *nrep = rep;
+        if (rep->getType() != ASC->getType()) {
+          IRBuilder<> B(ASC);
+          nrep = B.CreatePointerCast(rep, ASC->getType());
+        }
+        ASC->replaceAllUsesWith(nrep);
         assert(ASC);
         toErase.push_back(ASC);
         continue;
