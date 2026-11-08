@@ -726,6 +726,18 @@ struct CacheAnalysis {
           }
         }
 
+        // A call that writes no memory which existed before it, except on
+        // paths that throw, cannot overwrite what li read: inst2 follows li,
+        // so that memory existed when the call began. This is the exception
+        // compute_overwritten_args_for_one_callsite makes for what a callee
+        // read. writesToMemoryReadBy makes it only for the non-local variant,
+        // because it does not know which of the two runs first, and the local
+        // variant writes memory it returns. Writes through sret-like
+        // arguments name existing memory, so such a call is checked below.
+        if (auto CB = dyn_cast<CallBase>(inst2))
+          if (isLocalReadOnlyOrThrow(CB) && !hasSretLikeArgument(CB))
+            return false;
+
         if (!overwritesToMemoryReadBy(&TR, AA, TLI, SE, OrigLI, OrigDT, &li,
                                       inst2, /*scope*/ nullptr,
                                       &allocWrittenBeforeLoad)) {
