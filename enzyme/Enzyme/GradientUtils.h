@@ -73,6 +73,7 @@
 #include "llvm-c/Core.h"
 
 class GradientUtils;
+struct ArgumentOwnedWritesCache;
 extern llvm::StringMap<std::function<llvm::Value *(
     llvm::IRBuilder<> &, llvm::CallInst *, llvm::ArrayRef<llvm::Value *>,
     GradientUtils *)>>
@@ -334,7 +335,8 @@ public:
   llvm::ValueMap<llvm::Value *, ShadowRematerializer> backwardsOnlyShadows;
   std::vector<bool> nowrite_shadows;
 
-  void computeForwardingProperties(llvm::Instruction *V);
+  void computeForwardingProperties(llvm::Instruction *V,
+                                   ArgumentOwnedWritesCache &ownedWrites);
   void computeGuaranteedFrees();
 
 private:

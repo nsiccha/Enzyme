@@ -37,6 +37,7 @@
 #include "Utils.h"
 
 #include "DifferentialUseAnalysis.h"
+#include "FunctionUtils.h"
 #include "LibraryFuncs.h"
 #include "TypeAnalysis/TBAA.h"
 
@@ -10384,7 +10385,35 @@ void SubTransferHelper(GradientUtils *gutils, DerivativeMode mode,
   }
 }
 
-void GradientUtils::computeForwardingProperties(Instruction *V) {
+// Whether call, which only reads through its pointer operand idx, may still
+// write storage that operand owns. A readonly operand only promises that the
+// callee writes nothing through pointers based on it. A Julia array header is
+// such an operand: a callee that fills the array (before Julia 1.11) loads the
+// data pointer from the header and writes the elements through it, so the
+// header is readonly while the storage the allocation owns is written. The
+// callee writes no such storage when it writes no memory that existed before
+// the call (read-only-or-throw), or when its body shows that the only owned
+// storage it writes belongs to other arguments (getArgumentOwnedStorageWrites).
+static bool mayWriteOwnedStorageOfReadOnlyOperand(
+    CallInst *call, unsigned idx, TargetLibraryInfo &TLI,
+    ArgumentOwnedWritesCache &ownedWrites) {
+  if (isLocalReadOnlyOrThrow(call))
+    return false;
+  auto Callee = call->getCalledFunction();
+  if (!Callee || Callee->empty() ||
+      Callee->getCallingConv() != call->getCallingConv())
+    return true;
+  ArgumentOwnedWrites writes;
+  if (!getArgumentOwnedStorageWrites(*Callee, TLI, writes, ownedWrites))
+    return true;
+  for (auto &write : writes)
+    if (write.first == idx)
+      return true;
+  return false;
+}
+
+void GradientUtils::computeForwardingProperties(
+    Instruction *V, ArgumentOwnedWritesCache &ownedWrites) {
   if (!EnzymeRematerialize)
     return;
 
@@ -10537,6 +10566,21 @@ void GradientUtils::computeForwardingProperties(Instruction *V) {
         bool NoCapture = isNoCapture(CI, idx);
 
         bool ReadOnly = isReadOnly(CI, idx);
+
+        // Memory that may hold pointers can lead to storage the allocation
+        // owns but the operand is not based on, such as the elements of a
+        // Julia array, which are reached through the data pointer stored in
+        // its header (see EnzymeJuliaAddrLoad above). Rematerializing the
+        // allocation recreates that storage without the callee's writes.
+        if (ReadOnly && EnzymeJuliaAddrLoad && !CI->onlyReadsMemory() &&
+            !(TT == BaseType::Integer || TT.isFloat()) &&
+            mayWriteOwnedStorageOfReadOnlyOperand(CI, idx, TLI,
+                                                  ownedWrites)) {
+          EmitWarning("NotPromotable", *cur, " Allocation ", *V,
+                      " may have storage it owns written by readonly operand ",
+                      idx, " of ", *cur);
+          ReadOnly = false;
+        }
 
         bool WriteOnly = isWriteOnly(CI, idx);
 
@@ -10936,6 +10980,9 @@ int GradientUtils::getIndex(
 
 void GradientUtils::computeGuaranteedFrees() {
   SmallPtrSet<CallInst *, 2> allocsToPromote;
+  // getArgumentOwnedStorageWrites answers for computeForwardingProperties,
+  // which reads but does not change the module.
+  ArgumentOwnedWritesCache ownedWrites;
 
   DenseMap<Metadata *, SmallVector<CallInst *>> cache_frees;
   for (auto &BB : *oldFunc) {
@@ -10957,7 +11004,7 @@ void GradientUtils::computeGuaranteedFrees() {
       continue;
     for (auto &I : BB) {
       if (auto AI = dyn_cast<AllocaInst>(&I))
-        computeForwardingProperties(AI);
+        computeForwardingProperties(AI, ownedWrites);
 
       auto CI = dyn_cast<CallInst>(&I);
       if (!CI)
@@ -11020,7 +11067,7 @@ void GradientUtils::computeGuaranteedFrees() {
     // the derivative of store needs to redo the store,
     // isValueNeededInReverse needs to know to preserve the
     // store operands in this case, etc
-    computeForwardingProperties(V);
+    computeForwardingProperties(V, ownedWrites);
   }
 }
 
