@@ -434,23 +434,38 @@ public:
   /// reverse of the innermost loop that BuilderM's block belongs to, or null if
   /// it must be recomputed where it is used. `inst` must be defined in a loop
   /// around that loop or in no loop, and that loop must have one exit, which
-  /// `inst` dominates.
+  /// `inst` dominates. Sets `branches` if recomputing it branches, which needs
+  /// the end of a block without a terminator.
   llvm::BasicBlock *
   reverseLoopEntryForRecompute(llvm::Instruction *inst,
                                llvm::IRBuilder<> &BuilderM,
-                               const llvm::ValueToValueMapTy &available);
+                               const llvm::ValueToValueMapTy &available,
+                               bool &branches);
+
+  /// Whether a value can be recomputed the same way from any position after a
+  /// loop exit's reverse block, and if so whether that takes a branch.
+  enum class LoopEntryRecompute { No, Plain, Merge };
 
   /// Whether `inst` and everything it is computed from are recomputed the same
   /// way from any position after `origExit`'s reverse block: plain operations
-  /// of the original function, whose only phis are induction variables of loops
+  /// of the original function, merges of branches, induction variables of loops
   /// around `origExit`, and memory the reverse pass does not rematerialize.
-  bool recomputesAnywhereInReverse(llvm::Instruction *inst,
-                                   const llvm::BasicBlock *origExit,
-                                   llvm::IRBuilder<> &BuilderM,
-                                   unsigned depth = 0);
+  /// `inMerge` says the value is only read on one path of a merge, where it may
+  /// also come from a cache.
+  LoopEntryRecompute recomputesAnywhereInReverse(
+      llvm::Instruction *inst, const llvm::BasicBlock *origExit,
+      llvm::IRBuilder<> &BuilderM, unsigned depth = 0, bool inMerge = false);
+
+  /// The same for a phi that is not an induction variable: its incoming values
+  /// and the conditions that choose between them.
+  LoopEntryRecompute
+  mergeRecomputesAtLoopEntry(llvm::PHINode *phi,
+                             const llvm::BasicBlock *origExit,
+                             llvm::IRBuilder<> &BuilderM, unsigned depth);
 
   /// The answers of recomputesAnywhereInReverse.
-  std::map<std::pair<const llvm::Instruction *, const llvm::BasicBlock *>, bool>
+  std::map<std::tuple<const llvm::Instruction *, const llvm::BasicBlock *, bool>,
+           LoopEntryRecompute>
       recomputableAtLoopEntry;
 
 private:

@@ -108,6 +108,11 @@ llvm::cl::opt<bool> EnzymeReverseLoopEntryRecompute(
     cl::desc("Recompute a value defined outside a loop once per entry of that "
              "loop's reverse, rather than at each use inside it"));
 
+llvm::cl::opt<bool> EnzymeReverseLoopEntryMerges(
+    "enzyme-reverse-loop-entry-merges", cl::init(true), cl::Hidden,
+    cl::desc("With enzyme-reverse-loop-entry-recompute, also compute a merge of "
+             "branches once per entry of a loop's reverse"));
+
 llvm::cl::opt<bool> EnzymeSelectStrongZero(
     "enzyme-select-strong-zero", cl::init(true), cl::Hidden,
     cl::desc("Treat a zero adjoint as a strong zero in the reverse rules of "
@@ -7264,38 +7269,97 @@ static bool addRecsCorrespond(const SCEVAddRecExpr *ar1,
   return !L1->contains(L2) && !L2->contains(L1);
 }
 
-bool GradientUtils::recomputesAnywhereInReverse(Instruction *inst,
-                                                const BasicBlock *origExit,
-                                                IRBuilder<> &BuilderM,
-                                                unsigned depth) {
+GradientUtils::LoopEntryRecompute GradientUtils::mergeRecomputesAtLoopEntry(
+    PHINode *phi, const BasicBlock *origExit, IRBuilder<> &BuilderM,
+    unsigned depth) {
+  if (!EnzymeReverseLoopEntryMerges)
+    return LoopEntryRecompute::No;
+  // A loop-carried phi depends on the iteration it is read for. legalRecompute
+  // below refuses one that reads the last value of a finished loop.
+  BasicBlock *parent = phi->getParent();
+  BasicBlock *origParent = isOriginal(parent);
+  if (!origParent || OrigLI->isLoopHeader(origParent) ||
+      phi->getNumIncomingValues() == 0)
+    return LoopEntryRecompute::No;
+  ValueToValueMapTy noneAvailable;
+  if (!legalRecompute(phi, noneAvailable, &BuilderM) ||
+      !shouldRecompute(phi, noneAvailable, &BuilderM))
+    return LoopEntryRecompute::No;
+
+  for (auto &op : phi->incoming_values())
+    if (auto opinst = dyn_cast<Instruction>(op))
+      if (recomputesAnywhereInReverse(opinst, origExit, BuilderM, depth + 1,
+                                      /*inMerge*/ true) ==
+          LoopEntryRecompute::No)
+        return LoopEntryRecompute::No;
+
+  // The recomputation branches again on the conditions that chose the path, in
+  // the blocks between the merge and the block that dominates it. They have to
+  // be readable there too, and no loop may lie between.
+  const Loop *mergeLoop = LI.getLoopFor(parent);
+  SmallVector<BasicBlock *, 8> todo(phi->block_begin(), phi->block_end());
+  SmallPtrSet<BasicBlock *, 8> seen;
+  while (!todo.empty()) {
+    BasicBlock *block = todo.pop_back_val();
+    if (!seen.insert(block).second)
+      continue;
+    if (seen.size() > 16 || LI.getLoopFor(block) != mergeLoop)
+      return LoopEntryRecompute::No;
+    Instruction *term = block->getTerminator();
+    Value *cond = nullptr;
+    if (auto SI = dyn_cast<SwitchInst>(term))
+      cond = SI->getCondition();
+    else if (!isAnyBranch(term))
+      return LoopEntryRecompute::No;
+    else if (!isUnconditionalBranch(term))
+      cond = getBranchCondition(term);
+    if (auto condinst = dyn_cast_or_null<Instruction>(cond))
+      if (recomputesAnywhereInReverse(condinst, origExit, BuilderM, depth + 1,
+                                      /*inMerge*/ true) ==
+          LoopEntryRecompute::No)
+        return LoopEntryRecompute::No;
+    if (DT.dominates(block, parent))
+      continue;
+    for (BasicBlock *pred : predecessors(block))
+      todo.push_back(pred);
+  }
+  return LoopEntryRecompute::Merge;
+}
+
+GradientUtils::LoopEntryRecompute GradientUtils::recomputesAnywhereInReverse(
+    Instruction *inst, const BasicBlock *origExit, IRBuilder<> &BuilderM,
+    unsigned depth, bool inMerge) {
   if (inversionAllocs && inst->getParent() == inversionAllocs)
-    return true;
+    return LoopEntryRecompute::Plain;
   // Every lookup of a value along a chain asks this again for the values below
-  // it, and legalRecompute can walk the function. Phis end the recursion, so it
-  // never meets the entry made here before it is settled.
-  auto key = std::make_pair((const Instruction *)inst, origExit);
+  // it, and legalRecompute can walk the function. Loop-carried phis end the
+  // recursion, so it never meets the entry made here before it is settled.
+  auto key = std::make_tuple((const Instruction *)inst, origExit, inMerge);
   auto found = recomputableAtLoopEntry.find(key);
   if (found != recomputableAtLoopEntry.end())
     return found->second;
-  recomputableAtLoopEntry[key] = false;
+  recomputableAtLoopEntry[key] = LoopEntryRecompute::No;
   if (depth > 32)
-    return false;
+    return LoopEntryRecompute::No;
 
   // Only values of the original function: shadows and caches have their own
   // rules about where they may be read in the reverse pass.
   Instruction *orig = isOriginal(inst);
   if (!orig)
-    return false;
+    return LoopEntryRecompute::No;
 
-  // The one phi whose value does not depend on the path it is read on: the
-  // induction variable of a loop still running at the exit, which lookupM
-  // reads from that loop's reverse counter. Unrolling any other phi branches
-  // within the reverse pass, and may need the last value of a finished loop.
   if (auto phi = dyn_cast<PHINode>(inst)) {
+    // The induction variable of a loop still running at the exit is read from
+    // that loop's reverse counter, wherever it is read.
     LoopContext lc;
+    if (getContext(phi->getParent(), lc) && lc.var == phi)
+      return recomputableAtLoopEntry[key] =
+                 OrigLI->getLoopFor(orig->getParent())->contains(origExit)
+                     ? LoopEntryRecompute::Plain
+                     : LoopEntryRecompute::No;
+    // Any other phi is rebuilt as a branch on what chose its path.
     return recomputableAtLoopEntry[key] =
-               getContext(phi->getParent(), lc) && lc.var == phi &&
-               OrigLI->getLoopFor(orig->getParent())->contains(origExit);
+               mergeRecomputesAtLoopEntry(phi, origExit, BuilderM, depth);
   }
 
   if (isa<LoadInst>(inst)) {
@@ -7303,39 +7367,57 @@ bool GradientUtils::recomputesAnywhereInReverse(Instruction *inst,
     // legalRecompute judges by that instruction.
     auto origLoad = dyn_cast<LoadInst>(orig);
     if (!origLoad)
-      return false;
+      return LoopEntryRecompute::No;
     // Such memory is only valid again once the reverse pass has replayed its
     // allocation and stores, which it does at a position of its own.
     for (const auto &pair : rematerializableAllocations)
       if (llvm::is_contained(pair.second.loads, origLoad))
-        return false;
+        return LoopEntryRecompute::No;
   } else if (isa<CallInst>(inst)) {
     // legalRecompute below decides which calls can run again. An allocation it
     // may allow is the reverse pass's to replay.
     if (rematerializableAllocations.count(orig))
-      return false;
+      return LoopEntryRecompute::No;
   } else if (!isa<GetElementPtrInst>(inst) && !isa<CastInst>(inst) &&
-             !isa<BinaryOperator>(inst) && !isa<CmpInst>(inst) &&
-             !isa<SelectInst>(inst) && !isa<ExtractValueInst>(inst) &&
-             !isa<FreezeInst>(inst)) {
-    return false;
+             !isa<BinaryOperator>(inst) && !isa<UnaryOperator>(inst) &&
+             !isa<CmpInst>(inst) && !isa<SelectInst>(inst) &&
+             !isa<ExtractValueInst>(inst) && !isa<FreezeInst>(inst)) {
+    return LoopEntryRecompute::No;
   }
 
   ValueToValueMapTy noneAvailable;
   if (!legalRecompute(inst, noneAvailable, &BuilderM) ||
-      !shouldRecompute(inst, noneAvailable, &BuilderM))
-    return false;
+      !shouldRecompute(inst, noneAvailable, &BuilderM)) {
+    // What a merge computes on one of its paths may be read from a cache, such
+    // as the result of a call that carries derivatives: the recomputation reads
+    // it on that path only, for the same indices wherever it is placed. A value
+    // of a sibling loop is read through the last value of that loop.
+    if (!inMerge)
+      return LoopEntryRecompute::No;
+    const Loop *defLoop = OrigLI->getLoopFor(orig->getParent());
+    return recomputableAtLoopEntry[key] =
+               (!defLoop || defLoop->contains(origExit))
+                   ? LoopEntryRecompute::Plain
+                   : LoopEntryRecompute::No;
+  }
 
+  LoopEntryRecompute result = LoopEntryRecompute::Plain;
   for (auto &op : inst->operands())
-    if (auto opinst = dyn_cast<Instruction>(op))
-      if (!recomputesAnywhereInReverse(opinst, origExit, BuilderM, depth + 1))
-        return false;
-  return recomputableAtLoopEntry[key] = true;
+    if (auto opinst = dyn_cast<Instruction>(op)) {
+      auto opresult = recomputesAnywhereInReverse(opinst, origExit, BuilderM,
+                                                  depth + 1, inMerge);
+      if (opresult == LoopEntryRecompute::No)
+        return LoopEntryRecompute::No;
+      if (opresult == LoopEntryRecompute::Merge)
+        result = LoopEntryRecompute::Merge;
+    }
+  return recomputableAtLoopEntry[key] = result;
 }
 
 BasicBlock *GradientUtils::reverseLoopEntryForRecompute(
     Instruction *inst, IRBuilder<> &BuilderM,
-    const ValueToValueMapTy &available) {
+    const ValueToValueMapTy &available, bool &branches) {
+  branches = false;
   // The reverse of an OpenMP outlined region keeps its own loop structure.
   if (!EnzymeReverseLoopEntryRecompute || omp)
     return nullptr;
@@ -7404,8 +7486,10 @@ BasicBlock *GradientUtils::reverseLoopEntryForRecompute(
   IRBuilder<> B(entry);
   if (hasTerminator(entry))
     B.SetInsertPoint(entry->getTerminator());
-  if (!recomputesAnywhereInReverse(inst, origExit, B))
+  auto recompute = recomputesAnywhereInReverse(inst, origExit, B);
+  if (recompute == LoopEntryRecompute::No)
     return nullptr;
+  branches = recompute == LoopEntryRecompute::Merge;
   return entry;
 }
 
@@ -7578,14 +7662,40 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
   if (!reduceRegister && tryLegalRecomputeCheck &&
       !isOriginalBlock(*BuilderM.GetInsertBlock()) &&
       BuilderM.GetInsertBlock() != inversionAllocs) {
-    if (BasicBlock *entry =
-            reverseLoopEntryForRecompute(inst, BuilderM, incoming_available)) {
+    bool branches = false;
+    if (BasicBlock *entry = reverseLoopEntryForRecompute(
+            inst, BuilderM, incoming_available, branches)) {
       IRBuilder<> B(entry);
-      if (hasTerminator(entry))
-        B.SetInsertPoint(entry->getTerminator());
+      // unwrapM rebuilds a merge of branches by ending the block it is in, so
+      // the block's own terminator moves to a new block that follows them.
+      BasicBlock *tail = nullptr;
+      if (hasTerminator(entry)) {
+        if (branches && !lookup_cache[entry].count(val)) {
+          tail = BasicBlock::Create(entry->getContext(),
+                                    entry->getName() + "_loopentry", newFunc);
+          tail->moveAfter(entry);
+          entry->getTerminator()->moveBefore(*tail, tail->end());
+          tail->replaceSuccessorsPhiUsesWith(entry, tail);
+          B.SetInsertPoint(entry);
+        } else {
+          B.SetInsertPoint(entry->getTerminator());
+        }
+      }
       B.SetCurrentDebugLocation(BuilderM.getCurrentDebugLocation());
       B.setFastMathFlags(BuilderM.getFastMathFlags());
       Value *result = lookupM(val, B);
+      if (tail) {
+        BasicBlock *last = B.GetInsertBlock();
+        BasicBlock *fwd = reverseBlockToPrimal[entry];
+        tail->moveAfter(last);
+        B.CreateBr(tail);
+        reverseBlocks[fwd].push_back(tail);
+        reverseBlockToPrimal[tail] = fwd;
+        for (auto pair : unwrap_cache[last])
+          unwrap_cache[tail].insert(pair);
+        for (auto pair : lookup_cache[last])
+          lookup_cache[tail].insert(pair);
+      }
       lookup_cache[BuilderM.GetInsertBlock()][val] = result;
       return result;
     }
