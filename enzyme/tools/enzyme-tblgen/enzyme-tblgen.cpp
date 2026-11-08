@@ -1140,9 +1140,17 @@ bool handle(const Twine &curIndent, const Twine &argPattern, raw_ostream &os,
         getIntrinsic(os, intrName, intrTypes, argPattern, origName);
         os << ", ArrayRef<Value*>({";
       } else if (opName == "CheckedMul") {
-        os << "checkedMul(gutils->strongZero, " << builder << ", ";
+        if (intrinsic == MLIRDerivatives)
+          os << "checkedMul(gutils->strongZero, " << builder << ", ";
+        else
+          os << "checkedMul(gutils->strongZeroFor(&" << origName << "), "
+             << builder << ", ";
       } else if (opName == "CheckedDiv") {
-        os << "checkedDiv(gutils->strongZero, " << builder << ", ";
+        if (intrinsic == MLIRDerivatives)
+          os << "checkedDiv(gutils->strongZero, " << builder << ", ";
+        else
+          os << "checkedDiv(gutils->strongZeroFor(&" << origName << "), "
+             << builder << ", ";
       } else if (intrinsic == MLIRDerivatives) {
         // Derivative expressions are built with fast-math, as they are on the
         // LLVM side; ops that carry no such flags are unaffected.

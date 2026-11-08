@@ -2521,7 +2521,7 @@ public:
                   auto res = Builder2.CreateFDiv(
                       Builder2.CreateFNeg(Builder2.CreateFMul(idiff, lop0)),
                       lop1);
-                  if (gutils->strongZero) {
+                  if (gutils->strongZeroFor(&BO)) {
                     res = CreateSelect(
                         Builder2,
                         Builder2.CreateFCmpOEQ(
@@ -2546,7 +2546,7 @@ public:
                       Builder2.CreateFNeg(Builder2.CreateFMul(
                           s, Builder2.CreateFDiv(idiff, lop0))),
                       lop1);
-                  if (gutils->strongZero) {
+                  if (gutils->strongZeroFor(&BO)) {
                     res = CreateSelect(
                         Builder2,
                         Builder2.CreateFCmpOEQ(
@@ -2800,7 +2800,8 @@ public:
                 auto prevFP = Builder2.CreateBitCast(prev, FT);
                 auto idiffFP = Builder2.CreateBitCast(idiff, FT);
                 prev = Builder2.CreateBitCast(
-                    checkedMul(gutils->strongZero, Builder2, idiffFP, prevFP),
+                    checkedMul(gutils->strongZeroFor(&BO), Builder2, idiffFP,
+                               prevFP),
                     prev->getType());
                 return prev;
               };
@@ -3030,7 +3031,8 @@ public:
                 auto prevFP = Builder2.CreateBitCast(prev, FT);
                 auto difiFP = Builder2.CreateBitCast(difi, FT);
                 prev = Builder2.CreateBitCast(
-                    checkedMul(gutils->strongZero, Builder2, difiFP, prevFP),
+                    checkedMul(gutils->strongZeroFor(&BO), Builder2, difiFP,
+                               prevFP),
                     prev->getType());
 
                 return prev;

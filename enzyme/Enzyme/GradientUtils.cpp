@@ -108,6 +108,11 @@ llvm::cl::opt<bool> EnzymeReverseLoopEntryRecompute(
     cl::desc("Recompute a value defined outside a loop once per entry of that "
              "loop's reverse, rather than at each use inside it"));
 
+llvm::cl::opt<bool> EnzymeSelectStrongZero(
+    "enzyme-select-strong-zero", cl::init(true), cl::Hidden,
+    cl::desc("Treat a zero adjoint as a strong zero in the reverse rules of "
+             "values that reach the result only through select arms"));
+
 llvm::cl::opt<bool> EnzymeInactiveDynamic(
     "enzyme-inactive-dynamic", cl::init(true), cl::Hidden,
     cl::desc("Force wholy inactive dynamic loops to have 0 iter reverse pass"));
@@ -11436,5 +11441,104 @@ void GradientUtils::replaceAndRemoveUnwrapCacheFor(llvm::Value *A,
   }
   for (auto I : toErase) {
     erase(I);
+  }
+}
+
+bool GradientUtils::strongZeroFor(const llvm::Value *orig) {
+  if (strongZero)
+    return true;
+  if (!EnzymeSelectStrongZero)
+    return false;
+  if (mode != DerivativeMode::ReverseModeGradient &&
+      mode != DerivativeMode::ReverseModeCombined)
+    return false;
+  if (!selectMaskedComputed) {
+    computeSelectMasked();
+    selectMaskedComputed = true;
+  }
+  return selectMasked.count(orig);
+}
+
+// Fills selectMasked. A value is masked when it is a floating-point
+// instruction of oldFunc whose every use is a value operand of a select, a
+// comparison (which carries no derivative), or another masked value, and which
+// reaches at least one select that way. A select passes no adjoint to the
+// operand it did not pick, so in the reverse pass a masked value has a zero
+// adjoint on exactly the executions where the primal discarded it. That is
+// where LLVM's speculation of a guarded branch into a select (SimplifyCFG's
+// two-entry phi folding, InstCombine folding an operation into a select with a
+// constant arm, GVN folding a repeated guard) evaluates operands the source
+// never computed, such as 1 / 0. selectMasked keeps the masked poles and the
+// masked values computed from them, whose partials can be infinite there.
+void GradientUtils::computeSelectMasked() {
+  SmallPtrSet<const Instruction *, 16> cand;
+  for (auto &BB : *oldFunc)
+    for (auto &I : BB)
+      if (I.getType()->isFPOrFPVectorTy() && !I.use_empty())
+        cand.insert(&I);
+  auto compatibleUse = [&](const Use &U) {
+    auto *user = dyn_cast<Instruction>(U.getUser());
+    if (!user)
+      return false;
+    if (isa<SelectInst>(user))
+      return U.getOperandNo() != 0;
+    if (isa<FCmpInst>(user))
+      return true;
+    return cand.count(user) != 0;
+  };
+  SmallVector<const Instruction *, 16> work(cand.begin(), cand.end());
+  while (!work.empty()) {
+    auto *I = work.pop_back_val();
+    if (!cand.count(I))
+      continue;
+    bool ok = true;
+    for (const Use &U : I->uses())
+      if (!compatibleUse(U)) {
+        ok = false;
+        break;
+      }
+    if (ok)
+      continue;
+    cand.erase(I);
+    for (const Value *op : I->operands())
+      if (auto *OI = dyn_cast<Instruction>(op))
+        if (cand.count(OI))
+          work.push_back(OI);
+  }
+  SmallVector<const Instruction *, 16> reach;
+  for (auto *I : cand)
+    for (const Use &U : I->uses())
+      if (isa<SelectInst>(U.getUser()) && U.getOperandNo() != 0) {
+        reach.push_back(I);
+        break;
+      }
+  SmallPtrSet<const Instruction *, 16> masked;
+  while (!reach.empty()) {
+    auto *I = reach.pop_back_val();
+    if (!masked.insert(I).second)
+      continue;
+    for (const Value *op : I->operands())
+      if (auto *OI = dyn_cast<Instruction>(op))
+        if (cand.count(OI) && !masked.count(OI))
+          reach.push_back(OI);
+  }
+  // Of those, a partial can be infinite or NaN for finite inputs only at a
+  // pole (a division, a remainder, a call such as log or sqrt) or downstream
+  // of one, where an operand may already be infinite. Only these need the
+  // check; a masked fmul or fadd of finite values (a ReLU's h in
+  // `h > 0 ? h : 0`) keeps its plain rule.
+  SmallVector<const Instruction *, 16> poles;
+  for (auto *I : masked)
+    if (I->getOpcode() == Instruction::FDiv ||
+        I->getOpcode() == Instruction::FRem || isa<CallBase>(I))
+      poles.push_back(I);
+  while (!poles.empty()) {
+    auto *I = poles.pop_back_val();
+    if (!selectMasked.insert(I).second)
+      continue;
+    for (const User *U : I->users())
+      if (auto *UI = dyn_cast<Instruction>(U))
+        if (masked.count(UI) && !selectMasked.count(UI))
+          poles.push_back(UI);
   }
 }

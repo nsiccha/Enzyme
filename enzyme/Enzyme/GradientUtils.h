@@ -480,7 +480,20 @@ public:
   // functions with inf
   bool strongZero;
 
+  // Whether the reverse rules of `orig`, an instruction of oldFunc, treat a
+  // zero adjoint as a strong zero: always under strongZero, and otherwise when
+  // `orig` reaches the function's results only through the value operands of
+  // selects and is a pole (a division, a remainder, a call) or computed from
+  // one. Such a value has a zero adjoint whenever no select picks it, and LLVM
+  // speculates guarded code into select arms (`c ? 1 / x : 0` becomes
+  // `select c, 1 / x, 0`), whose partials can then be infinite or NaN.
+  bool strongZeroFor(const llvm::Value *orig);
+
 private:
+  bool selectMaskedComputed = false;
+  llvm::SmallPtrSet<const llvm::Value *, 4> selectMasked;
+  void computeSelectMasked();
+
   unsigned width;
 
 public:
