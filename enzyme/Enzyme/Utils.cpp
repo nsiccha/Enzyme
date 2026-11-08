@@ -93,6 +93,19 @@ llvm::cl::opt<bool>
 llvm::cl::opt<bool>
     EnzymeFastMath("enzyme-fast-math", cl::init(false), cl::Hidden,
                    cl::desc("Use fast math on derivative computation"));
+// The fast-math flags derivative arithmetic carries while enzyme-fast-math is
+// off: 1 reassoc, 2 nnan, 4 ninf, 8 nsz, 16 arcp, 32 contract, 64 afn. The
+// default, nsz and contract, never regroups an expression, so a representable
+// derivative cannot underflow or overflow through reordering (reassoc turned
+// (adjoint / y) * c into (adjoint * c) / y), and it assumes nothing about NaN
+// or infinity. nsz lets `adjoint + 0.0` fold, which strict arithmetic forbids
+// since -0.0 + 0.0 is +0.0; contract only fuses a multiply and an add, rounding
+// once. 0 is fully strict arithmetic.
+llvm::cl::opt<int> EnzymeFastMathFlags(
+    "enzyme-fast-math-flags", cl::init(8 | 32), cl::Hidden,
+    cl::desc("Fast-math flags on derivative computation when "
+             "enzyme-fast-math is off (1 reassoc, 2 nnan, 4 ninf, 8 nsz, "
+             "16 arcp, 32 contract, 64 afn)"));
 llvm::cl::opt<bool> EnzymeMemmoveWarning(
     "enzyme-memmove-warning", cl::init(true), cl::Hidden,
     cl::desc("Warn if using memmove implementation as a fallback for memmove"));
@@ -3935,8 +3948,18 @@ llvm::Value *SanitizeDerivatives(llvm::Value *val, llvm::Value *toset,
 
 llvm::FastMathFlags getFast() {
   llvm::FastMathFlags f;
-  if (EnzymeFastMath)
+  if (EnzymeFastMath) {
     f.set();
+    return f;
+  }
+  int flags = EnzymeFastMathFlags;
+  f.setAllowReassoc(flags & 1);
+  f.setNoNaNs(flags & 2);
+  f.setNoInfs(flags & 4);
+  f.setNoSignedZeros(flags & 8);
+  f.setAllowReciprocal(flags & 16);
+  f.setAllowContract(flags & 32);
+  f.setApproxFunc(flags & 64);
   return f;
 }
 

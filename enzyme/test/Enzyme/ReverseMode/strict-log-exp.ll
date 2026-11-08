@@ -1,16 +1,29 @@
 ; RUN: %opt %defaultLoadEnzyme -enzyme-preopt=false -passes="enzyme,function(mem2reg,instsimplify,simplifycfg),default<O2>" -S %s -o %t
 ; RUN: %lli %t
-; RUN: %FileCheck %s --check-prefix=STRICT < %t
+; RUN: %FileCheck %s --check-prefix=DEFAULT < %t
+; RUN: %opt %defaultLoadEnzyme -enzyme-fast-math-flags=0 -enzyme-preopt=false -passes="enzyme,function(mem2reg,instsimplify,simplifycfg),default<O2>" -S %s -o %t.strict
+; RUN: %lli %t.strict
+; RUN: %FileCheck %s --check-prefix=STRICT < %t.strict
 ; RUN: %opt %defaultLoadEnzyme -enzyme-fast-math=true -enzyme-preopt=false -passes="enzyme,function(mem2reg,instsimplify,simplifycfg)" -S %s | %FileCheck %s --check-prefix=FAST
 ;
 ; The reverse derivative is (exp(log(x*c)) / (x*c)) * c. Reassociation
 ; changes this to (exp(log(x*c)) * c) / (x*c), underflowing before the
 ; division restores the scale. The noinline entry keeps O2 from replacing
 ; the runtime derivative check with a constant-folded specialization.
-; Exercise the default, with no enzyme-fast-math option, after optimization.
+; Exercise the default, with no enzyme-fast-math option, after optimization:
+; derivative arithmetic carries nsz and contract, never reassoc. With
+; -enzyme-fast-math-flags=0 it carries no flags at all.
+;
+; DEFAULT-LABEL: define double @dtiny(
+; DEFAULT-NOT: fast
+; DEFAULT-NOT: reassoc
+; DEFAULT: fdiv nsz contract double
+; DEFAULT: fmul nsz contract double
+; DEFAULT: ret double
 ;
 ; STRICT-LABEL: define double @dtiny(
 ; STRICT-NOT: fast
+; STRICT-NOT: nsz
 ; STRICT: fdiv double
 ; STRICT: fmul double
 ; STRICT: ret double
