@@ -273,7 +273,10 @@ struct CacheAnalysis {
   // argument: the call could read through it or return one of its fields.
   // Uses that cannot reach callsite are irrelevant, but a use after the call
   // in a loop can reach the next iteration and must count. Following loads
-  // also catches publication of the owned buffer without its header.
+  // also catches publication of the owned buffer without its header. A
+  // loaded value that type analysis knows holds no pointer, such as an
+  // element of a Float64 array read back, cannot name the storage, so its
+  // uses need not be followed.
   bool allocationUnexposedToCall(CallInst *alloc, CallInst *callsite) {
     auto key = std::make_pair(alloc, callsite);
     auto found = unexposedAllocations.find(key);
@@ -303,6 +306,8 @@ struct CacheAnalysis {
           }
           if (MI->getRawDest() == V)
             continue;
+        } else if (isa<LoadInst>(I) && holdsNoPointers(TR.query(I)[{-1}])) {
+          continue;
         } else if (isPointerArithmeticInst(I) || isa<LoadInst>(I) ||
                    isa<SelectInst>(I) || isa<ExtractValueInst>(I) ||
                    isa<InsertValueInst>(I)) {
