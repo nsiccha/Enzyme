@@ -28,6 +28,7 @@
 #define ENZYME_DIFFERENTIALUSEANALYSIS_H_
 
 #include <deque>
+#include <memory>
 #include <map>
 #include <set>
 
@@ -88,25 +89,49 @@ void pushLoopyPHIPreheader(const GradientUtils *gutils, llvm::Value *V,
                            llvm::SetVector<llvm::Value *> &Intermediates,
                            std::deque<llvm::Value *> &todo);
 
+/// Bookkeeping for the cyclic memoization of is_value_needed_in_reverse.
+/// A query records itself in `seen` as not needed before it looks at its
+/// users (an inductive claim), so a sub-query that reaches it through a cycle
+/// reads that provisional entry. For a shadow query such a sub-query must not
+/// be memoized as a final "not needed" when the key it read later turns out
+/// to be needed: a loop-header phi whose shadow is needed through a value
+/// extracted from it made its latch phi, whose only user it is, read as never
+/// needed, and the primal its shadow is built from was dropped (Illegal
+/// replace ficticious phi for a loop counter inserted into an iterator
+/// state). Shadows are built structurally, from every operand, so a missed
+/// shadow need has no later repair. Primal queries keep the inductive answer:
+/// for a loop-carried value it is what lets the cache min-cut treat the phi
+/// as the cut, and a primal that turns out needed is reached through a cache
+/// or a recomputation.
+struct UseCycleState {
+  std::set<UsageKey> inProgress;
+  std::set<UsageKey> tentativeSet;
+  llvm::SmallVector<UsageKey, 16> tentative;
+  bool consultedProvisional = false;
+};
+
 template <QueryType VT, bool OneLevel = false>
 inline bool is_value_needed_in_reverse(
     const GradientUtils *gutils, const llvm::Value *inst, DerivativeMode mode,
     std::map<UsageKey, bool> &seen,
-    const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &oldUnreachable) {
+    const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &oldUnreachable,
+    UseCycleState *cs = nullptr);
+
+template <QueryType VT, bool OneLevel = false>
+__attribute__((always_inline)) inline bool is_value_needed_in_reverse_impl(
+    const GradientUtils *gutils, const llvm::Value *inst, DerivativeMode mode,
+    std::map<UsageKey, bool> &seen,
+    const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &oldUnreachable,
+    UseCycleState &cs) {
   using namespace llvm;
 
   TypeResults const &TR = gutils->TR;
   static_assert(VT == QueryType::Primal || VT == QueryType::Shadow ||
                 VT == QueryType::ShadowByConstPrimal);
   auto idx = UsageKey(inst, VT);
-  if (seen.find(idx) != seen.end())
-    return seen[idx];
   if (auto ainst = dyn_cast<Instruction>(inst)) {
     assert(ainst->getParent()->getParent() == gutils->oldFunc);
   }
-
-  // Inductively claim we aren't needed (and try to find contradiction)
-  seen[idx] = false;
 
   if (VT == QueryType::Primal) {
     if (auto op = dyn_cast<BinaryOperator>(inst)) {
@@ -164,10 +189,10 @@ inline bool is_value_needed_in_reverse(
         bool val;
         if (VT == QueryType::Shadow)
           val = is_value_needed_in_reverse<QueryType::Shadow>(
-              gutils, user, mode, seen, oldUnreachable);
+              gutils, user, mode, seen, oldUnreachable, &cs);
         else
           val = is_value_needed_in_reverse<QueryType::ShadowByConstPrimal>(
-              gutils, user, mode, seen, oldUnreachable);
+              gutils, user, mode, seen, oldUnreachable, &cs);
         if (val) {
           if (EnzymePrintDiffUse)
             llvm::errs() << " Need: " << to_string(VT) << " of " << *inst
@@ -222,7 +247,7 @@ inline bool is_value_needed_in_reverse(
                       partial = true;
                     } else if (recursiveUse && !OneLevel) {
                       partial = is_value_needed_in_reverse<QueryType::Shadow>(
-                          gutils, UI, mode, seen, oldUnreachable);
+                          gutils, UI, mode, seen, oldUnreachable, &cs);
                     }
                   } else if (VT == QueryType::Shadow) {
                     bool recursiveUse = false;
@@ -233,7 +258,7 @@ inline bool is_value_needed_in_reverse(
                     } else if (recursiveUse && !OneLevel) {
                       partial = is_value_needed_in_reverse<
                           QueryType::ShadowByConstPrimal>(gutils, UI, mode,
-                                                          seen, oldUnreachable);
+                                                          seen, oldUnreachable, &cs);
                     }
                   }
                 }
@@ -287,7 +312,7 @@ inline bool is_value_needed_in_reverse(
 
     // If a sub user needs, we need
     if (!OneLevel && is_value_needed_in_reverse<VT>(gutils, user, mode, seen,
-                                                    oldUnreachable)) {
+                                                    oldUnreachable, &cs)) {
       if (EnzymePrintDiffUse)
         llvm::errs() << " Need: " << to_string(VT) << "(" << mode << ") of "
                      << *inst << " in reverse as sub-need " << *user << "\n";
@@ -347,7 +372,7 @@ inline bool is_value_needed_in_reverse(
             }
             for (LoadInst *L : pair.second.loads)
               if (is_value_needed_in_reverse<VT>(gutils, L, mode, seen,
-                                                 oldUnreachable)) {
+                                                 oldUnreachable, &cs)) {
                 if (EnzymePrintDiffUse)
                   llvm::errs() << " Need: " << to_string(VT) << " of " << *inst
                                << " in reverse as rematload " << *L << "\n";
@@ -358,7 +383,7 @@ inline bool is_value_needed_in_reverse(
                       gutils, pair.operand, mode, pair.loadCall, oldUnreachable,
                       QueryType::Primal) ||
                   is_value_needed_in_reverse<VT>(gutils, pair.loadCall, mode,
-                                                 seen, oldUnreachable)) {
+                                                 seen, oldUnreachable, &cs)) {
                 if (EnzymePrintDiffUse)
                   llvm::errs() << " Need: " << to_string(VT) << " of " << *inst
                                << " in reverse as rematloadcall "
@@ -367,7 +392,7 @@ inline bool is_value_needed_in_reverse(
               }
 
             if (is_value_needed_in_reverse<VT>(gutils, pair.first, mode, seen,
-                                               oldUnreachable)) {
+                                               oldUnreachable, &cs)) {
               if (EnzymePrintDiffUse)
                 llvm::errs()
                     << " Need: " << to_string(VT) << " of " << *inst
@@ -480,7 +505,7 @@ inline bool is_value_needed_in_reverse(
       if (!user->getType()->isVoidTy() &&
           TR.anyPointer(const_cast<Instruction *>(user))) {
         if (is_value_needed_in_reverse<QueryType::Shadow>(
-                gutils, user, mode, seen, oldUnreachable)) {
+                gutils, user, mode, seen, oldUnreachable, &cs)) {
           if (EnzymePrintDiffUse)
             llvm::errs() << " Need: " << to_string(VT) << " of " << *inst
                          << " in reverse as used to compute shadow ptr "
@@ -502,6 +527,73 @@ inline bool is_value_needed_in_reverse(
     return seen[idx] = true;
   }
   return false;
+}
+
+
+template <QueryType VT, bool OneLevel>
+inline bool is_value_needed_in_reverse(
+    const GradientUtils *gutils, const llvm::Value *inst, DerivativeMode mode,
+    std::map<UsageKey, bool> &seen,
+    const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &oldUnreachable,
+    UseCycleState *cs) {
+  auto idx = UsageKey(inst, VT);
+  auto found = seen.find(idx);
+  if (found != seen.end()) {
+    // A provisional "not needed" (the key is still being evaluated, or was
+    // memoized while one was) makes the reader provisional too.
+    if (cs && !found->second &&
+        (cs->inProgress.count(idx) || cs->tentativeSet.count(idx)))
+      cs->consultedProvisional = true;
+    return found->second;
+  }
+  // The root query owns the state; a frame must not hold one itself, since
+  // this recursion goes as deep as a def-use chain and every byte of frame
+  // is paid per level.
+  std::unique_ptr<UseCycleState> owned;
+  if (!cs) {
+    owned = std::make_unique<UseCycleState>();
+    cs = owned.get();
+  }
+  // Only a shadow query's inductive claim is provisional (see UseCycleState).
+  constexpr bool Provisional = VT != QueryType::Primal;
+
+  // Inductively claim we aren't needed (and try to find contradiction)
+  seen[idx] = false;
+  if (Provisional)
+    cs->inProgress.insert(idx);
+  bool outerConsulted = cs->consultedProvisional;
+  cs->consultedProvisional = false;
+  size_t mark = cs->tentative.size();
+
+  bool needed = is_value_needed_in_reverse_impl<VT, OneLevel>(
+      gutils, inst, mode, seen, oldUnreachable, *cs);
+
+  if (Provisional)
+    cs->inProgress.erase(idx);
+  bool consulted = cs->consultedProvisional;
+  if (needed) {
+    seen[idx] = true;
+    if (Provisional) {
+      // Every "not needed" memoized since this query began may rest on the
+      // claim that this key is not needed. Forget them; a later query
+      // recomputes them against the final answer.
+      for (size_t i = mark, e = cs->tentative.size(); i < e; ++i) {
+        auto k = cs->tentative[i];
+        auto f = seen.find(k);
+        if (f != seen.end() && !f->second)
+          seen.erase(f);
+        cs->tentativeSet.erase(k);
+      }
+      cs->tentative.resize(mark);
+    }
+  } else if (consulted) {
+    // Final only once every key it read provisionally is final; until then a
+    // reader of this entry is provisional as well.
+    cs->tentative.push_back(idx);
+    cs->tentativeSet.insert(idx);
+  }
+  cs->consultedProvisional = outerConsulted || consulted;
+  return needed;
 }
 
 template <QueryType VT>
