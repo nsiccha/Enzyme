@@ -1312,6 +1312,9 @@ bool ActivityAnalyzer::isConstantValue(TypeResults const &TR, Value *Val) {
           return false;
         }
       }
+      // The temporary assumption is now proved. It was already in the set,
+      // so InsertConstantValue would not recognize it as a new fact.
+      ++InactiveFactsVersion;
       return true;
     }
     if (auto CD = dyn_cast<ConstantAggregate>(Val)) {
@@ -1324,6 +1327,7 @@ bool ActivityAnalyzer::isConstantValue(TypeResults const &TR, Value *Val) {
           return false;
         }
       }
+      ++InactiveFactsVersion;
       return true;
     }
 
@@ -3937,13 +3941,16 @@ void ActivityAnalyzer::runDeferredReEvaluations(TypeResults const &TR,
 
 void ActivityAnalyzer::InsertConstantInstruction(TypeResults const &TR,
                                                  llvm::Instruction *I) {
-  ConstantInstructions.insert(I);
+  if (ConstantInstructions.insert(I))
+    ++InactiveFactsVersion;
   auto found = ReEvaluateValueIfInactiveInst.find(I);
   if (found == ReEvaluateValueIfInactiveInst.end())
     return;
   auto set = ReEvaluateValueIfInactiveInst.take(found);
   for (auto toeval : set) {
-    if (!ActiveValues.count(toeval))
+    if (!ActiveValues.count(toeval) ||
+        !ReEvaluateValueIfInactiveInst.markEvaluated(I, toeval,
+                                                     InactiveFactsVersion))
       continue;
     ActiveValues.erase(toeval);
     if (EnzymePrintActivity)
@@ -3955,7 +3962,8 @@ void ActivityAnalyzer::InsertConstantInstruction(TypeResults const &TR,
 
 void ActivityAnalyzer::InsertConstantValue(TypeResults const &TR,
                                            llvm::Value *V) {
-  ConstantValues.insert(V);
+  if (ConstantValues.insert(V))
+    ++InactiveFactsVersion;
   if (InsertConstValueRecursionHandler) {
     InsertConstValueRecursionHandler->push_back(V);
     return;
@@ -3970,7 +3978,9 @@ void ActivityAnalyzer::InsertConstantValue(TypeResults const &TR,
     if (found != ReEvaluateValueIfInactiveValue.end()) {
       auto set = ReEvaluateValueIfInactiveValue.take(found);
       for (auto toeval : set) {
-        if (!ActiveValues.count(toeval))
+        if (!ActiveValues.count(toeval) ||
+            !ReEvaluateValueIfInactiveValue.markEvaluated(V, toeval,
+                                                          InactiveFactsVersion))
           continue;
         ActiveValues.erase(toeval);
         if (EnzymePrintActivity)
@@ -3983,7 +3993,9 @@ void ActivityAnalyzer::InsertConstantValue(TypeResults const &TR,
     if (found2 != ReEvaluateInstIfInactiveValue.end()) {
       auto set = ReEvaluateInstIfInactiveValue.take(found2);
       for (auto toeval : set) {
-        if (!ActiveInstructions.count(toeval))
+        if (!ActiveInstructions.count(toeval) ||
+            !ReEvaluateInstIfInactiveValue.markEvaluated(V, toeval,
+                                                         InactiveFactsVersion))
           continue;
         ActiveInstructions.erase(toeval);
         if (EnzymePrintActivity)

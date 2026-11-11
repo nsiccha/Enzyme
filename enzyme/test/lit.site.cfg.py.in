@@ -68,6 +68,7 @@ if len("@ENZYME_BINARY_DIR@") == 0:
 config.substitutions.append(('%eopt', emopt))
 config.substitutions.append(('%llvmver', config.llvm_ver))
 config.substitutions.append(('%FileCheck', config.llvm_tools_dir + "/FileCheck"))
+config.substitutions.append(('%activityReEvaluationTest', '"' + config.enzyme_obj_root + '/test/ActivityAnalysis/EnzymeActivityReEvaluationTest@CMAKE_EXECUTABLE_SUFFIX@"'))
 config.substitutions.append(('%clang', eclang))
 config.substitutions.append(('%O0TBAA', "-O1 -Xclang -disable-llvm-passes"))
 

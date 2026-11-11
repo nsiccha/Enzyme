@@ -47,6 +47,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/InstVisitor.h"
 
+#include "ActivityReEvaluation.h"
 #include "PersistentPtrSet.h"
 #include "TypeAnalysis/TypeAnalysis.h"
 #include "Utils.h"
@@ -147,44 +148,17 @@ public:
   bool isConstantValue(TypeResults const &TR, llvm::Value *val);
 
 private:
-  /// What to evaluate again once a key is shown to be inactive. A key can
-  /// already be known inactive when it gets its entry; such an entry runs the
-  /// next time a hypothesis that also knows the key is imported. So that an
-  /// import need not visit everything the hypothesis knows to find them, this
-  /// remembers the keys that may be in that state.
-  template <typename KeyT, typename ItemT> class ReEvaluationMap {
-    llvm::DenseMap<KeyT *, llvm::SmallPtrSet<ItemT *, 4>> Entries;
-    llvm::SmallPtrSet<KeyT *, 4> KeysToRecheck;
+  /// Advances only on a newly proved inactive value or instruction, not on
+  /// repeated notifications or tentative inductive assumptions. Hypotheses
+  /// start with empty re-evaluation maps, so their versions are independent.
+  uint64_t InactiveFactsVersion = 0;
 
-  public:
-    llvm::SmallPtrSet<ItemT *, 4> &operator[](KeyT *Key) {
-      KeysToRecheck.insert(Key);
-      return Entries[Key];
-    }
-    auto begin() { return Entries.begin(); }
-    auto end() { return Entries.end(); }
-    auto find(KeyT *Key) { return Entries.find(Key); }
-    bool count(KeyT *Key) const { return Entries.count(Key); }
-    /// Removes the entry of Key and returns what it held.
-    llvm::SmallPtrSet<ItemT *, 4>
-    take(typename decltype(Entries)::iterator It) {
-      auto Items = std::move(It->second);
-      Entries.erase(It);
-      return Items;
-    }
-    /// Empties and returns the keys to check, which the caller keeps or gives
-    /// back through keepForRecheck.
-    llvm::SmallPtrSet<KeyT *, 4> takeKeysToRecheck() {
-      auto Keys = std::move(KeysToRecheck);
-      KeysToRecheck.clear();
-      return Keys;
-    }
-    void keepForRecheck(KeyT *Key) { KeysToRecheck.insert(Key); }
-  };
-
-  ReEvaluationMap<llvm::Instruction, llvm::Value> ReEvaluateValueIfInactiveInst;
-  ReEvaluationMap<llvm::Value, llvm::Value> ReEvaluateValueIfInactiveValue;
-  ReEvaluationMap<llvm::Value, llvm::Instruction> ReEvaluateInstIfInactiveValue;
+  enzyme_detail::ActivityReEvaluationMap<llvm::Instruction, llvm::Value>
+      ReEvaluateValueIfInactiveInst;
+  enzyme_detail::ActivityReEvaluationMap<llvm::Value, llvm::Value>
+      ReEvaluateValueIfInactiveValue;
+  enzyme_detail::ActivityReEvaluationMap<llvm::Value, llvm::Instruction>
+      ReEvaluateInstIfInactiveValue;
 
   /// The instructions that a search of memory has to consider. Which ones those
   /// are depends only on the function, so an analyzer and its hypotheses share
