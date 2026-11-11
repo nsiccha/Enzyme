@@ -7935,6 +7935,21 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
                       //    << " step2: " << *ar2->getStepRecurrence(SE) <<
                       //    "\n";
 
+                      // Equal recurrences in sibling loops have equal values
+                      // at corresponding iterations, but distinct reverse
+                      // counters. Read the earlier cache at this loop's index,
+                      // not at the earlier loop's (possibly uninitialized)
+                      // reverse counter. Keep the outer cache dimensions in
+                      // the same loop nest; other nests need their own mapping.
+                      if (ar1->getLoop() != ar2->getLoop()) {
+                        if (ar1->getLoop()->getParentLoop() !=
+                            ar2->getLoop()->getParentLoop())
+                          continue;
+                        auto current = available.find(l1.var);
+                        if (current == available.end() || !current->second)
+                          continue;
+                        available[l2.var] = current->second;
+                      }
                       inst = li2;
                       break;
                     }
