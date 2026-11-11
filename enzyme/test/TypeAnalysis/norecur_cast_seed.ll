@@ -35,6 +35,6 @@ merge:
 !0 = !{}
 
 ; CHECK: caller - {} |
-; CHECK: merge
+; CHECK: {{^merge$}}
 ; CHECK-NEXT:   %fslot = phi {{.*}}@jl_nothing{{.*}}: {[-1]:Pointer, [-1,0]:Pointer, [-1,0,0]:Float@double}
-; CHECK-NEXT:   %islot = phi {{.*}}@jl_nothing{{.*}}: {[-1]:Pointer, [-1,0]:Pointer, [-1,0,0]:Integer}
+; CHECK-NEXT:   %islot = phi {{.*}}@jl_nothing{{.*}}: {[-1]:Pointer, [-1,0]:Pointer, [-1,0,0]:Integer, [-1,0,1]:Integer, [-1,0,2]:Integer, [-1,0,3]:Integer, [-1,0,4]:Integer, [-1,0,5]:Integer, [-1,0,6]:Integer, [-1,0,7]:Integer}
