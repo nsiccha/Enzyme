@@ -33,6 +33,7 @@
 
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -74,8 +75,26 @@ private:
   // mapping of known indices to type if one exists
   ConcreteTypeMapType mapping;
   std::vector<int> minIndices;
+  // Explicit layouts may extend past the inference budget. Carry their finite
+  // bound with the facts, rather than changing the process-wide option. Inferred
+  // pointer shifts must never increase this bound (a loop could do so forever).
+  int maxOffset = MaxTypeOffset;
+
+  TypeTree emptyWithOffsetLimit() const {
+    TypeTree result;
+    result.maxOffset = maxOffset;
+    return result;
+  }
 
 public:
+  bool ensureKnownOffset(int64_t offset) {
+    offset = std::min<int64_t>(offset, std::numeric_limits<int>::max());
+    if (offset <= maxOffset)
+      return false;
+    maxOffset = offset;
+    return true;
+  }
+
   TypeTree() {}
   TypeTree(ConcreteType dat) {
     if (dat != ConcreteType(BaseType::Unknown)) {
@@ -146,6 +165,8 @@ public:
       str = str.substr(endval);
 
       ConcreteType CT(tystr, ctx);
+      for (int idx : idxs)
+        Result.ensureKnownOffset(idx);
       Result.mapping.emplace(idxs, CT);
       if (Result.minIndices.size() < idxs.size()) {
         for (size_t i = Result.minIndices.size(), end = idxs.size(); i < end;
@@ -373,7 +394,7 @@ public:
         (minIndices.size() <= SeqSize) ? minIndices.size() : SeqSize;
     for (size_t i = 0; i < minLen; i++) {
       if (minIndices[i] > Seq[i]) {
-        if (minIndices[i] > MaxTypeOffset)
+        if (minIndices[i] > maxOffset)
           possibleDeletion = true;
         minIndices[i] = Seq[i];
       }
@@ -391,7 +412,7 @@ public:
         bool mustKeep = false;
         bool considerErase = false;
         for (int val : pair.first) {
-          if (val > MaxTypeOffset) {
+          if (val > maxOffset) {
             if (val == minIndices[i]) {
               mustKeep = true;
               break;
@@ -411,7 +432,7 @@ public:
     bool keep = false;
     bool considerErase = false;
     for (auto val : Seq) {
-      if (val > MaxTypeOffset) {
+      if (val > maxOffset) {
         if (val == minIndices[i]) {
           keep = true;
           break;
@@ -427,7 +448,11 @@ public:
   }
 
   /// How this TypeTree compares with another
-  bool operator<(const TypeTree &vd) const { return mapping < vd.mapping; }
+  bool operator<(const TypeTree &vd) const {
+    if (mapping != vd.mapping)
+      return mapping < vd.mapping;
+    return maxOffset < vd.maxOffset;
+  }
 
   /// Whether this TypeTree contains any information
   bool isKnown() const {
@@ -459,7 +484,7 @@ public:
 
   /// Select only the Integer ConcreteTypes
   TypeTree JustInt() const {
-    TypeTree vd;
+    TypeTree vd = emptyWithOffsetLimit();
     for (auto &pair : mapping) {
       if (pair.second == BaseType::Integer) {
         vd.insert(pair.first, pair.second);
@@ -471,7 +496,7 @@ public:
 
   /// Prepend an offset to all mappings
   TypeTree Only(int Off, llvm::Instruction *orig) const {
-    TypeTree Result;
+    TypeTree Result = emptyWithOffsetLimit();
     Result.minIndices.reserve(1 + minIndices.size());
     Result.minIndices.push_back(Off);
     for (auto midx : minIndices)
@@ -513,7 +538,7 @@ public:
 
   /// Peel off the outermost index at offset 0
   TypeTree Data0() const {
-    TypeTree Result;
+    TypeTree Result = emptyWithOffsetLimit();
 
     for (const auto &pair : mapping) {
       if (pair.first.size() == 0) {
@@ -556,7 +581,7 @@ public:
   /// Remove any mappings in the range [start, end) or [len, inf)
   /// This function has special handling for -1's
   TypeTree Clear(size_t start, size_t end, size_t len) const {
-    TypeTree Result;
+    TypeTree Result = emptyWithOffsetLimit();
 
     // Note that below do insertion with the orIn operator
     // to force an error if there is an incompatible
@@ -621,7 +646,7 @@ public:
       staging[next][pair.second].insert(pair.first[1]);
     }
 
-    TypeTree Result;
+    TypeTree Result = emptyWithOffsetLimit();
     for (auto &pair : staging) {
       auto &pnext = pair.first;
       for (auto &pair2 : pair.second) {
@@ -785,7 +810,7 @@ public:
 
   /// Keep only pointers (or anything's) to a repeated value (represented by -1)
   TypeTree KeepMinusOne(bool &legal) const {
-    TypeTree dat;
+    TypeTree dat = emptyWithOffsetLimit();
 
     for (const auto &pair : mapping) {
 
@@ -922,7 +947,7 @@ public:
     if (maxSize == 0)
       return TypeTree();
 
-    TypeTree Result;
+    TypeTree Result = emptyWithOffsetLimit();
 
     // The normal orIn / insert methods do collision checking, which is slow
     //  (and presently O(n)). This is because an expansion of a -1 which could
@@ -1041,7 +1066,7 @@ public:
 
       // If after moving this would not merit being kept for being a min index
       // or being within the max type offset, skip it.
-      if (next0 > MaxTypeOffset) {
+      if (next0 > maxOffset) {
         bool minIndex = next0 == Result.minIndices[0];
         if (!minIndex)
           for (size_t i = 1; i < pair.first.size(); i++) {
@@ -1108,7 +1133,7 @@ public:
 
   /// Keep only mappings where the type is not an `Anything`
   TypeTree PurgeAnything() const {
-    TypeTree Result;
+    TypeTree Result = emptyWithOffsetLimit();
     Result.minIndices.reserve(minIndices.size());
     for (const auto &pair : mapping) {
       if (pair.second == ConcreteType(BaseType::Anything))
@@ -1126,7 +1151,7 @@ public:
 
   /// Replace -1 with 0
   TypeTree ReplaceMinus() const {
-    TypeTree dat;
+    TypeTree dat = emptyWithOffsetLimit();
     for (const auto &pair : mapping) {
       if (pair.second == ConcreteType(BaseType::Anything))
         continue;
@@ -1150,7 +1175,7 @@ public:
 
   /// Keep only mappings where the type is an `Anything`
   TypeTree JustAnything() const {
-    TypeTree dat;
+    TypeTree dat = emptyWithOffsetLimit();
     for (const auto &pair : mapping) {
       if (pair.second != ConcreteType(BaseType::Anything))
         continue;
@@ -1160,12 +1185,15 @@ public:
   }
 
   /// Chceck equality of two TypeTrees
-  bool operator==(const TypeTree &RHS) const { return mapping == RHS.mapping; }
+  bool operator==(const TypeTree &RHS) const {
+    return maxOffset == RHS.maxOffset && mapping == RHS.mapping;
+  }
 
   /// Set this to another TypeTree, returning if this was changed
   bool operator=(const TypeTree &RHS) {
     if (*this == RHS)
       return false;
+    maxOffset = RHS.maxOffset;
     minIndices = RHS.minIndices;
     mapping.clear();
     for (const auto &elems : RHS.mapping) {
@@ -1312,7 +1340,7 @@ public:
   bool checkedOrIn(const TypeTree &RHS, bool PointerIntSame, bool &LegalOr) {
     // TODO detect recursive merge and simplify
 
-    bool changed = false;
+    bool changed = ensureKnownOffset(RHS.maxOffset);
     for (auto &pair : RHS.mapping) {
       changed |= checkedOrIn(pair.first, pair.second, PointerIntSame, LegalOr);
     }
@@ -1506,6 +1534,7 @@ public:
                      ->getSExtValue();
       auto next(prev);
       next.push_back((int)off);
+      ensureKnownOffset(off);
       insertFromMD(llvm::cast<llvm::MDNode>(md->getOperand(i + 1)), next);
     }
   }
