@@ -1195,6 +1195,23 @@ void TypeAnalyzer::updateAnalysis(Value *Val, TypeTree Data, Value *Origin) {
     if (CE->getOpcode() == Instruction::GetElementPtr &&
         isa<ConstantPointerNull>(CE->getOperand(0)))
       return;
+    // A cast of a global that type analysis must not recurse into is as
+    // opaque as the global itself. The Julia frontend seeds every cache slot
+    // of a GC-tracked pointer type with a cast of its `jl_nothing` global
+    // (its undefined value for such a type), and LLVM uniques constant
+    // expressions, so a fact learned from one cache's phi would otherwise
+    // reach the seed of every other cache of that type: a cache of
+    // Vector{Int} elements against a cache of Vector{Float64} elements
+    // raised "Illegal updateAnalysis" on that shared constant.
+    if (CE->isCast())
+      if (auto GV = dyn_cast<GlobalVariable>(
+              CE->getOperand(0)->stripPointerCasts()))
+        if (hasMetadata(GV, "enzyme_ta_norecur")) {
+          if (EnzymePrintType)
+            llvm::errs() << "Skipping updateAnalysis of cast of "
+                         << GV->getName() << "\n";
+          return;
+        }
   }
 
   if (auto I = dyn_cast<Instruction>(Val)) {
