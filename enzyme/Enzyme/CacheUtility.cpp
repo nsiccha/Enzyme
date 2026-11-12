@@ -1581,10 +1581,33 @@ CacheUtility::SubLimitType CacheUtility::getSubLimits(bool inForwardPass,
                     "Could not compute outermost loop limit by moving value ",
                     *limit, " computed at block", contexts[i].header->getName(),
                     " function ", contexts[i].header->getParent()->getName());
-        allocationPreheaders[i] = contexts[i].preheader;
-        allocationBuilder.SetInsertPoint(&allocationPreheaders[i]->back());
-        limitMinus1 = unwrapM(limit, allocationBuilder, prevMap,
-                              UnwrapMode::AttemptFullUnwrap);
+        // A bound may vary across an outer loop while remaining invariant
+        // across several inner loops. Try each boundary within the current
+        // chunk before falling back to a separate allocation for this loop.
+        int outer = i;
+        while (outer + 1 < (int)contexts.size() &&
+               allocationPreheaders[outer + 1] == allocationPreheaders[i])
+          ++outer;
+        for (int candidate = outer - 1; candidate >= i; --candidate) {
+          prevMap.clear();
+          for (int j = contexts.size() - 1; j > candidate; --j)
+            prevMap[contexts[j].var] = contexts[j].var;
+          allocationBuilder.SetInsertPoint(
+              &contexts[candidate].preheader->back());
+          limitMinus1 = unwrapM(limit, allocationBuilder, prevMap,
+                                UnwrapMode::AttemptFullUnwrap);
+          if (limitMinus1 && candidate > i && i == 0 && extraSize &&
+              !unwrapM(extraSize, allocationBuilder, prevMap,
+                       UnwrapMode::AttemptFullUnwrap))
+            limitMinus1 = nullptr;
+          if (limitMinus1) {
+            // Split every intervening loop out of the old chunk, so the
+            // allocation and all its indices agree on the new boundary.
+            for (int j = i; j <= candidate; ++j)
+              allocationPreheaders[j] = contexts[candidate].preheader;
+            break;
+          }
+        }
         if (limitMinus1 == nullptr) {
           llvm::errs() << *contexts[i].preheader->getParent() << "\n";
           llvm::errs() << "block: " << *allocationPreheaders[i] << "\n";
@@ -1623,6 +1646,31 @@ CacheUtility::SubLimitType CacheUtility::getSubLimits(bool inForwardPass,
         }
       }
 
+      bool canSkipLoop = false;
+      if (allocationPreheaders[i] != contexts[i].preheader) {
+        for (int k = i; (unsigned)(k + 1) < contexts.size() &&
+                        allocationPreheaders[k] != contexts[k].preheader;
+             ++k) {
+          BasicBlock *cur = contexts[k].preheader;
+          while (cur != contexts[k + 1].header) {
+            if (cur->getTerminator()->getNumSuccessors() != 1) {
+              canSkipLoop = true;
+              break;
+            }
+            cur = cur->getSinglePredecessor();
+            if (!cur) {
+              canSkipLoop = true;
+              break;
+            }
+          }
+          if (cur && cur->getTerminator()->getNumSuccessors() != 1) {
+            canSkipLoop = true;
+          }
+          if (canSkipLoop)
+            break;
+        }
+      }
+
       // We now need to compute the actual limit as opposed to the limit
       // minus one.
       if (inForwardPass) {
@@ -1634,9 +1682,14 @@ CacheUtility::SubLimitType CacheUtility::getSubLimits(bool inForwardPass,
         if (found != map.end() && found->second != nullptr) {
           limits[i] = found->second;
         } else {
-          limits[i] = map[allocationPreheaders[i]] =
-              allocationBuilder.CreateNSWAdd(
-                  limitMinus1, ConstantInt::get(limitMinus1->getType(), 1));
+          Value *add = allocationBuilder.CreateNSWAdd(
+              limitMinus1, ConstantInt::get(limitMinus1->getType(), 1));
+          if (canSkipLoop) {
+            auto zero = ConstantInt::get(limitMinus1->getType(), 0);
+            add = allocationBuilder.CreateSelect(
+                allocationBuilder.CreateICmpSLT(add, zero), zero, add);
+          }
+          limits[i] = map[allocationPreheaders[i]] = add;
         }
       } else {
         Value *lim = unwrapM(limitMinus1, *RB, reverseMap,
@@ -1647,7 +1700,12 @@ CacheUtility::SubLimitType CacheUtility::getSubLimits(bool inForwardPass,
           llvm::errs() << *limitMinus1 << "\n";
         }
         assert(lim);
-        limits[i] = RB->CreateNSWAdd(lim, ConstantInt::get(lim->getType(), 1));
+        Value *add = RB->CreateNSWAdd(lim, ConstantInt::get(lim->getType(), 1));
+        if (canSkipLoop) {
+          auto zero = ConstantInt::get(lim->getType(), 0);
+          add = RB->CreateSelect(RB->CreateICmpSLT(add, zero), zero, add);
+        }
+        limits[i] = add;
       }
     }
   }

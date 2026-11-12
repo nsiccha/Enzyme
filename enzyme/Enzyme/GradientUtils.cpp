@@ -1863,6 +1863,39 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
       return toreturn;
     }
 
+    // Identical arithmetic on each incoming edge does not depend on which
+    // edge was taken. Rebuild it directly, including when the insertion block
+    // is already terminated and cannot host a reconstructed branch diamond.
+    if (!OrigLI->isLoopHeader(origParent)) {
+      if (auto first = dyn_cast<BinaryOperator>(phi->getIncomingValue(0))) {
+        bool identical = true;
+        for (auto &incoming : phi->incoming_values()) {
+          auto other = dyn_cast<BinaryOperator>(incoming);
+          if (!other || !first->isIdenticalTo(other)) {
+            identical = false;
+            break;
+          }
+        }
+        for (auto &operand : first->operands()) {
+          if (auto inst = dyn_cast<Instruction>(operand))
+            if (!DT.dominates(inst, phi))
+              identical = false;
+        }
+        // Unwrapping can request the value outside the original branch.
+        // Do not speculate a potentially trapping operation such as sdiv.
+        if (identical && isSafeToSpeculativelyExecute(first)) {
+          auto result = unwrapM(first, BuilderM, available, unwrapMode,
+                                scope ? scope : phi->getParent(), permitCache);
+          if (result) {
+            if (permitCache)
+              unwrap_cache[BuilderM.GetInsertBlock()][idx.first][idx.second] =
+                  result;
+            return result;
+          }
+        }
+      }
+    }
+
     std::set<BasicBlock *> targetToPreds;
     // Map of function edges to list of values possible
     std::map<std::pair</*pred*/ BasicBlock *, /*successor*/ BasicBlock *>,
