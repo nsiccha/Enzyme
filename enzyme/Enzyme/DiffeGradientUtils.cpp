@@ -906,7 +906,8 @@ CallInst *DiffeGradientUtils::freeCache(BasicBlock *forwardPreheader,
                                         const SubLimitType &sublimits, int i,
                                         AllocaInst *alloc, llvm::Type *T,
                                         ConstantInt *byteSizeOfType,
-                                        Value *storeInto, MDNode *InvariantMD) {
+                                        Value *storeInto, MDNode *InvariantMD,
+                                        Type *packedType) {
   if (!FreeMemory)
     return nullptr;
   assert(reverseBlocks.find(forwardPreheader) != reverseBlocks.end());
@@ -953,6 +954,19 @@ CallInst *DiffeGradientUtils::freeCache(BasicBlock *forwardPreheader,
       (unsigned)newFunc->getParent()->getDataLayout().getPointerSize());
   forfree->setAlignment(Align(align));
 
+  if (packedType) {
+    auto buffer = tbuild.CreateLoad(packedType, forfree);
+    if (auto ci = CreateDealloc(tbuild, buffer)) {
+      // A nest containing no rows never grows its initially null buffer.
+      ci->removeParamAttr(0, Attribute::NonNull);
+      auto ident = MDNode::getDistinct(
+          ci->getContext(),
+          {ConstantAsMetadata::get(ConstantInt::getFalse(ci->getContext()))});
+      ci->setMetadata("enzyme_cache_free",
+                      MDNode::get(ci->getContext(), {ident}));
+      scopeFrees[alloc].insert(ci);
+    }
+  }
   CallInst *ci = CreateDealloc(tbuild, forfree);
   if (ci) {
     if (newFunc->getSubprogram())

@@ -111,8 +111,8 @@ public:
                             const SubLimitType &sublimits, int i,
                             llvm::AllocaInst *alloc, llvm::Type *myType,
                             llvm::ConstantInt *byteSizeOfType,
-                            llvm::Value *storeInto,
-                            llvm::MDNode *InvariantMD) override;
+                            llvm::Value *storeInto, llvm::MDNode *InvariantMD,
+                            llvm::Type *packedType = nullptr) override;
 
   /// align is the alignment that should be specified for load/store to pointer
   void addToInvertedPtrDiffe(llvm::Instruction *orig, llvm::Value *origVal,

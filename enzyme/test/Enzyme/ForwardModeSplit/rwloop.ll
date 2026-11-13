@@ -117,49 +117,53 @@ attributes #9 = { noreturn nounwind }
 !9 = !{!"any pointer", !4, i64 0}
 
 
-; CHECK: define internal double @fwddiffealldiv(double* noalias nocapture %a, double* nocapture %"a'", i32* noalias nocapture %N, i8* %tapeArg)
-; CHECK-NEXT: entry:
-; CHECK-NEXT:   %0 = bitcast i8* %tapeArg to { i1, i32, double** }*
-; CHECK-NEXT:   %truetape = load { i1, i32, double** }, { i1, i32, double** }* %0
-; CHECK-DAG:   %[[i2:.+]] = extractvalue { i1, i32, double** } %truetape, 2
-; CHECK-DAG:   %cmp233 = extractvalue { i1, i32, double** } %truetape, 0
+; The first table slot owns the growing value buffer; later slots hold offsets.
+; CHECK-LABEL: define internal double @fwddiffealldiv(double* noalias nocapture %a, double* nocapture %"a'", i32* noalias nocapture %N, i8* %tapeArg)
+; CHECK: entry:
+; CHECK-NEXT:   %[[V0:.+]] = bitcast i8* %tapeArg to { i1, i32, double** }*
+; CHECK-NEXT:   %truetape = load { i1, i32, double** }, { i1, i32, double** }* %[[V0]], align 8
+; CHECK-NEXT:   %[[V1:.+]] = extractvalue { i1, i32, double** } %truetape, 2
+; CHECK-NEXT:   %cmp233 = extractvalue { i1, i32, double** } %truetape, 0
 ; CHECK-NEXT:   br label %for.cond1.preheader
 
-; CHECK: for.cond1.preheader:                              ; preds = %for.cond.cleanup3, %entry
-; CHECK-DAG:   %iv = phi i64 [ %iv.next, %for.cond.cleanup3 ], [ 0, %entry ]
-; CHECK-DAG:   %[[sum036:.+]] = phi {{(fast )?}}double [ 0.000000e+00, %entry ], [ %[[sumlcssa:.+]], %for.cond.cleanup3 ]
-; CHECK-NEXT:   %iv.next = add nuw nsw i64 %iv, 1
+; CHECK: for.cond1.preheader:
+; CHECK-NEXT:   %[[V2:.+]] = phi fast double [ 0.000000e+00, %entry ], [ %[[V18:.+]], %for.cond.cleanup3 ]
+; CHECK-NEXT:   %iv = phi i64 [ %iv.next, %for.cond.cleanup3 ], [ 0, %entry ]
+; CHECK-NEXT:   %iv.next = add i64 %iv, 1
 ; CHECK-NEXT:   br i1 %cmp233, label %for.body4.lr.ph, label %for.cond.cleanup3
 
-; CHECK: for.body4.lr.ph:                                  ; preds = %for.cond1.preheader
-; CHECK-NEXT:   %[[i3:.+]] = mul nuw nsw i64 %iv, 10
-; CHECK-NEXT:   %[[i5:.+]] = extractvalue { i1, i32, double** } %truetape, 1
-; CHECK-NEXT:   %[[i6:.+]] = sext i32 %[[i5]] to i64
+; CHECK: for.body4.lr.ph:
+; CHECK-NEXT:   %[[V3:.+]] = mul nuw nsw i64 %iv, 10
+; CHECK-NEXT:   %[[V4:.+]] = extractvalue { i1, i32, double** } %truetape, 1
+; CHECK-NEXT:   %[[V5:.+]] = sext i32 %[[V4]] to i64
 ; CHECK-NEXT:   br label %for.body4
 
-; CHECK: for.body4:                                        ; preds = %for.body4, %for.body4.lr.ph
-; CHECK-DAG:   %iv1 = phi i64 [ %iv.next2, %for.body4 ], [ 0, %for.body4.lr.ph ]
-; CHECK-DAG:   %[[sum134:.+]] = phi {{(fast )?}}double [ %[[sum036]], %for.body4.lr.ph ], [ %[[i15:.+]], %for.body4 ]
+; CHECK: for.body4:
+; CHECK-NEXT:   %[[V6:.+]] = phi fast double [ %[[V2]], %for.body4.lr.ph ], [ %[[V17:.+]], %for.body4 ]
+; CHECK-NEXT:   %iv1 = phi i64 [ %iv.next2, %for.body4 ], [ 0, %for.body4.lr.ph ]
 ; CHECK-NEXT:   %iv.next2 = add nuw nsw i64 %iv1, 1
-; CHECK-NEXT:   %[[i7:.+]] = add nuw nsw i64 %iv1, %[[i3]]
-; CHECK-NEXT:   %[[arrayidxipg:.+]] = getelementptr inbounds double, double* %"a'", i64 %[[i7]]
-; CHECK-NEXT:   %[[i12:.+]] = load double, double* %[[arrayidxipg]], align 8
-; CHECK-NEXT:   %[[i8:.+]] = getelementptr inbounds double*, double** %[[i2]], i64 %iv
-; CHECK-NEXT:   %[[i9:.+]] = load double*, double** %[[i8]], align 8, !dereferenceable !{{[0-9]+}}, !invariant.group !
-; CHECK-NEXT:   %[[i10:.+]] = getelementptr inbounds double, double* %[[i9]], i64 %iv1
-; CHECK-NEXT:   %[[i11:.+]] = load double, double* %[[i10]], align 8, !invariant.group !
-; CHECK-NEXT:   %[[i13:.+]] = fmul fast double %[[i12]], %[[i11]]
-; CHECK-NEXT:   %[[i14:.+]] = fadd fast double %[[i13]], %[[i13]]
-; CHECK-NEXT:   %[[i15]] = fadd fast double %[[sum134]], %[[i14]]
-; CHECK-NEXT:   store double 0.000000e+00, double* %[[arrayidxipg]], align 8
-; CHECK-NEXT:   %cmp2 = icmp slt i64 %iv.next2, %[[i6]]
+; CHECK-NEXT:   %[[V7:.+]] = add nuw nsw i64 %iv1, %[[V3]]
+; CHECK-NEXT:   %"arrayidx'ipg" = getelementptr inbounds double, double* %"a'", i64 %[[V7]]
+; CHECK-NEXT:   %"'ipl" = load double, double* %"arrayidx'ipg", align 8
+; CHECK-NEXT:   %[[V8:.+]] = getelementptr inbounds double*, double** %[[V1]], i64 %iv.next
+; CHECK-NEXT:   %[[V9:.+]] = load double*, double** %[[V8]], align 8
+; CHECK-NEXT:   %[[V10:.+]] = ptrtoint double* %[[V9]] to i64
+; CHECK-NEXT:   %[[V11:.+]] = load double*, double** %[[V1]], align 8
+; CHECK-NEXT:   %[[V12:.+]] = add nuw i64 %[[V10]], %iv1
+; CHECK-NEXT:   %[[V13:.+]] = getelementptr inbounds double, double* %[[V11]], i64 %[[V12]]
+; CHECK-NEXT:   %[[V14:.+]] = load double, double* %[[V13]], align 8, !invariant.group ![[G0:[0-9]+]]
+; CHECK-NEXT:   %[[V15:.+]] = fmul fast double %"'ipl", %[[V14]]
+; CHECK-NEXT:   %[[V16:.+]] = fadd fast double %[[V15]], %[[V15]]
+; CHECK-NEXT:   %[[V17]] = fadd fast double %[[V6]], %[[V16]]
+; CHECK-NEXT:   store double 0.000000e+00, double* %"arrayidx'ipg", align 8
+; CHECK-NEXT:   %cmp2 = icmp slt i64 %iv.next2, %[[V5]]
 ; CHECK-NEXT:   br i1 %cmp2, label %for.body4, label %for.cond.cleanup3
 
-; CHECK: for.cond.cleanup3:                                ; preds = %for.body4, %for.cond1.preheader
-; CHECK-NEXT:   %[[sumlcssa]] = phi {{(fast )?}}double [ %[[sum036:.+]], %for.cond1.preheader ], [ %[[i15]], %for.body4 ]
+; CHECK: for.cond.cleanup3:
+; CHECK-NEXT:   %[[V18]] = phi fast double [ %[[V2]], %for.cond1.preheader ], [ %[[V17]], %for.body4 ]
 ; CHECK-NEXT:   %exitcond = icmp eq i64 %iv.next, 10
 ; CHECK-NEXT:   br i1 %exitcond, label %for.cond.cleanup, label %for.cond1.preheader
 
-; CHECK: for.cond.cleanup:                                 ; preds = %for.cond.cleanup3
-; CHECK-NEXT:   ret double %[[sumlcssa]]
+; CHECK: for.cond.cleanup:
+; CHECK-NEXT:   ret double %[[V18]]
 ; CHECK-NEXT: }
