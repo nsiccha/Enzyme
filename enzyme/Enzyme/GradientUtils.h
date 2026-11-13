@@ -442,6 +442,11 @@ public:
                                const llvm::ValueToValueMapTy &available,
                                bool &branches);
 
+  /// Whether lookupM can directly use a forward SSA value defined in origDef
+  /// at the reverse of origUse. Both blocks belong to the original function.
+  bool primalValueAvailableInReverse(const llvm::BasicBlock *origDef,
+                                     const llvm::BasicBlock *origUse) const;
+
   /// Whether a value can be recomputed the same way from any position after a
   /// loop exit's reverse block, and if so whether that takes a branch.
   enum class LoopEntryRecompute { No, Plain, Merge };
@@ -449,7 +454,8 @@ public:
   /// Whether `inst` and everything it is computed from are recomputed the same
   /// way from any position after `origExit`'s reverse block: plain operations
   /// of the original function, merges of branches, induction variables of loops
-  /// around `origExit`, and memory the reverse pass does not rematerialize.
+  /// around `origExit`, memory the reverse pass does not rematerialize, and
+  /// forward values that lookupM can use directly.
   /// `inMerge` says the value is only read on one path of a merge, where it may
   /// also come from a cache.
   LoopEntryRecompute recomputesAnywhereInReverse(

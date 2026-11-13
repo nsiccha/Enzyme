@@ -7359,6 +7359,19 @@ GradientUtils::LoopEntryRecompute GradientUtils::mergeRecomputesAtLoopEntry(
   return LoopEntryRecompute::Merge;
 }
 
+bool GradientUtils::primalValueAvailableInReverse(
+    const BasicBlock *origDef, const BasicBlock *origUse) const {
+  if (!BlocksDominatingAllReturns.count(origDef))
+    return false;
+
+  // The original SSA value is the last forward iteration's value. It is the
+  // right value only if the definition and use share no enclosing loop.
+  for (Loop *L = OrigLI->getLoopFor(origDef); L; L = L->getParentLoop())
+    if (L->contains(origUse))
+      return false;
+  return true;
+}
+
 GradientUtils::LoopEntryRecompute GradientUtils::recomputesAnywhereInReverse(
     Instruction *inst, const BasicBlock *origExit, IRBuilder<> &BuilderM,
     unsigned depth, bool inMerge) {
@@ -7380,6 +7393,14 @@ GradientUtils::LoopEntryRecompute GradientUtils::recomputesAnywhereInReverse(
   Instruction *orig = isOriginal(inst);
   if (!orig)
     return LoopEntryRecompute::No;
+
+  // lookupM can use this value directly from the forward pass. Its operands
+  // need not be recomputable: for example, an allocation that still dominates
+  // the reverse pass, or a scalar loaded before its memory was overwritten.
+  // Register reduction can ask lookupM to recompute even a dominating value.
+  if (!EnzymeRegisterReduce)
+    if (primalValueAvailableInReverse(orig->getParent(), origExit))
+      return recomputableAtLoopEntry[key] = LoopEntryRecompute::Plain;
 
   if (auto phi = dyn_cast<PHINode>(inst)) {
     // The induction variable of a loop still running at the exit is read from
@@ -7641,36 +7662,12 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
       }
       assert(orig);
 
-      // TODO upgrade this to be all returns that this could enter from
-      bool legal = BlocksDominatingAllReturns.count(orig);
-      if (legal) {
-
+      if (BlocksDominatingAllReturns.count(orig)) {
         BasicBlock *forwardBlock =
             isOriginal(originalForReverseBlock(*BuilderM.GetInsertBlock()));
         assert(forwardBlock);
-
-        // Don't allow this if we're not definitely using the last iteration of
-        // this value
-        //   + either because the value isn't in a loop
-        //   + or because the forward of the block usage location isn't in a
-        //   loop (thus last iteration)
-        //   + or because the loop nests share no ancestry
-
-        bool loopLegal = true;
-        for (Loop *idx = OrigLI->getLoopFor(orig); idx != nullptr;
-             idx = idx->getParentLoop()) {
-          for (Loop *fdx = OrigLI->getLoopFor(forwardBlock); fdx != nullptr;
-               fdx = fdx->getParentLoop()) {
-            if (idx == fdx) {
-              loopLegal = false;
-              break;
-            }
-          }
-        }
-
-        if (loopLegal) {
+        if (primalValueAvailableInReverse(orig, forwardBlock))
           return inst;
-        }
       }
     }
   }

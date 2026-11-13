@@ -1007,9 +1007,8 @@ attributes #9 = { noreturn nounwind }
 ; CHECK-NEXT:   %"iv5'ac.0" = phi i64 [ %[[iv5start:.+]], %invertscalar ], [ %[[iv5sub:.+]], %incinvertmatfor3 ]
 ; CHECK-NEXT:   %[[m0diffemul26:.+]] = fmul fast double %"zadd'de.1", 4.000000e+00
 
-; CHECK-NEXT:   %[[addptrZ:.+]] = getelementptr inbounds double, double* %.cast, i64 %"iv3'ac.0"
 ; CHECK-NEXT:   %[[mul_uw:.+]] = shl nsw i64 %"iv5'ac.0", 2
-; CHECK-NEXT:   %[[arrayidx:.+]] = getelementptr inbounds double, double* %[[addptrZ]], i64 %[[mul_uw]]
+; CHECK-NEXT:   %[[arrayidx:.+]] = getelementptr inbounds double, double* %[[addptrZ:.+]], i64 %[[mul_uw]]
 ; CHECK-NEXT:   %[[ival:.+]] = load double, double* %[[arrayidx]], align 8
 
 ; CHECK-NEXT:   %[[mv2:.+]] = fmul fast double %[[m0diffemul26]], %[[ival]]
@@ -1028,6 +1027,9 @@ attributes #9 = { noreturn nounwind }
 
 ; CHECK: invertscalar:                                     ; preds = %invertfor.cond.cleanup4, %incinvertmatfor2
 ; CHECK-NEXT:   %"iv3'ac.0" = phi i64 [ 3, %invertfor.cond.cleanup4 ], [ %[[iv3sub]], %incinvertmatfor2 ]
+; The primal allocation is still available, so its row pointer is recomputed
+; once on entry to the innermost reverse loop.
+; CHECK-NEXT:   %[[addptrZ]] = getelementptr inbounds double, double* %.cast, i64 %"iv3'ac.0"
 ; CHECK-NEXT:   %[[rows_uw:.+]] = load i64, i64* %m_rows.i1, align 8
 ; TODO-MAX-ORCHECK-NEXT:   %[[sgt:.+]] = icmp sgt i64 %[[rows_uw]], 1
 ; TODO-MAX-ORCHECK-NEXT:   %[[smax:.+]] = select i1 %[[sgt]], i64 %[[rows_uw]], i64 1
