@@ -41,6 +41,7 @@
 #include "LibraryFuncs.h"
 #include "TypeAnalysis/TBAA.h"
 
+#include "llvm/Analysis/IVDescriptors.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
@@ -631,6 +632,150 @@ bool GradientUtils::onlyActiveUseInLoopIsPHI(const Instruction *val,
     return false;
   }
   return true;
+}
+
+void GradientUtils::findReassociableAdjoints(Loop *L,
+                                             SmallPtrSetImpl<Value *> &result) {
+  // Memory recurrences, nested loops and atomic accumulation need a separate
+  // independence proof. SSA adjoints of invariant scalar loads are covered:
+  // their memory adjoints are updated outside this loop, by the ordinary rule.
+  if (!L->getSubLoops().empty() || AtomicAdd)
+    return;
+  for (auto BB : L->blocks())
+    for (auto &I : *BB) {
+      if (I.mayWriteToMemory() || I.mayThrow())
+        return;
+      if (auto LI = dyn_cast<LoadInst>(&I))
+        if (!LI->isSimple())
+          return;
+    }
+
+  SmallPtrSet<Instruction *, 16> recurrence;
+  SmallVector<Value *, 16> work;
+  for (auto &Phi : L->getHeader()->phis()) {
+    if (isConstantValue(&Phi))
+      continue;
+    RecurrenceDescriptor RD;
+    if (!RecurrenceDescriptor::isReductionPHI(&Phi, L, RD) ||
+        RD.getRecurrenceKind() != RecurKind::FAdd ||
+        !RD.getFastMathFlags().allowReassoc())
+      return;
+    auto chain = RD.getReductionOpChain(&Phi, L);
+    if (chain.empty())
+      return;
+    SmallPtrSet<Instruction *, 8> members;
+    members.insert(&Phi);
+    members.insert(chain.begin(), chain.end());
+    for (auto I : chain) {
+      if ((I->getOpcode() != Instruction::FAdd &&
+           I->getOpcode() != Instruction::FSub) ||
+          !I->getFastMathFlags().allowReassoc())
+        return;
+      auto A = dyn_cast<Instruction>(I->getOperand(0));
+      auto B = dyn_cast<Instruction>(I->getOperand(1));
+      bool carriesA = A && members.count(A);
+      bool carriesB = B && members.count(B);
+      if (carriesA == carriesB ||
+          (carriesB && I->getOpcode() == Instruction::FSub))
+        return;
+      work.push_back(I->getOperand(carriesA ? 1 : 0));
+    }
+    // A prefix sum observed inside the loop is not an independent reduction.
+    for (auto I : members)
+      for (auto U : I->users()) {
+        auto UI = dyn_cast<Instruction>(U);
+        if (!UI || (!members.count(UI) &&
+                    (L->contains(UI) || I != RD.getLoopExitInstr())))
+          return;
+      }
+    recurrence.insert(members.begin(), members.end());
+  }
+  if (recurrence.empty())
+    return;
+
+  // Walk the per-iteration expressions back to invariant SSA inputs. No
+  // loop-carried value may enter a contribution, even through a predicate.
+  SmallPtrSet<Instruction *, 32> contributors;
+  SmallPtrSet<Value *, 8> invariants;
+  while (!work.empty()) {
+    auto V = work.pop_back_val();
+    if (isConstantValue(V))
+      continue;
+    if (L->isLoopInvariant(V)) {
+      invariants.insert(V);
+      continue;
+    }
+    auto I = dyn_cast<Instruction>(V);
+    if (!I || isa<PHINode>(I) || recurrence.count(I))
+      return;
+    if (!contributors.insert(I).second)
+      continue;
+    if (isa<LoadInst>(I))
+      continue;
+    // An opaque/custom call can couple its adjoints in ways this SSA proof
+    // does not establish. Inlined arithmetic and pure LLVM intrinsics suffice.
+    if (auto CI = dyn_cast<CallInst>(I)) {
+      if (!isa<IntrinsicInst>(CI) || !CI->doesNotAccessMemory())
+        return;
+      for (auto &A : CI->args())
+        work.push_back(A);
+    } else {
+      if (!isa<BinaryOperator>(I) && !isa<UnaryOperator>(I) &&
+          !isa<CastInst>(I) && !isa<SelectInst>(I) && !isa<CmpInst>(I))
+        return;
+      for (auto &A : I->operands())
+        work.push_back(A);
+    }
+  }
+
+  // Remove shared expressions and inputs with another differentiated use.
+  // Propagating the exclusions backwards visits each edge once, including
+  // shared DAGs; doing a use-tree search for every input would be quadratic.
+  SmallVector<Instruction *, 16> excluded;
+  SmallPtrSet<Instruction *, 16> seen;
+  for (auto I : contributors)
+    for (auto U : I->users()) {
+      auto UI = dyn_cast<Instruction>(U);
+      if (!UI || (!contributors.count(UI) && !recurrence.count(UI) &&
+                  !isConstantInstruction(UI))) {
+        excluded.push_back(I);
+        break;
+      }
+    }
+  for (auto BB : L->blocks())
+    for (auto &I : *BB)
+      if (!contributors.count(&I) && !recurrence.count(&I) &&
+          !isConstantInstruction(&I))
+        for (auto &A : I.operands())
+          invariants.erase(A);
+  while (!excluded.empty()) {
+    auto I = excluded.pop_back_val();
+    if (!seen.insert(I).second)
+      continue;
+    for (auto &A : I->operands()) {
+      invariants.erase(A);
+      if (auto AI = dyn_cast<Instruction>(A))
+        if (contributors.count(AI))
+          excluded.push_back(AI);
+    }
+  }
+  result.insert(invariants.begin(), invariants.end());
+}
+
+bool GradientUtils::canReassociateAdjoint(Value *V, BasicBlock *reverseBlock) {
+  auto F = reverseBlockToPrimal.find(reverseBlock);
+  if (F == reverseBlockToPrimal.end() || !OrigLI)
+    return false;
+  auto L = OrigLI->getLoopFor(isOriginal(F->second));
+  if (!L || !L->isLoopInvariant(V))
+    return false;
+  auto found = reassociableAdjoints.find(L);
+  if (found == reassociableAdjoints.end()) {
+    auto &values = reassociableAdjoints[L];
+    findReassociableAdjoints(L, values);
+    return values.count(V);
+  }
+  return found->second.count(V);
 }
 
 bool GradientUtils::assumeDynamicLoopOfSizeOne(Loop *L) const {

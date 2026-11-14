@@ -534,6 +534,22 @@ static bool isZero(llvm::Constant *cst) {
   return cst->isZeroValue();
 #endif
 }
+
+static Value *addAdjointContribution(IRBuilder<> &B, Value *old, Value *inc,
+                                     bool reassociate) {
+  IRBuilder<>::FastMathFlagGuard guard(B);
+  if (reassociate) {
+    auto flags = B.getFastMathFlags();
+    flags.setAllowReassoc();
+    B.setFastMathFlags(flags);
+  }
+  if (auto BI = dyn_cast<BinaryOperator>(inc))
+    if (auto C = dyn_cast<ConstantFP>(BI->getOperand(0)))
+      if (BI->getOpcode() == BinaryOperator::FSub && C->isZero())
+        return B.CreateFSub(old, BI->getOperand(1));
+  return B.CreateFAdd(old, inc);
+}
+
 SmallVector<SelectInst *, 4>
 DiffeGradientUtils::addToDiffe(Value *val, Value *dif, IRBuilder<> &BuilderM,
                                Type *addingType, ArrayRef<Value *> idxs,
@@ -550,18 +566,10 @@ DiffeGradientUtils::addToDiffe(Value *val, Value *dif, IRBuilder<> &BuilderM,
 
   SmallVector<SelectInst *, 4> addedSelects;
 
+  const bool reassociate =
+      canReassociateAdjoint(val, BuilderM.GetInsertBlock());
   auto faddForNeg = [&](Value *old, Value *inc, bool san) {
-    if (auto bi = dyn_cast<BinaryOperator>(inc)) {
-      if (auto ci = dyn_cast<ConstantFP>(bi->getOperand(0))) {
-        if (bi->getOpcode() == BinaryOperator::FSub && ci->isZero()) {
-          Value *res = BuilderM.CreateFSub(old, bi->getOperand(1));
-          if (san)
-            res = SanitizeDerivatives(val, res, BuilderM, mask);
-          return res;
-        }
-      }
-    }
-    Value *res = BuilderM.CreateFAdd(old, inc);
+    Value *res = addAdjointContribution(BuilderM, old, inc, reassociate);
     if (san)
       res = SanitizeDerivatives(val, res, BuilderM, mask);
     return res;

@@ -147,6 +147,15 @@ public:
   llvm::LoopInfo *OrigLI;
   llvm::ScalarEvolution *OrigSE;
 
+  /// Original, loop-invariant values whose independent adjoint contributions
+  /// belong exclusively to reassociable additive reductions. Compute once per
+  /// leaf loop; never infer permission from unrelated fast arithmetic.
+  llvm::DenseMap<const llvm::Loop *, llvm::SmallPtrSet<llvm::Value *, 8>>
+      reassociableAdjoints;
+  void findReassociableAdjoints(llvm::Loop *L,
+                                llvm::SmallPtrSetImpl<llvm::Value *> &result);
+  bool canReassociateAdjoint(llvm::Value *V, llvm::BasicBlock *reverseBlock);
+
   /// (Original) Blocks which dominate all returns
   llvm::SmallPtrSet<llvm::BasicBlock *, 4> BlocksDominatingAllReturns;
 
