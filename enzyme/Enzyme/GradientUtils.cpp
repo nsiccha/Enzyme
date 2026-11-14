@@ -10623,6 +10623,28 @@ void GradientUtils::computeForwardingProperties(
     if (notForAnalysis.count(cur->getParent()))
       continue;
     if (isPointerArithmeticInst(cur)) {
+      if (auto phi = dyn_cast<PHINode>(cur)) {
+        auto loop = OrigLI->getLoopFor(phi->getParent());
+        if (loop && loop->getHeader() == phi->getParent() &&
+            loop->contains(V)) {
+          for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+            if (phi->getIncomingValue(i) != prev ||
+                !loop->contains(phi->getIncomingBlock(i)))
+              continue;
+            // Loop replay keeps one current instance of each allocation.
+            // A backedge carries the previous instance: rebuilding the current
+            // one would make its initialization and reverse users read that
+            // instance instead, potentially before its stores have run.
+            EmitWarning("NotPromotable", *cur, " Could not promote allocation ",
+                        *V, " carried across a loop backedge by ", *cur);
+            promotable = false;
+            shadowpromotable = false;
+            break;
+          }
+          if (!promotable)
+            break;
+        }
+      }
       for (auto u : cur->users()) {
         if (auto I = dyn_cast<Instruction>(u))
           todo.push_back(std::make_pair(I, (Value *)cur));
