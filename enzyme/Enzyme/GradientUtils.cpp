@@ -1101,11 +1101,6 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
     }
   }
 
-  if (isa<LoadInst>(val) &&
-      cast<LoadInst>(val)->getMetadata("enzyme_mustcache")) {
-    return val;
-  }
-
   if (available.count(val)) {
     auto avail = available.lookup(val);
     // A null entry marks a value as explicitly unavailable (e.g. the phi
@@ -1652,6 +1647,12 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
     assert(val->getType() == toreturn->getType());
     return toreturn;
   } else if (auto load = dyn_cast<LoadInst>(val)) {
+    // A cached load need not dominate this use (custom-rule return fields
+    // can be produced on only one forward path). Use the normal lookup
+    // fallback instead of returning the forward instruction or reloading it.
+    if (load->getMetadata("enzyme_mustcache"))
+      goto endCheck;
+
     if (load->getMetadata("enzyme_noneedunwrap"))
       return load;
 
