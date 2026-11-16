@@ -11859,8 +11859,10 @@ bool GradientUtils::strongZeroFor(const llvm::Value *orig) {
 // where LLVM's speculation of a guarded branch into a select (SimplifyCFG's
 // two-entry phi folding, InstCombine folding an operation into a select with a
 // constant arm, GVN folding a repeated guard) evaluates operands the source
-// never computed, such as 1 / 0. selectMasked keeps the masked poles and the
-// masked values computed from them, whose partials can be infinite there.
+// never computed, such as 1 / 0 or x * x for a rejected nonfinite x.
+// Even without a pole, an operand can be nonfinite or have overflowed in an
+// earlier multiplication. Keep every masked instruction: checkedMul/checkedDiv
+// already omit checks when their partial is a safe floating-point constant.
 void GradientUtils::computeSelectMasked() {
   SmallPtrSet<const Instruction *, 16> cand;
   for (auto &BB : *oldFunc)
@@ -11903,33 +11905,13 @@ void GradientUtils::computeSelectMasked() {
         reach.push_back(I);
         break;
       }
-  SmallPtrSet<const Instruction *, 16> masked;
   while (!reach.empty()) {
     auto *I = reach.pop_back_val();
-    if (!masked.insert(I).second)
+    if (!selectMasked.insert(I).second)
       continue;
     for (const Value *op : I->operands())
       if (auto *OI = dyn_cast<Instruction>(op))
-        if (cand.count(OI) && !masked.count(OI))
+        if (cand.count(OI) && !selectMasked.count(OI))
           reach.push_back(OI);
-  }
-  // Of those, a partial can be infinite or NaN for finite inputs only at a
-  // pole (a division, a remainder, a call such as log or sqrt) or downstream
-  // of one, where an operand may already be infinite. Only these need the
-  // check; a masked fmul or fadd of finite values (a ReLU's h in
-  // `h > 0 ? h : 0`) keeps its plain rule.
-  SmallVector<const Instruction *, 16> poles;
-  for (auto *I : masked)
-    if (I->getOpcode() == Instruction::FDiv ||
-        I->getOpcode() == Instruction::FRem || isa<CallBase>(I))
-      poles.push_back(I);
-  while (!poles.empty()) {
-    auto *I = poles.pop_back_val();
-    if (!selectMasked.insert(I).second)
-      continue;
-    for (const User *U : I->users())
-      if (auto *UI = dyn_cast<Instruction>(U))
-        if (masked.count(UI) && !selectMasked.count(UI))
-          poles.push_back(UI);
   }
 }

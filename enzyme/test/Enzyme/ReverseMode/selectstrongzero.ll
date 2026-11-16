@@ -23,8 +23,8 @@ entry:
   ret double %r
 }
 
-; A select-masked product of finite values (a ReLU) has no pole, so it keeps
-; its plain rule too.
+; A masked product needs the check too: inputs may be nonfinite, even
+; without any preceding division or call.
 define double @relu(double %x, double %w) {
 entry:
   %h = fmul double %w, %x
@@ -60,9 +60,18 @@ declare double @__enzyme_autodiff(...)
 ; CHECK: ret { double }
 
 ; CHECK-LABEL: define internal { double, double } @differelu(double %x, double %w, double %differeturn)
-; CHECK-NOT: oeq
+; CHECK: fmul
+; CHECK: fcmp{{( fast)?}} oeq
+; CHECK: select
+; CHECK: fmul
+; CHECK: fcmp{{( fast)?}} oeq
+; CHECK: select
 ; CHECK: ret { double, double }
 
 ; OFF-LABEL: define internal { double } @diffeguarded(double %x, double %differeturn)
 ; OFF-NOT: oeq
 ; OFF: ret { double }
+
+; OFF-LABEL: define internal { double, double } @differelu(double %x, double %w, double %differeturn)
+; OFF-NOT: oeq
+; OFF: ret { double, double }

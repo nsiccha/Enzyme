@@ -68,8 +68,12 @@ declare double @__enzyme_autodiff(...)
 ; CHECK-NEXT:   %p_unwrap = getelementptr inbounds {{(nuw )?}}double, ptr %x, i64 %"iv'ac.0"
 ; CHECK-NEXT:   %xi_unwrap = load double, ptr %p_unwrap, align 8{{.*}}
 ; CHECK-NEXT:   %[[m1:.+]] = fmul fast double %[[dsqt]], %xi_unwrap
+; CHECK-NEXT:   %[[z1:.+]] = fcmp fast oeq double %[[dsqt]], 0.000000e+00
+; CHECK-NEXT:   %[[c1:.+]] = select fast i1 %[[z1]], double 0.000000e+00, double %[[m1]]
 ; CHECK-NEXT:   %[[m2:.+]] = fmul fast double %[[dsqt]], %xi_unwrap
-; CHECK-NEXT:   %[[dxi:.+]] = fadd fast double %[[m1]], %[[m2]]
+; CHECK-NEXT:   %[[z2:.+]] = fcmp fast oeq double %[[dsqt]], 0.000000e+00
+; CHECK-NEXT:   %[[sum:.+]] = fadd fast double %[[c1]], %[[m2]]
+; CHECK-NEXT:   %[[dxi:.+]] = select fast i1 %[[z2]], double %[[c1]], double %[[sum]]
 ; CHECK-NEXT:   %"p'ipg_unwrap" = getelementptr inbounds {{(nuw )?}}double, ptr %"x'", i64 %"iv'ac.0"
 ; CHECK-NEXT:   %[[old:.+]] = load double, ptr %"p'ipg_unwrap", align 8{{.*}}
 ; CHECK-NEXT:   %[[new:.+]] = fadd fast double %[[old]], %[[dxi]]
