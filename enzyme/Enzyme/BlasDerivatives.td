@@ -184,6 +184,20 @@ class DiagUpdateSPMV<string _tmp> {
   string unused = _tmp;
 }
 
+// (ScaleOrZero<""> (BlasCall<"scal"> $n, $scale, (Shadow $x)))
+// (ScaleOrZero<""> (BlasCall<"lascl"> ..., Constant<"1.0">, $scale, $m, $n, (Shadow $A), ...))
+//
+// Scales the shadow as the wrapped call would, except that a zero scale
+// overwrites it with zero instead of multiplying by zero.
+// A routine that computes `out := ... + beta * out` does not read `out` when
+// beta is zero (and a copy never reads its destination), so the derivative
+// with respect to what `out` held before is exactly zero there. A product
+// keeps a NaN or an infinity (0 * NaN is NaN), which then stays in a shadow
+// that outlives the call.
+class ScaleOrZero<string _tmp=""> {
+  string unused = _tmp;
+}
+
 // General note: If return is scalar, return it. If return is vec, update it.
 
 // x *= alpha
@@ -207,7 +221,7 @@ def lacpy : CallBlasPattern<(Op $layout, $uplo, $m, $n, $A, $lda, $B, $ldb),
                   ["B"],[cblas_layout, uplo, len, len, mld<["m", "n"]>, mld<["m", "n"]>],
                   [
                   (MemcpyMatAdd<true> $layout, $uplo, $m, $n, (Shadow $A), (Shadow $B)),
-                  (BlasCall<"lascl"> $layout, $uplo, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, Constant<"0.0">, $m, $n, (Shadow $B), Alloca<1>),
+                  (ScaleOrZero<""> (BlasCall<"lascl"> $layout, $uplo, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, Constant<"0.0">, $m, $n, (Shadow $B), Alloca<1>)),
                   ],
                   (Seq<[], [], 1>
                     (BlasCall<"lacpy"> $layout, $uplo, $m, $n, (Shadow $A), (Shadow $B))
@@ -266,15 +280,22 @@ def nrm2 : CallBlasPattern<(Op $n, $x, $incx),
                   >;
 
 
+// y = x
+// in reverse mode this becomes
+// dx += dy
+// dy  = 0
+// The second line holds whether or not x is active: y is overwritten, so
+// nothing computed before the copy depends on what the adjoint of y holds.
 def copy : CallBlasPattern<(Op $n, $x, $incx, $y, $incy),
                   ["y"],[len, vinc<["n"]>, vinc<["n"]>],
                   [
-                  (InactiveArg),// copy moves x into y, so x is never modified.
-                  (BlasCall<"axpy"> $n, Constant<"1.0">, (Shadow $y), (Shadow $x))
+                  /* x */ (BlasCall<"axpy"> $n, Constant<"1.0">, (Shadow $y), (Shadow $x)),
+                  /* y */ (ScaleOrZero<""> (BlasCall<"scal"> $n, Constant<"0.0">, (Shadow $y)))
                   ],
+                  // FWD: dy = dx, which is zero when x is inactive
                   (Seq<[], ["beta1"], 1>
                     (BlasCall<"copy"> (FirstUse<"beta1"> $n, $n), (Shadow $x), (Shadow $y)),
-                    (FirstUse<"beta1"> (BlasCall<"scal"> $n, Constant<"0">, (Shadow $y)))
+                    (FirstUse<"beta1"> (ScaleOrZero<""> (BlasCall<"scal"> $n, Constant<"0.0">, (Shadow $y))))
                   )
                   >;
 
@@ -311,7 +332,8 @@ def gemv : CallBlasPattern<(Op $layout, $transa, $m, $n, $alpha, $A, $lda, $x, $
                   /* A      */  (BlasCall<"ger">  $layout, $m, $n, $alpha, (Rows $transa, (Concat (Shadow $y), $x), (Concat $x, (Shadow $y))), (Shadow $A)),
                   /* x      */  (BlasCall<"gemv"> $layout, transpose<"transa">, $m, $n, $alpha, $A, (ld $A, Char<"N">, $lda, $m, $m), (Shadow $y), Constant<"1.0">, (Shadow $x)),
                   /* beta   */  (BlasCall<"dot"> (Rows $transa, $m, $n), (Shadow $y), input<"y">),
-                  /* y      */  (BlasCall<"scal"> (Rows $transa, $m, $n), $beta, (Shadow $y))
+                  // beta dy, with BLAS semantics: beta == 0 overwrites dy instead of scaling it
+                  /* y      */  (ScaleOrZero<""> (BlasCall<"scal"> (Rows $transa, $m, $n), $beta, (Shadow $y)))
                   ],
                   (Seq<[], ["beta1"], 1>
                     (BlasCall<"axpy"> (Rows $transa, $m, $n), (Shadow $beta), $y, (Shadow $y)),
@@ -387,7 +409,7 @@ def gemm : CallBlasPattern<(Op $layout, $transa, $transb, $m, $n, $k, $alpha, $A
                                                     (Concat (Shadow $C), $A, (ld $A, $transa, $lda, $k, $m))),
                                                   Constant<"1.0">, (Shadow $B)),
                   /* beta  */ (FrobInnerProd<""> $m, $n, (Shadow $C), input<"C">),
-                  /* C     */ (BlasCall<"lascl"> $layout, Char<"G">, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, $beta, $m, $n, (Shadow $C), Alloca<1>)
+                  /* C     */ (ScaleOrZero<""> (BlasCall<"lascl"> $layout, Char<"G">, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, $beta, $m, $n, (Shadow $C), Alloca<1>))
                   ],
                   // FWD: dC = dalpha A B + alpha dA B + alpha A dB + dbeta C + beta dC 
                   (Seq<[], ["beta1"], 1>
@@ -485,7 +507,7 @@ def symm: CallBlasPattern<(Op $layout, $side, $uplo, $m, $n, $alpha, $A, $lda, $
                         ),
                         /*B*/ (BlasCall<"symm"> $layout, $side, $uplo, $m, $n, $alpha, $A, (ld $A, (side_to_trans $side), $lda, $n, $m), (Shadow $C), Constant<"1">, (Shadow $B)),
                         /*beta*/ (AssertingInactiveArg),
-                        /*C*/ (BlasCall<"lascl"> $layout, Char<"G">, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, $beta, $m, $n, (Shadow $C), Alloca<1>)
+                        /*C*/ (ScaleOrZero<""> (BlasCall<"lascl"> $layout, Char<"G">, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, $beta, $m, $n, (Shadow $C), Alloca<1>))
                    ],
                   // FWD: dC = dalpha A B + alpha dA B + alpha A dB + dbeta C + beta dC 
                   (Seq<[], ["beta1"], 1>
@@ -537,7 +559,7 @@ def symv: CallBlasPattern<(Op $layout, $uplo, $n, $alpha, $A, $lda, $x, $incx, $
                         ),
                         /*x*/ (BlasCall<"symv"> $layout, $uplo, $n, $alpha, $A, (ld $A, Char<"N">, $lda, $n, $n), (Shadow $y), Constant<"1.0">, (Shadow $x)),
                         /*beta*/ (BlasCall<"dot"> $n, (Shadow $y), input<"y">),
-                        /*y*/ (BlasCall<"scal"> $n, $beta, (Shadow $y))
+                        /*y*/ (ScaleOrZero<""> (BlasCall<"scal"> $n, $beta, (Shadow $y)))
                    ],
                   // FWD: dy = dalpha A x + alpha dA x + alpha A dx + dbeta y + beta dy
 
@@ -618,7 +640,7 @@ def syrk : CallBlasPattern<(Op $layout, $uplo, $trans, $n, $k, $alpha, $A, $lda,
                     )
                   ),
                   /* beta  */ (AssertingInactiveArg),
-                  /* C     */ (BlasCall<"lascl"> $layout, $uplo, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, $beta, $n, $n, (Shadow $C), Alloca<1>)
+                  /* C     */ (ScaleOrZero<""> (BlasCall<"lascl"> $layout, $uplo, ConstantInt<0>, ConstantInt<0>, Constant<"1.0">, $beta, $n, $n, (Shadow $C), Alloca<1>))
                   ],
                   (Seq<[], ["beta1"], 1>
                     (BlasCall<"axpy"> (AssertingInactiveArg), (Shadow $beta), $C, (Shadow $C)),
@@ -641,7 +663,7 @@ def spmv : CallBlasPattern<(Op $layout, $uplo, $n, $alpha, $ap, $x, $incx, $beta
                     (DiagUpdateSPMV<""> $uplo, $n, $alpha, $x, (Shadow $y), (Shadow $ap))),
                   /* x     */ (BlasCall<"spmv"> $layout, $uplo, $n, $alpha, $ap, (Shadow $y), Constant<"1.0">, (Shadow $x)),
                   /* beta  */ (BlasCall<"dot"> $n, (Shadow $y), input<"y">),
-                  /* y     */ (BlasCall<"scal"> $n, $beta, (Shadow $y))
+                  /* y     */ (ScaleOrZero<""> (BlasCall<"scal"> $n, $beta, (Shadow $y)))
                   ]
                   >;
 

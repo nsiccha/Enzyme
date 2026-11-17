@@ -201,13 +201,12 @@ entry:
 ; CHECK-NEXT:   call void @cblas_dger(i32 101, i32 %N, i32 %N, double 1.000000e-03, double* %[[r39]], i32 1, double* %[[r40]], i32 1, double* %"K'", i32 %N)
 ; CHECK-NEXT:   call void @cblas_dgemv(i32 101, i32 112, i32 %N, i32 %N, double 1.000000e-03, double* %K, i32 %N, double* %"v0'", i32 1, double 1.000000e+00, double* %"x0'", i32 1)
 ; CHECK-NEXT:   %[[i47:.+]] = select i1 true, i32 %N, i32 %N
-; CHECK-NEXT:   call void @cblas_dscal(i32 %[[i47]], double 1.000000e+00, double* %"v0'", i32 1)
 ; CHECK-DAG:   %[[r42:.+]] = select i1 true, double* %"v0'", double* %cache.x
 ; CHECK-DAG:   %[[r43:.+]] = select i1 true, double* %cache.x, double* %"v0'"
 ; CHECK-NEXT:   call void @cblas_dger(i32 101, i32 %N, i32 %N, double 1.000000e-03, double* %[[r42]], i32 1, double* %[[r43]], i32 1, double* %"K'", i32 %N)
 ; CHECK-NEXT:   call void @cblas_dgemv(i32 101, i32 112, i32 %N, i32 %N, double 1.000000e-03, double* %cache.A, i32 %N, double* %"v0'", i32 1, double 1.000000e+00, double* %"x0'", i32 1)
 ; CHECK-NEXT:   %[[i49:.+]] = select i1 true, i32 %N, i32 %N
-; CHECK-NEXT:   call void @cblas_dscal(i32 %[[i49]], double 1.000000e+00, double* %"v0'", i32 1)
+; CHECK-NEXT:   %[[soz1:.+]] = icmp sle i32 %[[i49]], 0
 ; CHECK-NEXT:   %[[i50:.+]] = bitcast double* %cache.A to i8*
 ; CHECK-NEXT:   tail call void @free(i8* nonnull %[[i50]])
 ; CHECK-NEXT:   %[[i51:.+]] = bitcast double* %cache.x to i8*
@@ -217,7 +216,7 @@ entry:
 ; CHECK-NEXT:   call void @cblas_dger(i32 101, i32 %N, i32 %N, double 1.000000e-03, double* %[[r48]], i32 1, double* %[[r49]], i32 1, double* %"K'", i32 %N)
 ; CHECK-NEXT:   call void @cblas_dgemv(i32 101, i32 112, i32 %N, i32 %N, double 1.000000e-03, double* %cache.A5, i32 %N, double* %"v0'", i32 1, double 1.000000e+00, double* %"x0'", i32 1)
 ; CHECK-NEXT:   %[[i53:.+]] = select i1 true, i32 %N, i32 %N
-; CHECK-NEXT:   call void @cblas_dscal(i32 %[[i53]], double 1.000000e+00, double* %"v0'", i32 1)
+; CHECK-NEXT:   %[[soz2:.+]] = icmp sle i32 %[[i53]], 0
 ; CHECK-NEXT:   %[[i54:.+]] = bitcast double* %cache.A5 to i8*
 ; CHECK-NEXT:   tail call void @free(i8* nonnull %[[i54]])
 ; CHECK-NEXT:   %[[i55:.+]] = bitcast double* %cache.x8 to i8*
@@ -227,7 +226,7 @@ entry:
 ; CHECK-NEXT:   call void @cblas_dger(i32 101, i32 %N, i32 %N, double 1.000000e-03, double* %[[r54]], i32 1, double* %[[r55]], i32 1, double* %"K'", i32 %N)
 ; CHECK-NEXT:   call void @cblas_dgemv(i32 101, i32 112, i32 %N, i32 %N, double 1.000000e-03, double* %cache.A13, i32 %N, double* %"v0'", i32 1, double 1.000000e+00, double* %"x0'", i32 1)
 ; CHECK-NEXT:   %[[i57:.+]] = select i1 true, i32 %N, i32 %N
-; CHECK-NEXT:   call void @cblas_dscal(i32 %[[i57]], double 1.000000e+00, double* %"v0'", i32 1)
+; CHECK-NEXT:   %[[soz3:.+]] = icmp sle i32 %[[i57]], 0
 ; CHECK-NEXT:   %[[i58:.+]] = bitcast double* %cache.A13 to i8*
 ; CHECK-NEXT:   tail call void @free(i8* nonnull %[[i58]])
 ; CHECK-NEXT:   %[[i59:.+]] = bitcast double* %cache.x16 to i8*
@@ -237,7 +236,7 @@ entry:
 ; CHECK-NEXT:   call void @cblas_dger(i32 101, i32 %N, i32 %N, double 1.000000e-03, double* %[[r60]], i32 1, double* %[[r61]], i32 1, double* %"K'", i32 %N)
 ; CHECK-NEXT:   call void @cblas_dgemv(i32 101, i32 112, i32 %N, i32 %N, double 1.000000e-03, double* %cache.A21, i32 %N, double* %"v0'", i32 1, double 1.000000e+00, double* %"x0'", i32 1)
 ; CHECK-NEXT:   %[[i61:.+]] = select i1 true, i32 %N, i32 %N
-; CHECK-NEXT:   call void @cblas_dscal(i32 %[[i61]], double 1.000000e+00, double* %"v0'", i32 1)
+; CHECK-NEXT:   %[[soz4:.+]] = icmp sle i32 %[[i61]], 0
 ; CHECK-NEXT:   %[[i62:.+]] = bitcast double* %cache.A21 to i8*
 ; CHECK-NEXT:   tail call void @free(i8* nonnull %[[i62]])
 ; CHECK-NEXT:   %[[i63:.+]] = bitcast double* %cache.x24 to i8*

@@ -938,6 +938,27 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
                      const llvm::ArrayRef<llvm::OperandBundleDef> bundles,
                      bool byRef, bool cublas, bool julia_decl);
 
+/// Scale, in place, the adjoint or tangent of an output that a BLAS routine
+/// wrote as `out := ... + scale * out`, following BLAS's own semantics for the
+/// scale: when it is zero the routine never read the output, so the entries are
+/// overwritten with zero and not multiplied by it (0 * NaN and 0 * Inf are
+/// NaN). The entries are those of an m x n matrix with leading dimension ld,
+/// restricted to the triangle `uplo` names if it names one. A vector with
+/// increment inc is the 1 x n matrix with leading dimension |inc|: pass
+/// `uplo == nullptr`, `m == nullptr` and `absLd == true`.
+///
+/// Every value is in the calling convention of the BLAS routine being
+/// differentiated (`byRef`, `cblas` with its `layout`), except `scale`, which
+/// `scaleByRef` describes, and `out`, which may also be an integer holding the
+/// address.
+void callScaleOrZero(llvm::IRBuilder<> &B, llvm::Module &M,
+                     llvm::IntegerType *IT, llvm::Type *fpTy,
+                     llvm::Value *layout, llvm::Value *uplo, llvm::Value *m,
+                     llvm::Value *n, llvm::Value *scale, llvm::Value *out,
+                     llvm::Value *ld, bool absLd,
+                     llvm::ArrayRef<llvm::OperandBundleDef> bundles, bool byRef,
+                     bool scaleByRef, bool cblas);
+
 /// Create function for type that performs memcpy with a stride
 llvm::Function *getOrInsertMemcpyStrided(llvm::Module &M,
                                          llvm::Type *elementType,

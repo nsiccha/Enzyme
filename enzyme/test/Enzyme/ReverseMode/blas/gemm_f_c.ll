@@ -55,11 +55,6 @@ entry:
 ; CHECK-NEXT:   %byref.constant.fp.1.0 = alloca double, align 8
 ; CHECK-NEXT:   %byref.transpose.transa = alloca i8
 ; CHECK-NEXT:   %[[byref_fp_1_013:.+]] = alloca double, align 8
-; CHECK-NEXT:   %byref.constant.char.G = alloca i8, align 1
-; CHECK-NEXT:   %byref.constant.int.0 = alloca i64, align 8
-; CHECK-NEXT:   %[[byrefconstantint4:.+]] = alloca i64, align 8
-; CHECK-NEXT:   %[[byref_fp_1_017:.+]] = alloca double, align 8
-; CHECK-NEXT:   %[[tmp:.+]] = alloca i64
 ; CHECK-NEXT:   %transa = alloca i8, align 1
 ; CHECK-NEXT:   %transb = alloca i8, align 1
 ; CHECK-NEXT:   %m = alloca i64, align 16
@@ -273,12 +268,66 @@ entry:
 ; CHECK-NEXT:   store double 1.000000e+00, double* %[[byref_fp_1_013]], align 8
 ; CHECK-NEXT:   %[[fpcast_1_014:.+]] = bitcast double* %[[byref_fp_1_013]] to i8*
 ; CHECK-NEXT:   call void @dgemm_64_(i8* %[[r83]], i8* %[[r84]], i8* %[[r85]], i8* %[[r86]], i8* %m_p, i8* %alpha_p, i8* %[[r98]], i8* %[[r99]], i8* %[[r100]], i8* %[[r101]], i8* %[[fpcast_1_014]], i8* %"B'", i8* %ldb_p, i64 1, i64 1)
-; CHECK-NEXT:   store i8 71, i8* %byref.constant.char.G
-; CHECK-NEXT:   store i64 0, i64* %byref.constant.int.0
-; CHECK-NEXT:   store i64 0, i64* %[[byrefconstantint4]]
-; CHECK-NEXT:   store double 1.000000e+00, double* %[[byref_fp_1_017]]
-; CHECK-NEXT:   %[[fpcast_1_018:.+]] = bitcast double* %[[byref_fp_1_017]] to i8*
-; CHECK-NEXT:   call void @dlascl_64_(i8* %byref.constant.char.G, i64* %byref.constant.int.0, i64* %[[byrefconstantint4]], i8* %[[fpcast_1_018]], i8* %beta_p, i8* %m_p, i8* %n_p, i8* %"C'", i8* %ldc_p, i64* %[[tmp]], i64 1)
+; CHECK-NEXT:   %[[soz1:.+]] = bitcast i8* %n_p to i64*
+; CHECK-NEXT:   %[[soz2:.+]] = load i64, i64* %[[soz1]], align 4
+; CHECK-NEXT:   %[[soz3:.+]] = bitcast i8* %m_p to i64*
+; CHECK-NEXT:   %[[soz4:.+]] = load i64, i64* %[[soz3]], align 4
+; CHECK-NEXT:   %[[soz5:.+]] = bitcast i8* %ldc_p to i64*
+; CHECK-NEXT:   %[[soz6:.+]] = load i64, i64* %[[soz5]], align 4
+; CHECK-NEXT:   %[[soz7:.+]] = bitcast i8* %beta_p to double*
+; CHECK-NEXT:   %[[soz8:.+]] = load double, double* %[[soz7]], align 8
+; CHECK-NEXT:   %[[soz9:.+]] = bitcast i8* %"C'" to double*
+; CHECK-NEXT:   %identity.i = fcmp oeq double %[[soz8]], 1.000000e+00
+; CHECK-NEXT:   %[[soz10:.+]] = icmp sle i64 %[[soz2]], 0
+; CHECK-NEXT:   %[[soz11:.+]] = icmp sle i64 %[[soz4]], 0
+; CHECK-NEXT:   %[[soz12:.+]] = or i1 %[[soz11]], %[[soz10]]
+; CHECK-NEXT:   %[[soz13:.+]] = or i1 %[[soz12]], %identity.i
+; CHECK-NEXT:   br i1 %[[soz13]], label %__enzyme_scale_or_zero_double_64.exit, label %init.i
+; CHECK: init.i:                                           ; preds = %invertentry
+; CHECK-NEXT:   %overwrite.i = fcmp oeq double %[[soz8]], 0.000000e+00
+; CHECK-NEXT:   %[[soz24:.+]] = icmp eq i64 %[[soz6]], %[[soz4]]
+; CHECK-NEXT:   br i1 %[[soz24]], label %flat.i, label %col.i
+; CHECK: flat.i:                                           ; preds = %init.i
+; CHECK-NEXT:   %total.i = mul nuw nsw i64 %[[soz4]], %[[soz2]]
+; CHECK-NEXT:   br i1 %overwrite.i, label %flat.zero.i, label %flat.scale.i
+; CHECK: flat.zero.i:                                      ; preds = %flat.i
+; CHECK-NEXT:   %[[soz25:.+]] = mul nuw nsw i64 %total.i, 8
+; CHECK-NEXT:   call void @llvm.memset.p0i8.i64(i8* %"C'", i8 0, i64 %[[soz25]], i1 false)
+; CHECK-NEXT:   br label %__enzyme_scale_or_zero_double_64.exit
+; CHECK: flat.scale.i:                                     ; preds = %flat.scale.i, %flat.i
+; CHECK-NEXT:   %k.i = phi i64 [ 0, %flat.i ], [ %k.next.i, %flat.scale.i ]
+; CHECK-NEXT:   %out.k.i = getelementptr inbounds double, double* %[[soz9]], i64 %k.i
+; CHECK-NEXT:   %[[soz26:.+]] = load double, double* %out.k.i, align 8
+; CHECK-NEXT:   %scaled.k.i = fmul double %[[soz8]], %[[soz26]]
+; CHECK-NEXT:   store double %scaled.k.i, double* %out.k.i, align 8
+; CHECK-NEXT:   %k.next.i = add nuw nsw i64 %k.i, 1
+; CHECK-NEXT:   %[[soz27:.+]] = icmp eq i64 %k.next.i, %total.i
+; CHECK-NEXT:   br i1 %[[soz27]], label %__enzyme_scale_or_zero_double_64.exit, label %flat.scale.i
+; CHECK: col.i:                                            ; preds = %col.end.i, %init.i
+; CHECK-NEXT:   %j.i24 = phi i64 [ 0, %init.i ], [ %j.next.i25, %col.end.i ]
+; CHECK-NEXT:   %j.next.i25 = add nuw nsw i64 %j.i24, 1
+; CHECK-NEXT:   %[[soz14:.+]] = icmp slt i64 %j.next.i25, %[[soz4]]
+; CHECK-NEXT:   %[[soz15:.+]] = select i1 %[[soz14]], i64 %j.next.i25, i64 %[[soz4]]
+; CHECK-NEXT:   %[[soz16:.+]] = icmp slt i64 %j.i24, %[[soz4]]
+; CHECK-NEXT:   %[[soz17:.+]] = select i1 %[[soz16]], i64 %j.i24, i64 %[[soz4]]
+; CHECK-NEXT:   %col.offset.i = mul nuw nsw i64 %j.i24, %[[soz6]]
+; CHECK-NEXT:   %[[soz18:.+]] = icmp slt i64 0, %[[soz4]]
+; CHECK-NEXT:   br i1 %[[soz18]], label %row.i, label %col.end.i
+; CHECK: row.i:                                            ; preds = %row.i, %col.i
+; CHECK-NEXT:   %i.i26 = phi i64 [ 0, %col.i ], [ %i.next.i27, %row.i ]
+; CHECK-NEXT:   %[[soz19:.+]] = add nuw nsw i64 %i.i26, %col.offset.i
+; CHECK-NEXT:   %out.i.i = getelementptr inbounds double, double* %[[soz9]], i64 %[[soz19]]
+; CHECK-NEXT:   %[[soz20:.+]] = load double, double* %out.i.i, align 8
+; CHECK-NEXT:   %scaled.i = fmul double %[[soz8]], %[[soz20]]
+; CHECK-NEXT:   %[[soz21:.+]] = select i1 %overwrite.i, double 0.000000e+00, double %scaled.i
+; CHECK-NEXT:   store double %[[soz21]], double* %out.i.i, align 8
+; CHECK-NEXT:   %i.next.i27 = add nuw nsw i64 %i.i26, 1
+; CHECK-NEXT:   %[[soz22:.+]] = icmp eq i64 %i.next.i27, %[[soz4]]
+; CHECK-NEXT:   br i1 %[[soz22]], label %col.end.i, label %row.i
+; CHECK: col.end.i:                                        ; preds = %row.i, %col.i
+; CHECK-NEXT:   %[[soz23:.+]] = icmp eq i64 %j.next.i25, %[[soz2]]
+; CHECK-NEXT:   br i1 %[[soz23]], label %__enzyme_scale_or_zero_double_64.exit, label %col.i
+; CHECK: __enzyme_scale_or_zero_double_64.exit:            ; preds = %invertentry, %flat.zero.i, %flat.scale.i, %col.end.i
 ; CHECK-NEXT:   %[[ret1:.+]] = bitcast double* %cache.A to i8*
 ; CHECK-NEXT:   tail call void @free(i8* nonnull %[[ret1]])
 ; CHECK-NEXT:   %[[ret2:.+]] = bitcast double* %cache.B to i8*

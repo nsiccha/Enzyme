@@ -1820,6 +1820,209 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
   return res;
 }
 
+// A BLAS routine that computes `out := ... + scale * out` does not read `out`
+// when `scale` is zero: it overwrites it. The adjoint of what `out` held before
+// the call (and, in forward mode, the tangent's contribution from it) is then
+// exactly zero, whatever the adjoint of the result holds. Multiplying by the
+// scale, as `scal` and `lascl` do, keeps a NaN or an infinity there, since
+// 0 * NaN and 0 * Inf are NaN, and a shadow that is used again (a second
+// reverse pass over the same shadow memory, a later write to the same output)
+// then carries that NaN into every later derivative. So this writes
+// `out[i, j] = scale == 0 ? 0 : scale * out[i, j]`, without the fast-math flags
+// that would let the select be folded into the product, and leaves `out` alone
+// when the scale is one. An output that is one block of values, a vector with
+// increment one or a full matrix without padding between its columns, is
+// cleared with a memset or scaled in a single loop.
+void callScaleOrZero(IRBuilder<> &B, Module &M, IntegerType *IT, Type *fpTy,
+                     Value *layout, Value *uplo, Value *m, Value *n,
+                     Value *scale, Value *out, Value *ld, bool absLd,
+                     ArrayRef<OperandBundleDef> bundles, bool byRef,
+                     bool scaleByRef, bool cblas) {
+  assert(fpTy->isFloatingPointTy());
+  auto &Ctx = M.getContext();
+  IntegerType *CT = IntegerType::get(Ctx, 8);
+
+  // Take the arguments out of the BLAS calling convention.
+  Value *nV = load_if_ref(B, IT, n, byRef);
+  Value *mV = m ? load_if_ref(B, IT, m, byRef) : ConstantInt::get(IT, 1);
+  Value *ldV = load_if_ref(B, IT, ld, byRef);
+  Value *scaleV = load_if_ref(B, fpTy, scale, scaleByRef);
+  if (absLd) {
+    // The elements of a vector with a negative increment lie at the same
+    // addresses as with its absolute value.
+    ldV = B.CreateSelect(B.CreateICmpSLT(ldV, ConstantInt::get(IT, 0)),
+                         B.CreateNeg(ldV), ldV);
+  }
+
+  // Row-major storage of a matrix is column-major storage of its transpose.
+  Value *isRow = nullptr;
+  if (cblas && layout) {
+    isRow = B.CreateICmpEQ(
+        layout, ConstantInt::get(layout->getType(), /*CblasRowMajor*/ 101));
+    Value *rows = B.CreateSelect(isRow, nV, mV);
+    nV = B.CreateSelect(isRow, mV, nV);
+    mV = rows;
+  }
+
+  // 'U' and 'L' name a triangle (with its diagonal); anything else is the full
+  // matrix, as for lacpy and lascl.
+  Value *uploV = ConstantInt::get(CT, 'G');
+  if (uplo) {
+    Value *u = load_if_ref(B, CT, uplo, byRef);
+    auto names = [&](char upper, char lower, unsigned cblasEnum) {
+      Value *res =
+          B.CreateOr(B.CreateICmpEQ(u, ConstantInt::get(u->getType(), upper)),
+                     B.CreateICmpEQ(u, ConstantInt::get(u->getType(), lower)));
+      // Under the CBLAS ABI the triangle is an enum, CblasUpper or CblasLower.
+      if (!byRef)
+        res = B.CreateOr(
+            res, B.CreateICmpEQ(u, ConstantInt::get(u->getType(), cblasEnum)));
+      return res;
+    };
+    Value *isU = names('U', 'u', 121);
+    Value *isL = names('L', 'l', 122);
+    if (isRow) {
+      Value *upper = B.CreateSelect(isRow, isL, isU);
+      isL = B.CreateSelect(isRow, isU, isL);
+      isU = upper;
+    }
+    uploV = B.CreateSelect(isU, ConstantInt::get(CT, 'U'),
+                           B.CreateSelect(isL, ConstantInt::get(CT, 'L'),
+                                          ConstantInt::get(CT, 'G')));
+  }
+
+  unsigned AS = 0;
+  if (auto OPT = dyn_cast<PointerType>(out->getType()))
+    AS = OPT->getAddressSpace();
+  PointerType *PT = getPointerType(fpTy, AS);
+  Value *outV = out->getType()->isIntegerTy() ? B.CreateIntToPtr(out, PT)
+                                              : B.CreatePointerCast(out, PT);
+
+  std::string name = "__enzyme_scale_or_zero_" + tofltstr(fpTy) + "_" +
+                     std::to_string(IT->getBitWidth());
+  if (AS != 0)
+    name += "_as" + std::to_string(AS);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx),
+                                       {CT, IT, IT, fpTy, PT, IT}, false);
+  Function *F = cast<Function>(M.getOrInsertFunction(name, FT).getCallee());
+
+  if (F->empty()) {
+    F->setLinkage(Function::LinkageTypes::InternalLinkage);
+#if LLVM_VERSION_MAJOR >= 16
+    F->setOnlyAccessesArgMemory();
+#else
+    F->addFnAttr(Attribute::ArgMemOnly);
+#endif
+    F->addFnAttr(Attribute::NoUnwind);
+    F->addFnAttr(Attribute::AlwaysInline);
+    addFunctionNoCapture(F, 4);
+
+    auto fuplo = F->arg_begin();
+    fuplo->setName("uplo");
+    auto fm = fuplo + 1;
+    fm->setName("m");
+    auto fn = fm + 1;
+    fn->setName("n");
+    auto fscale = fn + 1;
+    fscale->setName("scale");
+    auto fout = fscale + 1;
+    fout->setName("out");
+    auto fld = fout + 1;
+    fld->setName("ld");
+
+    BasicBlock *entry = BasicBlock::Create(Ctx, "entry", F);
+    BasicBlock *init = BasicBlock::Create(Ctx, "init", F);
+    BasicBlock *flat = BasicBlock::Create(Ctx, "flat", F);
+    BasicBlock *flatzero = BasicBlock::Create(Ctx, "flat.zero", F);
+    BasicBlock *flatscale = BasicBlock::Create(Ctx, "flat.scale", F);
+    BasicBlock *col = BasicBlock::Create(Ctx, "col", F);
+    BasicBlock *row = BasicBlock::Create(Ctx, "row", F);
+    BasicBlock *colend = BasicBlock::Create(Ctx, "col.end", F);
+    BasicBlock *end = BasicBlock::Create(Ctx, "end", F);
+
+    Value *zero = ConstantInt::get(IT, 0);
+    Value *one = ConstantInt::get(IT, 1);
+
+    // Nothing to do for an empty output, nor for a scale of one, which BLAS
+    // does not apply either.
+    IRBuilder<> B1(entry);
+    B1.CreateCondBr(
+        B1.CreateOr(
+            B1.CreateOr(B1.CreateICmpSLE(fm, zero), B1.CreateICmpSLE(fn, zero)),
+            B1.CreateFCmpOEQ(fscale, ConstantFP::get(fpTy, 1.0), "identity")),
+        end, init);
+
+    IRBuilder<> B2(init);
+    Value *overwrite =
+        B2.CreateFCmpOEQ(fscale, ConstantFP::get(fpTy, 0.0), "overwrite");
+    Value *upper = B2.CreateICmpEQ(fuplo, ConstantInt::get(CT, 'U'), "upper");
+    Value *lower = B2.CreateICmpEQ(fuplo, ConstantInt::get(CT, 'L'), "lower");
+    // Without a triangle and without padding between the columns the output
+    // is one block of m * n values.
+    Value *contiguous = B2.CreateAnd(B2.CreateNot(B2.CreateOr(upper, lower)),
+                                     B2.CreateICmpEQ(fld, fm), "contiguous");
+    B2.CreateCondBr(contiguous, flat, col);
+
+    IRBuilder<> BF(flat);
+    Value *total = BF.CreateMul(fm, fn, "total", true, true);
+    BF.CreateCondBr(overwrite, flatzero, flatscale);
+
+    IRBuilder<> BZ(flatzero);
+    auto elSize = (M.getDataLayout().getTypeSizeInBits(fpTy) + 7) / 8;
+    BZ.CreateMemSet(
+        BZ.CreatePointerCast(fout, getPointerType(Type::getInt8Ty(Ctx), AS)),
+        BZ.getInt8(0),
+        BZ.CreateMul(total, ConstantInt::get(IT, elSize), "", true, true),
+        MaybeAlign());
+    BZ.CreateBr(end);
+
+    IRBuilder<> BS(flatscale);
+    PHINode *k = BS.CreatePHI(IT, 2, "k");
+    k->addIncoming(zero, flat);
+    Value *kptr = BS.CreateInBoundsGEP(fpTy, fout, k, "out.k");
+    BS.CreateStore(BS.CreateFMul(fscale, BS.CreateLoad(fpTy, kptr), "scaled.k"),
+                   kptr);
+    Value *knext = BS.CreateAdd(k, one, "k.next", true, true);
+    k->addIncoming(knext, flatscale);
+    BS.CreateCondBr(BS.CreateICmpEQ(knext, total), end, flatscale);
+
+    IRBuilder<> B3(col);
+    PHINode *j = B3.CreatePHI(IT, 2, "j");
+    j->addIncoming(zero, init);
+    Value *jnext = B3.CreateAdd(j, one, "j.next", true, true);
+    // Rows [first, last) of column j: all of them, those up to the diagonal
+    // for 'U', those from the diagonal on for 'L'.
+    Value *last = B3.CreateSelect(
+        upper, B3.CreateSelect(B3.CreateICmpSLT(jnext, fm), jnext, fm), fm,
+        "last");
+    Value *first = B3.CreateSelect(
+        lower, B3.CreateSelect(B3.CreateICmpSLT(j, fm), j, fm), zero, "first");
+    Value *offset = B3.CreateMul(j, fld, "col.offset", true, true);
+    B3.CreateCondBr(B3.CreateICmpSLT(first, last), row, colend);
+
+    IRBuilder<> B4(row);
+    PHINode *i = B4.CreatePHI(IT, 2, "i");
+    i->addIncoming(first, col);
+    Value *ptr = B4.CreateInBoundsGEP(
+        fpTy, fout, B4.CreateAdd(i, offset, "", true, true), "out.i");
+    Value *scaled = B4.CreateFMul(fscale, B4.CreateLoad(fpTy, ptr), "scaled");
+    B4.CreateStore(
+        B4.CreateSelect(overwrite, ConstantFP::get(fpTy, 0.0), scaled), ptr);
+    Value *inext = B4.CreateAdd(i, one, "i.next", true, true);
+    i->addIncoming(inext, row);
+    B4.CreateCondBr(B4.CreateICmpEQ(inext, last), colend, row);
+
+    IRBuilder<> B5(colend);
+    j->addIncoming(jnext, colend);
+    B5.CreateCondBr(B5.CreateICmpEQ(jnext, fn), end, col);
+
+    IRBuilder<> B6(end);
+    B6.CreateRetVoid();
+  }
+
+  B.CreateCall(F, {uploV, mV, nV, scaleV, outV, ldV}, bundles);
+}
+
 Function *getOrInsertMemcpyStrided(Module &M, Type *elementType, PointerType *T,
                                    Type *IT, unsigned dstalign,
                                    unsigned srcalign) {
