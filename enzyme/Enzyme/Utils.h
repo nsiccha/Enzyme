@@ -2363,6 +2363,22 @@ static inline llvm::Value *checkedMul(bool strongZero,
   }
   return res;
 }
+// checkedMul for a product written with the derivative as its second operand,
+// keeping that operand order in the emitted instruction.
+static inline llvm::Value *checkedMulRHS(bool strongZero,
+                                         llvm::IRBuilder<> &Builder2,
+                                         llvm::Value *pres, llvm::Value *idiff,
+                                         const llvm::Twine &Name = "") {
+  llvm::Value *res = Builder2.CreateFMul(pres, idiff, Name);
+  if (strongZero) {
+    llvm::Value *zero = llvm::Constant::getNullValue(idiff->getType());
+    if (auto C = llvm::dyn_cast<llvm::ConstantFP>(pres))
+      if (!C->isInfinity() && !C->isNaN())
+        return res;
+    res = Builder2.CreateSelect(Builder2.CreateFCmpOEQ(idiff, zero), zero, res);
+  }
+  return res;
+}
 static inline llvm::Value *checkedDiv(bool strongZero,
                                       llvm::IRBuilder<> &Builder2,
                                       llvm::Value *idiff, llvm::Value *pres,
