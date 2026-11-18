@@ -22,6 +22,7 @@ class StaticSelect<string condition_> : Operation</*primal*/0, /*shadow*/0, /*cu
 }
 
 def SelectIfActive : StaticSelect<"!gutils->isConstantValue(imVal)">;
+def SelectIfReassoc : StaticSelect<"getFast().allowReassoc()">;
 
 class Attribute<string name_> {
   string name = name_;
@@ -1327,19 +1328,23 @@ def : BinopPattern<(Op $x, $y), "FMul", 0, 0,
                     ],
                     (ForwardFromSummedReverse)
                   >;
-// The tangent of x / y is (dx - (dy / y) * x) / y. (dx * y - dy * x) / (y * y) would
-// form y * y, which underflows to zero for |y| < 1.5e-154 (and overflows for
-// |y| > 1.3e154), so a representable tangent came out Inf or NaN, and each nested
-// derivative through a division squared the divisor once more. dy / y is the relative
-// tangent of y, which stays in range however tiny or huge y is, and is exactly zero
-// when dy is, so unlike dy * (x / y) it stays right when the primal quotient overflows
-// or underflows.
+// Without reassociation, take the relative tangent dy/y before multiplying by
+// x. The primal quotient can overflow or underflow for a finite tangent.
+// When reassociation is allowed, use the upstream ordering that avoids a
+// squared denominator in optimized vector and forward-over-reverse code.
 def : BinopPattern<(Op $x, $y), "FDiv", 0, 0,
                     [
                       (CheckedDiv (DiffeRet), $y),
                       (FNeg (CheckedMul (CheckedDiv (DiffeRet), $y), (FDiv $x, $y)))
                     ],
-                    (CheckedDiv (FSub (SelectIfActive $x, (Shadow $x), (Zero $x)), (SelectIfActive $y, (CheckedMul (Shadow $y), (FDiv $x, $y)), (Zero $y))), $y)
+                    (CheckedDiv
+                      (FSub (SelectIfActive $x, (Shadow $x), (Zero $x)),
+                            (SelectIfActive $y,
+                              (SelectIfReassoc
+                                (CheckedMul (Shadow $y), (FDiv $x, $y)),
+                                (CheckedMul (CheckedDiv (Shadow $y), $y), $x)),
+                              (Zero $y))),
+                      $y)
                   >;
 
 def : BinopPattern<(Op $x, $y), "FRem", 0, 0,
