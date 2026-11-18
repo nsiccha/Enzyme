@@ -23,6 +23,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include "FunctionUtils.h"
+#include "DesulAtomics.h"
 
 #include "DiffeGradientUtils.h"
 #include "EnzymeLogic.h"
@@ -430,7 +431,7 @@ void RecursivelyReplaceAddressSpace(
           continue;
         }
       } else {
-        IRBuilder<> B(&(*P->getParent()->getFirstNonPHIOrDbgOrLifetime()));
+        IRBuilder<> B(getFirstNonPHIOrDbgOrLifetime(P->getParent()));
         auto nP = B.CreatePHI(rep->getType(), P->getNumOperands());
         for (size_t i = 0; i < NumOperands; i++) {
           nP->addIncoming(replacedOperands[i], P->getIncomingBlock(i));
@@ -511,10 +512,8 @@ void RecursivelyReplaceAddressSpace(
                 getPointerType(StructType::get(SI->getContext(), {}), 10);
             auto FT = FunctionType::get(Type::getVoidTy(rep->getContext()),
                                         {JLT}, true);
-            auto wb = B.GetInsertBlock()
-                          ->getParent()
-                          ->getParent()
-                          ->getOrInsertFunction("julia.write_barrier", FT);
+            auto wb = getJuliaObjectWriteBarrier(
+                *B.GetInsertBlock()->getParent()->getParent(), FT);
             auto obj = getBaseObject(rep);
             assert(obj->getType() == JLT);
             subvals.insert(subvals.begin(), obj);
@@ -566,12 +565,7 @@ void RecursivelyReplaceAddressSpace(
     }
     if (auto CI = dyn_cast<CallInst>(inst)) {
       if (auto F = CI->getCalledFunction()) {
-        if (F->getName() == "julia.write_barrier" && legal) {
-          assert(CI);
-          toErase.push_back(CI);
-          continue;
-        }
-        if (F->getName() == "julia.write_barrier_binding" && legal) {
+        if (isJuliaWriteBarrier(F->getName()) && legal) {
           assert(CI);
           toErase.push_back(CI);
           continue;
@@ -1389,6 +1383,88 @@ Function *CreateMPIWrapper(Function *F) {
   return W;
 }
 
+/// Lower calls to Desul's `host_atomic_fetch_oper` / `device_atomic_fetch_oper`
+/// with a linear `_add_fetch_operator` / `_sub_fetch_operator` on a scalar
+/// floating-point type to the equivalent `atomicrmw fadd` / `atomicrmw fsub`,
+/// whose derivative Enzyme already knows in every mode. Desul implements these
+/// as a compare-exchange loop (or, for types without a lock-free atomic, under
+/// an address lock), which Enzyme cannot differentiate as such; PreserveNVVM
+/// keeps the calls from being inlined before this point.
+///
+/// A call on a two-component floating-point aggregate (Kokkos::atomic_add /
+/// atomic_sub on complex<T>: the value passed as one <2 x T> vector or, for
+/// {double, double}, as two scalars) whose result is unused is lowered to one
+/// atomicrmw per component: the final contents of the destination are the
+/// same, only the old value returned by the call could differ (be torn
+/// between the components) under contention.
+static void LowerDesulAtomicFetchOper(Function &F) {
+  SmallVector<CallInst *, 4> ToLower;
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (auto *Callee = CI->getCalledFunction())
+          if (desul_atomics::classifyLinearFetchOper(Callee->getName()) !=
+              desul_atomics::LinearFetchOp::None)
+            ToLower.push_back(CI);
+
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  for (auto *CI : ToLower) {
+    // T fetch_oper(const Op &, T *dest, T val, MemoryOrder, MemoryScope)
+    Type *T = CI->getType();
+    if (CI->arg_size() < 3 || !CI->getArgOperand(1)->getType()->isPointerTy())
+      continue;
+    // The scalar components of the value and the type of each.
+    SmallVector<Value *, 2> Vals;
+    Type *ElemTy = T;
+    if (T->isFloatingPointTy() && CI->getArgOperand(2)->getType() == T) {
+      Vals.push_back(CI->getArgOperand(2));
+    } else if (CI->use_empty()) {
+      if (auto *VT = dyn_cast<FixedVectorType>(T)) {
+        if (VT->getNumElements() == 2 &&
+            VT->getElementType()->isFloatingPointTy() &&
+            CI->getArgOperand(2)->getType() == T) {
+          ElemTy = VT->getElementType();
+          IRBuilder<> B(CI);
+          for (unsigned c = 0; c < 2; ++c)
+            Vals.push_back(B.CreateExtractElement(CI->getArgOperand(2), c));
+        }
+      } else if (auto *ST = dyn_cast<StructType>(T)) {
+        if (ST->getNumElements() == 2 &&
+            ST->getElementType(0)->isFloatingPointTy() &&
+            ST->getElementType(0) == ST->getElementType(1) &&
+            CI->arg_size() >= 4 &&
+            CI->getArgOperand(2)->getType() == ST->getElementType(0) &&
+            CI->getArgOperand(3)->getType() == ST->getElementType(0)) {
+          ElemTy = ST->getElementType(0);
+          Vals = {CI->getArgOperand(2), CI->getArgOperand(3)};
+        }
+      }
+    }
+    if (Vals.empty())
+      continue;
+    StringRef Name = CI->getCalledFunction()->getName();
+    auto Op = desul_atomics::classifyLinearFetchOper(Name) ==
+                      desul_atomics::LinearFetchOp::Add
+                  ? AtomicRMWInst::FAdd
+                  : AtomicRMWInst::FSub;
+    IRBuilder<> B(CI);
+    for (unsigned c = 0; c < Vals.size(); ++c) {
+      Value *Dest = CI->getArgOperand(1);
+      if (c != 0)
+        Dest = B.CreateConstInBoundsGEP1_64(ElemTy, Dest, c);
+      auto *RMW = B.CreateAtomicRMW(
+          Op, Dest, Vals[c], DL.getABITypeAlign(ElemTy),
+          desul_atomics::memoryOrderOf(Name), SyncScope::System);
+      RMW->setDebugLoc(CI->getDebugLoc());
+      if (Vals.size() == 1) {
+        RMW->takeName(CI);
+        CI->replaceAllUsesWith(RMW);
+      }
+    }
+    CI->eraseFromParent();
+  }
+}
+
 static void SimplifyMPIQueries(Function &NewF, FunctionAnalysisManager &FAM) {
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(NewF);
   SmallVector<CallBase *, 4> Todo;
@@ -1669,10 +1745,19 @@ PreProcessCache::PreProcessCache() {
     return AM;
   });
 
-  PassBuilder PB;
+  static LLVMContext AnalysisRegistrationCtx;
+  PassBuilder PB = makePassBuilder(AnalysisRegistrationCtx);
   PB.registerModuleAnalyses(MAM);
   PB.registerFunctionAnalyses(FAM);
   PB.registerLoopAnalyses(LAM);
+}
+
+llvm::PassBuilder makePassBuilder(LLVMContext &Ctx) {
+#if LLVM_VERSION_MAJOR >= 24
+  return PassBuilder(Ctx);
+#else
+  return PassBuilder();
+#endif
 }
 
 llvm::AAResults &
@@ -1765,11 +1850,7 @@ void SplitPHIs(llvm::Function &F) {
   }
 }
 
-// returns if newly changed, subject to the pending calls
-// Whether a parameter carries the function's result: an sret (also one still
-// marked for Enzyme.jl's calling-convention fixup), a Julia sret union, or the
-// roots of a returned value.
-static bool isReturnLikeParam(const Function &F, unsigned argno) {
+bool isReturnLikeParam(const Function &F, unsigned argno) {
   if (F.hasParamAttribute(argno, Attribute::StructRet))
     return true;
   for (auto name : {"enzyme_sret", "enzyme_sret_v", "enzymejl_returnRoots",
@@ -1778,6 +1859,24 @@ static bool isReturnLikeParam(const Function &F, unsigned argno) {
       return true;
   return false;
 }
+
+bool isReturnLikeParam(const CallBase &CB, unsigned argno) {
+  if (CB.paramHasAttr(argno, Attribute::StructRet))
+    return true;
+  for (auto name : {"enzyme_sret", "enzyme_sret_v", "enzymejl_returnRoots",
+                    "enzymejl_sret_union_bytes"})
+    if (CB.getAttributeAtIndex(argno + AttributeList::FirstArgIndex, name)
+            .isValid())
+      return true;
+  // Only trust the callee's attributes when the call matches its signature; a
+  // Julia call wrapping its arguments into an array does not.
+  if (auto F = getFunctionFromCall(&CB))
+    if (F->getCallingConv() == CB.getCallingConv() && argno < F->arg_size())
+      return isReturnLikeParam(*F, argno);
+  return false;
+}
+
+// returns if newly changed, subject to the pending calls
 
 // Whether a derivative of F comes from a custom rule rather than from F's
 // body: one registered by a frontend (Enzyme.jl marks the function
@@ -1882,7 +1981,7 @@ bool DetectPointerArgOfFn(llvm::Function &F,
 
           auto name = getFuncNameFromCall(CB);
 
-          if (name == "julia.write_barrier") {
+          if (isJuliaWriteBarrier(name)) {
             continue;
           }
 
@@ -2198,7 +2297,8 @@ bool ReadOnlyOrThrowDetector::isJuliaMemoryAllocation(Value *V) {
   return name == "jl_alloc_genericmemory" ||
          name == "ijl_alloc_genericmemory" ||
          name == "jl_alloc_genericmemory_unchecked" ||
-         name == "ijl_alloc_genericmemory_unchecked";
+         name == "ijl_alloc_genericmemory_unchecked" ||
+         name == "julia.gc_alloc_memory";
 }
 bool ReadOnlyOrThrowDetector::isJuliaArrayAllocation(Value *V) {
   auto CB = dyn_cast<CallBase>(V);
@@ -2312,9 +2412,10 @@ bool ReadOnlyOrThrowDetector::fieldOnlyHoldsFreshData(Instruction *Obj,
       }
       if (auto CB = dyn_cast<CallBase>(I)) {
         auto name = getFuncNameFromCall(CB);
-        if (name == "julia.write_barrier")
+        if (isJuliaWriteBarrier(name))
           continue;
-        if (CB->isLifetimeStartOrEnd())
+        if (CB->isLifetimeStartOrEnd() ||
+            isDebugFunction(CB->getCalledFunction()))
           continue;
         for (unsigned i = 0; i < CB->arg_size(); ++i) {
           if (CB->getArgOperand(i) != V)
@@ -2632,9 +2733,11 @@ bool ReadOnlyOrThrowDetector::mayReachReturn(Value *Obj, bool Deep,
       if (auto CB = dyn_cast<CallBase>(I)) {
         if (CB->getCalledOperand() == V)
           return true;
-        if (CB->isLifetimeStartOrEnd() || isDeallocationCall(CB, TLI))
+        if (CB->isLifetimeStartOrEnd() ||
+            isDebugFunction(CB->getCalledFunction()) ||
+            isDeallocationCall(CB, TLI))
           continue;
-        if (getFuncNameFromCall(CB) == "julia.write_barrier")
+        if (isJuliaWriteBarrier(getFuncNameFromCall(CB)))
           continue;
         if (!mayHandBackPointer(CB))
           continue;
@@ -2733,10 +2836,12 @@ bool ReadOnlyOrThrowDetector::freshFieldMayReachReturn(Value *Base,
         continue;
       }
       if (auto CB = dyn_cast<CallBase>(I)) {
-        if (CB->isLifetimeStartOrEnd() || isDeallocationCall(CB, TLI))
+        if (CB->isLifetimeStartOrEnd() ||
+            isDebugFunction(CB->getCalledFunction()) ||
+            isDeallocationCall(CB, TLI))
           continue;
         auto name = getFuncNameFromCall(CB);
-        if (name == "julia.write_barrier")
+        if (isJuliaWriteBarrier(name))
           continue;
         // julia.gc_loaded(obj, ptr) returns ptr, keeping obj alive: passing
         // Base as the object hands back nothing loaded from it (a load of the
@@ -2770,6 +2875,18 @@ bool ReadOnlyOrThrowDetector::run() {
     for (auto &I : BB) {
       if (!I.mayWriteToMemory())
         continue;
+      if (auto CI = dyn_cast<CallBase>(&I)) {
+        if (isDebugFunction(CI->getCalledFunction()))
+          continue;
+      }
+      if (auto II = dyn_cast<IntrinsicInst>(&I)) {
+        if (II->getIntrinsicID() == Intrinsic::assume)
+          continue;
+#if LLVM_VERSION_MAJOR >= 13
+        if (II->getIntrinsicID() == Intrinsic::experimental_noalias_scope_decl)
+          continue;
+#endif
+      }
       if (hasMetadata(&I, "enzyme_ReadOnlyOrThrow"))
         continue;
       // A call marked local read-only-or-throw is handled like a call to a
@@ -2964,7 +3081,10 @@ bool ReadOnlyOrThrowDetector::run() {
         if (auto F2 = CI->getCalledFunction()) {
           if (isDebugFunction(F2))
             continue;
-          if (F2->getName() == "julia.write_barrier")
+          if (isMemFreeLibMFunction(getFuncNameFromCall(CI)))
+            continue;
+          if (isJuliaWriteBarrier(F2->getName()) ||
+              isRustNoAllocShimFunction(F2->getName()))
             continue;
           if (F2->getCallingConv() == CI->getCallingConv()) {
             if (F2 == &F)
@@ -3154,7 +3274,7 @@ bool DetectReadonlyOrThrow(Module &M) {
     }
   }
 
-  PassBuilder PB;
+  PassBuilder PB = makePassBuilder(M.getContext());
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
@@ -3681,7 +3801,7 @@ Function *PreProcessCache::preprocessForClone(Function *F,
         break;
       }
       if (Level != OptimizationLevel::O0) {
-        PassBuilder PB;
+        PassBuilder PB = makePassBuilder(F->getContext());
         FunctionPassManager FPM = PB.buildFunctionSimplificationPipeline(
             Level, ThinOrFullLTOPhase::None);
         PA = FPM.run(*NewF, FAM);
@@ -3754,6 +3874,7 @@ Function *PreProcessCache::preprocessForClone(Function *F,
   }
 
   SimplifyMPIQueries(*NewF, FAM);
+  LowerDesulAtomicFetchOper(*NewF);
   {
     auto PA = PromotePass().run(*NewF, FAM);
     FAM.invalidate(*NewF, PA);
@@ -3840,7 +3961,7 @@ Function *PreProcessCache::preprocessForClone(Function *F,
                     F->getName() == "f90_pausea")) {
             continue;
           }
-          if (llvm::isModOrRefSet(AA2.getModRefInfo(CI, Loc))) {
+          if (llvm::isModOrRefSet(getModRefInfo(AA2, CI, Loc))) {
             llvm::errs() << " failed to inline global: " << g << " due to "
                          << *CI << "\n";
             activeCall = true;
@@ -3906,14 +4027,14 @@ Function *PreProcessCache::preprocessForClone(Function *F,
                   goto endCheck;
                 }
 
-                if (llvm::isModSet(AA2.getModRefInfo(CI, Loc))) {
+                if (llvm::isModSet(getModRefInfo(AA2, CI, Loc))) {
                   hasWrite = true;
                   goto endCheck;
                 }
               }
 
               else if (auto I = dyn_cast<Instruction>(u)) {
-                if (llvm::isModSet(AA2.getModRefInfo(I, Loc))) {
+                if (llvm::isModSet(getModRefInfo(AA2, I, Loc))) {
                   hasWrite = true;
                   goto endCheck;
                 }
@@ -4015,7 +4136,7 @@ Function *PreProcessCache::preprocessForClone(Function *F,
 
     auto Level = OptimizationLevel::O2;
 
-    PassBuilder PB;
+    PassBuilder PB = makePassBuilder(F->getContext());
     FunctionPassManager FPM =
         PB.buildFunctionSimplificationPipeline(Level, ThinOrFullLTOPhase::None);
     auto PA = FPM.run(*F, FAM);
@@ -4822,7 +4943,7 @@ void PreProcessCache::optimizeIntermediate(Function *F) {
     break;
   }
   if (Level != OptimizationLevel::O0) {
-    PassBuilder PB;
+    PassBuilder PB = makePassBuilder(F->getContext());
     FunctionPassManager FPM =
         PB.buildFunctionSimplificationPipeline(Level, ThinOrFullLTOPhase::None);
     PA = FPM.run(*F, FAM);
@@ -7824,7 +7945,7 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
 
         Value *newIV = nullptr;
         {
-#if LLVM_VERSION_MAJOR >= 22
+#if LLVM_VERSION_MAJOR >= 22 && !defined(ENZYME_LLVM22_PRERELEASE)
           SCEVExpander Exp(SE, "sparseenzyme");
 #else
           SCEVExpander Exp(SE, DL, "sparseenzyme");
@@ -9852,7 +9973,7 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
 
       IRBuilder<> B(getFirstNonPHI(L->getHeader()));
       {
-#if LLVM_VERSION_MAJOR >= 22
+#if LLVM_VERSION_MAJOR >= 22 && !defined(ENZYME_LLVM22_PRERELEASE)
         SCEVExpander Exp(SE, "sparseenzyme");
 #else
         SCEVExpander Exp(SE, DL, "sparseenzyme");
@@ -10027,7 +10148,7 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
       auto off = en.index();
       auto &solutions = en.value().second;
       ConstraintContext ctx(SE, L, Assumptions, DT);
-#if LLVM_VERSION_MAJOR >= 22
+#if LLVM_VERSION_MAJOR >= 22 && !defined(ENZYME_LLVM22_PRERELEASE)
       SCEVExpander Exp(SE, "sparseenzyme", /*preservelcssa*/ false);
 #else
       SCEVExpander Exp(SE, DL, "sparseenzyme", /*preservelcssa*/ false);
@@ -10217,7 +10338,7 @@ void replaceToDense(llvm::CallBase *CI, bool replaceAll, llvm::Function *F,
         gep = B.CreateIntToPtr(gep, CI->getType());
       } else if (!allconst) {
         gep = B.CreateGEP(CI->getSourceElementType(), replacements[val], inds);
-        if (auto ge = cast<GetElementPtrInst>(gep))
+        if (auto ge = dyn_cast<GetElementPtrInst>(gep))
           ge->setIsInBounds(CI->isInBounds());
       } else {
         APInt ai(64, 0);
@@ -10382,7 +10503,7 @@ bool LowerSparsification(llvm::Function *F, bool replaceAll) {
   todo.clear();
 
   if (changed && EnzymeAutoSparsity) {
-    PassBuilder PB;
+    PassBuilder PB = makePassBuilder(F->getContext());
     LoopAnalysisManager LAM;
     FunctionAnalysisManager FAM;
     CGSCCAnalysisManager CGAM;

@@ -349,12 +349,10 @@ namespace {
 struct BatchPass : public enzyme::impl::BatchPassBase<BatchPass> {
   void runOnOperation() override;
 
-  // Cache mapping original function and batch sizes to batched function
-  std::map<enzyme::batchutils::BatchCacheKey, FunctionOpInterface>
-      batchedFunctionCache;
-
-  void lowerEnzymeBatchCalls(SymbolTableCollection &symbolTable,
-                             Operation *op) {
+  void lowerEnzymeBatchCalls(
+      SymbolTableCollection &symbolTable, Operation *op,
+      std::map<enzyme::batchutils::BatchCacheKey, FunctionOpInterface>
+          &BatchedFunctionCache) {
     {
       SmallVector<Operation *> toLower;
       op->walk([&](enzyme::BatchOp dop) { toLower.push_back(dop); });
@@ -364,7 +362,7 @@ struct BatchPass : public enzyme::impl::BatchPassBase<BatchPass> {
       for (auto T : toLower) {
         if (auto F = dyn_cast<enzyme::BatchOp>(T)) {
           auto res = enzyme::batchutils::batchOperation(symbolTable, builder, F,
-                                                        batchedFunctionCache);
+                                                        BatchedFunctionCache);
           if (!res.succeeded()) {
             signalPassFailure();
             return;
@@ -380,6 +378,8 @@ struct BatchPass : public enzyme::impl::BatchPassBase<BatchPass> {
 } // end anonymous namespace
 
 void BatchPass::runOnOperation() {
+  std::map<enzyme::batchutils::BatchCacheKey, FunctionOpInterface>
+      BatchedFunctionCache;
   SymbolTableCollection symbolTable;
   symbolTable.getSymbolTable(getOperation());
   // Batch calls live in function bodies and in the regions of custom reverse
@@ -387,6 +387,6 @@ void BatchPass::runOnOperation() {
   // frontend traces them like any other function).
   getOperation()->walk([&](Operation *op) {
     if (isa<FunctionOpInterface, enzyme::CustomReverseRuleOp>(op))
-      lowerEnzymeBatchCalls(symbolTable, op);
+      lowerEnzymeBatchCalls(symbolTable, op, BatchedFunctionCache);
   });
 }

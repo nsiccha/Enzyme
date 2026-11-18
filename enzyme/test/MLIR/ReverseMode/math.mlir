@@ -23,6 +23,35 @@ func.func @dsq(%x: f64, %dr: f64) -> f64 {
 
 // -----
 
+func.func @fpowi(%x: f64, %n: i32) -> f64 {
+  %res = math.fpowi %x, %n : f64, i32
+  return %res : f64
+}
+
+func.func @dfpowi(%x: f64, %n: i32, %dr: f64) -> f64 {
+  %0 = enzyme.autodiff @fpowi(%x, %n, %dr) <{ activity=[#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_const>], ret_activity=[#enzyme.activity<enzyme_activenoneed>] }> : (f64, i32, f64) -> f64
+  return %0 : f64
+}
+
+// The exponent is an integer and inactive: d/dx x^n = n * x^(n - 1), and 0 for
+// n == 0 so that x == 0 does not give 0 * inf = NaN.
+
+// CHECK: func.func private @diffefpowi(%[[x:.+]]: f64, %[[n:.+]]: i32, %[[dr:.+]]: f64) -> f64 {
+// CHECK-NEXT:    %[[one:.+]] = arith.constant 1 : i32
+// CHECK-NEXT:    %[[zi:.+]] = arith.constant 0 : i32
+// CHECK-NEXT:    %[[zf:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[isz:.+]] = arith.cmpi eq, %[[n]], %[[zi]] : i32
+// CHECK-NEXT:    %[[nf:.+]] = arith.sitofp %[[n]] : i32 to f64
+// CHECK-NEXT:    %[[nm1:.+]] = arith.subi %[[n]], %[[one]] : i32
+// CHECK-NEXT:    %[[pow:.+]] = math.fpowi %[[x]], %[[nm1]] fastmath<fast> : f64, i32
+// CHECK-NEXT:    %[[dd:.+]] = arith.mulf %[[nf]], %[[pow]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[prod:.+]] = arith.mulf %[[dr]], %[[dd]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[res:.+]] = arith.select %[[isz]], %[[zf]], %[[prod]] : f64
+// CHECK-NEXT:    return %[[res]] : f64
+// CHECK-NEXT:  }
+
+// -----
+
 func.func @atan(%x: f64) -> f64 {
   %res = math.atan %x : f64
   return %res : f64
@@ -514,4 +543,29 @@ func.func @datan2(%y: f64, %x: f64, %dr: f64) -> (f64, f64) {
 // CHECK-NEXT:    %[[fx:.+]] = arith.divf %[[negy]], %[[den2]] fastmath<fast> : f64
 // CHECK-NEXT:    %[[gx:.+]] = arith.mulf %[[dr]], %[[fx]] fastmath<fast> : f64
 // CHECK-NEXT:    return %[[gy]], %[[gx]] : f64, f64
+// CHECK-NEXT:  }
+
+// -----
+
+func.func @clampf(%x: f64, %lo: f64, %hi: f64) -> f64 {
+  %res = math.clampf %x to [%lo, %hi] : f64
+  return %res : f64
+}
+
+func.func @dclampf(%x: f64, %lo: f64, %hi: f64, %dr: f64) -> (f64, f64, f64) {
+  %0:3 = enzyme.autodiff @clampf(%x, %lo, %hi, %dr) <{ activity=[#enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>, #enzyme.activity<enzyme_active>], ret_activity=[#enzyme.activity<enzyme_activenoneed>] }> : (f64, f64, f64, f64) -> (f64, f64, f64)
+  return %0#0, %0#1, %0#2 : f64, f64, f64
+}
+
+// CHECK: func.func private @diffeclampf(%[[x:.+]]: f64, %[[lo:.+]]: f64, %[[hi:.+]]: f64, %[[dr:.+]]: f64) -> (f64, f64, f64) {
+// CHECK-NEXT:    %[[zero:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[below:.+]] = arith.cmpf olt, %[[x]], %[[lo]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[above:.+]] = arith.cmpf oge, %[[x]], %[[hi]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[inner:.+]] = arith.select %[[above]], %[[zero]], %[[dr]] : f64
+// CHECK-NEXT:    %[[gx:.+]] = arith.select %[[below]], %[[zero]], %[[inner]] : f64
+// CHECK-NEXT:    %[[below2:.+]] = arith.cmpf olt, %[[x]], %[[lo]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[glo:.+]] = arith.select %[[below2]], %[[dr]], %[[zero]] : f64
+// CHECK-NEXT:    %[[above2:.+]] = arith.cmpf oge, %[[x]], %[[hi]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[ghi:.+]] = arith.select %[[above2]], %[[dr]], %[[zero]] : f64
+// CHECK-NEXT:    return %[[gx]], %[[glo]], %[[ghi]] : f64, f64, f64
 // CHECK-NEXT:  }

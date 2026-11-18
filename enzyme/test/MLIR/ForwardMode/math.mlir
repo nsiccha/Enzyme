@@ -229,6 +229,65 @@ func.func @dlog10(%x: f64, %dx: f64) -> f64 {
 
 // -----
 
+func.func @fpowi(%x: f64, %n: i32) -> f64 {
+  %res = math.fpowi %x, %n : f64, i32
+  return %res : f64
+}
+
+func.func @dfpowi(%x: f64, %dx: f64, %n: i32) -> f64 {
+  %0 = enzyme.fwddiff @fpowi(%x, %dx, %n) <{ activity=[#enzyme.activity<enzyme_dup>, #enzyme.activity<enzyme_const>], ret_activity=[#enzyme.activity<enzyme_dupnoneed>] }> : (f64, f64, i32) -> f64
+  return %0 : f64
+}
+
+// The exponent is an integer and inactive: d/dx x^n = n * x^(n - 1), and 0 for
+// n == 0 so that x == 0 does not give 0 * inf = NaN.
+
+// CHECK: func.func private @fwddiffefpowi(%[[x:.+]]: f64, %[[dx:.+]]: f64, %[[n:.+]]: i32) -> f64 {
+// CHECK-NEXT:    %[[zi:.+]] = arith.constant 0 : i32
+// CHECK-NEXT:    %[[isz:.+]] = arith.cmpi eq, %[[n]], %[[zi]] : i32
+// CHECK-NEXT:    %[[zf:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[nf:.+]] = arith.sitofp %[[n]] : i32 to f64
+// CHECK-NEXT:    %[[one:.+]] = arith.constant 1 : i32
+// CHECK-NEXT:    %[[nm1:.+]] = arith.subi %[[n]], %[[one]] : i32
+// CHECK-NEXT:    %[[pow:.+]] = math.fpowi %[[x]], %[[nm1]] fastmath<fast> : f64, i32
+// CHECK-NEXT:    %[[dd:.+]] = arith.mulf %[[nf]], %[[pow]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[prod:.+]] = arith.mulf %[[dx]], %[[dd]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[res:.+]] = arith.select %[[isz]], %[[zf]], %[[prod]] : f64
+// CHECK-NEXT:    %{{.+}} = math.fpowi %[[x]], %[[n]] : f64, i32
+// CHECK-NEXT:    return %[[res]] : f64
+// CHECK-NEXT:  }
+
+// -----
+
+func.func @fpowi_tensor(%x: tensor<2xf32>, %n: tensor<2xi32>) -> tensor<2xf32> {
+  %res = math.fpowi %x, %n : tensor<2xf32>, tensor<2xi32>
+  return %res : tensor<2xf32>
+}
+
+func.func @dfpowi_tensor(%x: tensor<2xf32>, %dx: tensor<2xf32>, %n: tensor<2xi32>) -> tensor<2xf32> {
+  %0 = enzyme.fwddiff @fpowi_tensor(%x, %dx, %n) <{ activity=[#enzyme.activity<enzyme_dup>, #enzyme.activity<enzyme_const>], ret_activity=[#enzyme.activity<enzyme_dupnoneed>] }> : (tensor<2xf32>, tensor<2xf32>, tensor<2xi32>) -> tensor<2xf32>
+  return %0 : tensor<2xf32>
+}
+
+// The constant 1 for the exponent is a splat of the integer element type.
+
+// CHECK: func.func private @fwddiffefpowi_tensor(%[[x:.+]]: tensor<2xf32>, %[[dx:.+]]: tensor<2xf32>, %[[n:.+]]: tensor<2xi32>) -> tensor<2xf32> {
+// CHECK-NEXT:    %[[zi:.+]] = arith.constant dense<0> : tensor<2xi32>
+// CHECK-NEXT:    %[[isz:.+]] = arith.cmpi eq, %[[n]], %[[zi]] : tensor<2xi32>
+// CHECK-NEXT:    %[[zf:.+]] = arith.constant dense<0.000000e+00> : tensor<2xf32>
+// CHECK-NEXT:    %[[nf:.+]] = arith.sitofp %[[n]] : tensor<2xi32> to tensor<2xf32>
+// CHECK-NEXT:    %[[one:.+]] = arith.constant dense<1> : tensor<2xi32>
+// CHECK-NEXT:    %[[nm1:.+]] = arith.subi %[[n]], %[[one]] : tensor<2xi32>
+// CHECK-NEXT:    %[[pow:.+]] = math.fpowi %[[x]], %[[nm1]] fastmath<fast> : tensor<2xf32>, tensor<2xi32>
+// CHECK-NEXT:    %[[dd:.+]] = arith.mulf %[[nf]], %[[pow]] fastmath<fast> : tensor<2xf32>
+// CHECK-NEXT:    %[[prod:.+]] = arith.mulf %[[dx]], %[[dd]] fastmath<fast> : tensor<2xf32>
+// CHECK-NEXT:    %[[res:.+]] = arith.select %[[isz]], %[[zf]], %[[prod]] : tensor<2xi1>, tensor<2xf32>
+// CHECK-NEXT:    %{{.+}} = math.fpowi %[[x]], %[[n]] : tensor<2xf32>, tensor<2xi32>
+// CHECK-NEXT:    return %[[res]] : tensor<2xf32>
+// CHECK-NEXT:  }
+
+// -----
+
 func.func @rsqrt(%x: f64) -> f64 {
   %res = math.rsqrt %x : f64
   return %res : f64
@@ -406,5 +465,36 @@ func.func @datan2(%y: f64, %dy: f64, %x: f64, %dx: f64) -> f64 {
 // CHECK-NEXT:    %[[gx:.+]] = arith.mulf %[[dx]], %[[fx]] fastmath<fast> : f64
 // CHECK-NEXT:    %[[res:.+]] = arith.addf %[[gy]], %[[gx]] fastmath<fast> : f64
 // CHECK-NEXT:    %{{.+}} = math.atan2 %[[y]], %[[x]] : f64
+// CHECK-NEXT:    return %[[res]] : f64
+// CHECK-NEXT:  }
+
+// -----
+
+func.func @clampf(%x: f64, %lo: f64, %hi: f64) -> f64 {
+  %res = math.clampf %x to [%lo, %hi] : f64
+  return %res : f64
+}
+
+func.func @dclampf(%x: f64, %dx: f64, %lo: f64, %dlo: f64, %hi: f64, %dhi: f64) -> f64 {
+  %0 = enzyme.fwddiff @clampf(%x, %dx, %lo, %dlo, %hi, %dhi) <{ activity=[#enzyme.activity<enzyme_dup>, #enzyme.activity<enzyme_dup>, #enzyme.activity<enzyme_dup>], ret_activity=[#enzyme.activity<enzyme_dupnoneed>] }> : (f64, f64, f64, f64, f64, f64) -> f64
+  return %0 : f64
+}
+
+// CHECK: func.func private @fwddiffeclampf(%[[x:.+]]: f64, %[[dx:.+]]: f64, %[[lo:.+]]: f64, %[[dlo:.+]]: f64, %[[hi:.+]]: f64, %[[dhi:.+]]: f64) -> f64 {
+// CHECK-NEXT:    %[[below:.+]] = arith.cmpf olt, %[[x]], %[[lo]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[zero:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[above:.+]] = arith.cmpf oge, %[[x]], %[[hi]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[zero2:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[inner:.+]] = arith.select %[[above]], %[[zero2]], %[[dx]] : f64
+// CHECK-NEXT:    %[[gx:.+]] = arith.select %[[below]], %[[zero]], %[[inner]] : f64
+// CHECK-NEXT:    %[[below2:.+]] = arith.cmpf olt, %[[x]], %[[lo]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[zero3:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[glo:.+]] = arith.select %[[below2]], %[[dlo]], %[[zero3]] : f64
+// CHECK-NEXT:    %[[sum:.+]] = arith.addf %[[gx]], %[[glo]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[above2:.+]] = arith.cmpf oge, %[[x]], %[[hi]] fastmath<fast> : f64
+// CHECK-NEXT:    %[[zero4:.+]] = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:    %[[ghi:.+]] = arith.select %[[above2]], %[[dhi]], %[[zero4]] : f64
+// CHECK-NEXT:    %[[res:.+]] = arith.addf %[[sum]], %[[ghi]] fastmath<fast> : f64
+// CHECK-NEXT:    %{{.+}} = math.clampf %[[x]] to [%[[lo]], %[[hi]]] : f64
 // CHECK-NEXT:    return %[[res]] : f64
 // CHECK-NEXT:  }

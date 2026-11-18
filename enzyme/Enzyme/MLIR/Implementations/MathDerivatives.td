@@ -58,6 +58,17 @@ def : MLIRDerivative<"math", "PowFOp", (Op $x, $y),
                       (CheckedMulF (DiffeRet), (Arith_Select (CmpF (Arith_OEQ), $x, (ConstantFP<"0","arith","ConstantOp"> $x):$pzero), $pzero, (MulF (PowF $x, $y), (LogF $x))))
                     ]
                   >;
+def : MLIRDerivative<"math", "FPowIOp", (Op $x, $y),
+                    [
+                      (Arith_Select
+                        (CmpI (Arith_EQ), $y, (ConstantInt<"0","arith","ConstantOp"> $y)),
+                        (ConstantFP<"0","arith","ConstantOp"> $x),
+                        (CheckedMulF (DiffeRet),
+                          (MulF (SItoF (TypeOf $x), $y),
+                                (FPowI $x, (SubI $y, (ConstantInt<"1","arith","ConstantOp"> $y)))))),
+                      (InactiveArg)
+                    ]
+                  >;
 def : MLIRDerivative<"math", "LogOp", (Op $x),
                     [
                       (CheckedDivF (DiffeRet), $x)
@@ -233,6 +244,21 @@ def : MLIRDerivative<"math", "ErfcOp", (Op $x),
                       (CheckedMulF (DiffeRet),
                         (MulF (ConstantFP<"-1.1283791670955125738961589031215451716881012586580","arith","ConstantOp"> $x),
                               (ExpF (NegF (MulF $x, $x)))))
+                    ]
+                  >;
+def : MLIRDerivative<"math", "ClampFOp", (Op $x, $min, $max),
+                    [
+                      (Arith_Select (CmpF (Arith_OLT), $x, $min),
+                        (ConstantFP<"0", "arith", "ConstantOp"> $x),
+                        (Arith_Select (CmpF (Arith_OGE), $x, $max),
+                          (ConstantFP<"0", "arith", "ConstantOp"> $x), 
+                          (DiffeRet))),
+                      (Arith_Select (CmpF (Arith_OLT), $x, $min),
+                        (DiffeRet),
+                        (ConstantFP<"0", "arith", "ConstantOp"> $min)),
+                      (Arith_Select (CmpF (Arith_OGE), $x, $max),
+                        (DiffeRet),
+                        (ConstantFP<"0", "arith", "ConstantOp"> $max))
                     ]
                   >;
 def : MathInactiveOp<"CeilOp">;
