@@ -534,6 +534,22 @@ static bool isZero(llvm::Constant *cst) {
   return cst->isZeroValue();
 #endif
 }
+
+static Value *addAdjointContribution(IRBuilder<> &B, Value *old, Value *inc,
+                                     bool reassociate) {
+  IRBuilder<>::FastMathFlagGuard guard(B);
+  if (reassociate) {
+    auto flags = B.getFastMathFlags();
+    flags.setAllowReassoc();
+    B.setFastMathFlags(flags);
+  }
+  if (auto BI = dyn_cast<BinaryOperator>(inc))
+    if (auto C = dyn_cast<ConstantFP>(BI->getOperand(0)))
+      if (BI->getOpcode() == BinaryOperator::FSub && C->isZero())
+        return B.CreateFSub(old, BI->getOperand(1));
+  return B.CreateFAdd(old, inc);
+}
+
 SmallVector<SelectInst *, 4>
 DiffeGradientUtils::addToDiffe(Value *val, Value *dif, IRBuilder<> &BuilderM,
                                Type *addingType, ArrayRef<Value *> idxs,
@@ -550,18 +566,10 @@ DiffeGradientUtils::addToDiffe(Value *val, Value *dif, IRBuilder<> &BuilderM,
 
   SmallVector<SelectInst *, 4> addedSelects;
 
+  const bool reassociate =
+      canReassociateAdjoint(val, BuilderM.GetInsertBlock());
   auto faddForNeg = [&](Value *old, Value *inc, bool san) {
-    if (auto bi = dyn_cast<BinaryOperator>(inc)) {
-      if (auto ci = dyn_cast<ConstantFP>(bi->getOperand(0))) {
-        if (bi->getOpcode() == BinaryOperator::FSub && ci->isZero()) {
-          Value *res = BuilderM.CreateFSub(old, bi->getOperand(1));
-          if (san)
-            res = SanitizeDerivatives(val, res, BuilderM, mask);
-          return res;
-        }
-      }
-    }
-    Value *res = BuilderM.CreateFAdd(old, inc);
+    Value *res = addAdjointContribution(BuilderM, old, inc, reassociate);
     if (san)
       res = SanitizeDerivatives(val, res, BuilderM, mask);
     return res;
@@ -907,7 +915,8 @@ CallInst *DiffeGradientUtils::freeCache(BasicBlock *forwardPreheader,
                                         const SubLimitType &sublimits, int i,
                                         AllocaInst *alloc, llvm::Type *T,
                                         ConstantInt *byteSizeOfType,
-                                        Value *storeInto, MDNode *InvariantMD) {
+                                        Value *storeInto, MDNode *InvariantMD,
+                                        Type *packedType) {
   if (!FreeMemory)
     return nullptr;
   assert(reverseBlocks.find(forwardPreheader) != reverseBlocks.end());
@@ -954,6 +963,19 @@ CallInst *DiffeGradientUtils::freeCache(BasicBlock *forwardPreheader,
       (unsigned)newFunc->getParent()->getDataLayout().getPointerSize());
   forfree->setAlignment(Align(align));
 
+  if (packedType) {
+    auto buffer = tbuild.CreateLoad(packedType, forfree);
+    if (auto ci = CreateDealloc(tbuild, buffer)) {
+      // A nest containing no rows never grows its initially null buffer.
+      ci->removeParamAttr(0, Attribute::NonNull);
+      auto ident = MDNode::getDistinct(
+          ci->getContext(),
+          {ConstantAsMetadata::get(ConstantInt::getFalse(ci->getContext()))});
+      ci->setMetadata("enzyme_cache_free",
+                      MDNode::get(ci->getContext(), {ident}));
+      scopeFrees[alloc].insert(ci);
+    }
+  }
   CallInst *ci = CreateDealloc(tbuild, forfree);
   if (ci) {
     if (newFunc->getSubprogram())

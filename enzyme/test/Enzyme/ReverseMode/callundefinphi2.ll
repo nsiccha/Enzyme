@@ -366,6 +366,7 @@ attributes #22 = { readnone speculatable }
 ; CHECK-NEXT:   %[[lcssade:.+]] = phi i64 [ %[[g18]], %incinvertfor.cond10.preheader.i ], [ 0, %for.cond.cleanup13.i ]
 ; CHECK-NEXT:   %[[addlcssa:.+]] = phi double [ 0.000000e+00, %incinvertfor.cond10.preheader.i ], [ %differeturn, %for.cond.cleanup13.i ]
 ; CHECK-NEXT:   %"iv3'ac.0" = phi i64 [ %[[iv3sub]], %incinvertfor.cond10.preheader.i ], [ 3, %for.cond.cleanup13.i ]
+; CHECK-NEXT:   %[[iv54:.+]] = mul nsw i64 4, %"iv3'ac.0"
 ; CHECK-NEXT:   br label %invertfor.body14.i
 
 ; CHECK: invertfor.body14.i:                               ; preds = %incinvertfor.body14.i, %invertfor.cond.cleanup13.i
@@ -374,7 +375,6 @@ attributes #22 = { readnone speculatable }
 ; CHECK-NEXT:   %"iv5'ac.0" = phi i64 [ 3, %invertfor.cond.cleanup13.i ], [ %[[iv5sub:.+]], %incinvertfor.body14.i ]
 ; CHECK-NEXT:   %[[dedd:.+]] = bitcast i64 %[[de11:.+]] to double
 ; CHECK-NEXT:   %[[fad:.+]] = fadd fast double %"add.i.i'de.1", %[[dedd]]
-; CHECK-NEXT:   %[[iv54:.+]] = mul {{(nuw )?}}nsw i64 %"iv3'ac.0", 4
 ; CHECK-NEXT:   %[[iv35a:.+]] = add {{(nuw )?}}nsw i64 %"iv5'ac.0", %[[iv54]]
 ; CHECK-NEXT:   %[[bcq:.+]] = getelementptr inbounds double, double* %[[malloccache]], i64 %[[iv35a]]
 ; CHECK-NEXT:   %[[unwrap13:.+]] = load double, double* %[[bcq]], align 8, !invariant.group !
@@ -530,7 +530,6 @@ attributes #22 = { readnone speculatable }
 ; CHECK: invertif.exit:                                    ; preds = %invertfor.cond.cleanup4, %incinvertfor.body5
 ; CHECK-NEXT:   %"call2.i.i.i'de.1" = phi double [ %"call2.i.i.i'de.2", %invertfor.cond.cleanup4 ], [ %"call2.i.i.i'de.0", %incinvertfor.body5 ]
 ; CHECK-NEXT:   %"iv1'ac.0" = phi i64 [ 3, %invertfor.cond.cleanup4 ], [ %[[iv1sub]], %incinvertfor.body5 ]
-; CHECK-NEXT:   %mul.i.i.i.i.i_unwrap = mul nsw i64 4, %"iv'ac.0"
 ; CHECK-NEXT:   %add.i.i.i_unwrap = add nsw i64 %mul.i.i.i.i.i_unwrap, %"iv1'ac.0"
 ; CHECK-NEXT:   %"arrayidx'ipg_unwrap" = getelementptr inbounds double, double* %"w3'", i64 %add.i.i.i_unwrap
 ; CHECK-NEXT:   %[[dret:.+]] = load double, double* %"arrayidx'ipg_unwrap", align 8
@@ -542,6 +541,7 @@ attributes #22 = { readnone speculatable }
 ; CHECK: invertfor.cond.cleanup4:                          ; preds = %for.cond.cleanup4, %incinvertfor.cond1.preheader
 ; CHECK-NEXT:   %"call2.i.i.i'de.2" = phi double [ %"call2.i.i.i'de.0", %incinvertfor.cond1.preheader ], [ 0.000000e+00, %for.cond.cleanup4 ]
 ; CHECK-NEXT:   %"iv'ac.0" = phi i64 [ %[[ivsub]], %incinvertfor.cond1.preheader ], [ 3, %for.cond.cleanup4 ]
+; CHECK-NEXT:   %mul.i.i.i.i.i_unwrap = mul nsw i64 4, %"iv'ac.0"
 ; CHECK-NEXT:   br label %invertif.exit
 ; CHECK-NEXT: }
 

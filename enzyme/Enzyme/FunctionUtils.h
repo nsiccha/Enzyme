@@ -81,6 +81,41 @@ class PassBuilder;
 
 llvm::PassBuilder makePassBuilder(llvm::LLVMContext &Ctx);
 
+/// Storage owned by a function's pointer arguments that it may write, as
+/// (argument number, byte offset of the owning pointer field) pairs.
+using ArgumentOwnedWrites = llvm::SmallVector<std::pair<unsigned, int64_t>, 2>;
+
+/// Memoized getArgumentOwnedStorageWrites answers for one unchanged module.
+struct ArgumentOwnedWritesCache {
+  /// Finished queries: whether each succeeded, and the writes it returned.
+  llvm::DenseMap<llvm::Function *, std::pair<bool, ArgumentOwnedWrites>>
+      results;
+  /// Queries in progress. Meeting one again means recursion, which the query
+  /// answers conservatively.
+  llvm::SmallPtrSet<llvm::Function *, 4> active;
+};
+
+/// Whether F, outside paths that throw, writes only memory that did not exist
+/// before the call (as an enzyme_LocalReadOnlyOrThrow function may) and
+/// storage owned by its pointer arguments: through a pointer loaded at a
+/// constant offset from an argument, as Julia writes an array argument's
+/// elements. Those (argument number, offset) pairs are returned in writes. F
+/// itself never writes its arguments' own memory, so the pointers it loads
+/// from them are the ones its caller passed; whether the storage they name
+/// existed before the call is for that caller to show.
+///
+/// Calls F makes count too: a call that may write only through pointer
+/// arguments (argmemonly, such as a BLAS routine filling its output matrix)
+/// and a call to a function this query accepts, its own owned-storage writes
+/// mapped onto F's arguments or, given FAM, onto fresh allocations F makes
+/// (such as the result array Julia's matrix product fills through
+/// gemm_wrapper!). Answers are kept in cache.
+bool getArgumentOwnedStorageWrites(
+    llvm::Function &F, llvm::TargetLibraryInfo &TLI,
+    llvm::SmallVectorImpl<std::pair<unsigned, int64_t>> &writes,
+    ArgumentOwnedWritesCache &cache,
+    llvm::FunctionAnalysisManager *FAM = nullptr);
+
 class PreProcessCache {
 public:
   PreProcessCache();

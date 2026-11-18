@@ -37,9 +37,11 @@
 #include "Utils.h"
 
 #include "DifferentialUseAnalysis.h"
+#include "FunctionUtils.h"
 #include "LibraryFuncs.h"
 #include "TypeAnalysis/TBAA.h"
 
+#include "llvm/Analysis/IVDescriptors.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
@@ -96,6 +98,26 @@ llvm::cl::opt<bool> EnzymeMinCutCache("enzyme-mincut-cache", cl::init(true),
 llvm::cl::opt<bool> EnzymeLoopInvariantCache(
     "enzyme-loop-invariant-cache", cl::init(true), cl::Hidden,
     cl::desc("Attempt to hoist cache outside of loop"));
+
+llvm::cl::opt<bool> EnzymeRecomputeBranchPredicates(
+    "enzyme-recompute-branch-predicates", cl::init(true), cl::Hidden,
+    cl::desc("Decide which edge into a merge the forward pass took from "
+             "recomputed branch conditions rather than a cache"));
+
+llvm::cl::opt<bool> EnzymeReverseLoopEntryRecompute(
+    "enzyme-reverse-loop-entry-recompute", cl::init(true), cl::Hidden,
+    cl::desc("Recompute a value defined outside a loop once per entry of that "
+             "loop's reverse, rather than at each use inside it"));
+
+llvm::cl::opt<bool> EnzymeReverseLoopEntryMerges(
+    "enzyme-reverse-loop-entry-merges", cl::init(true), cl::Hidden,
+    cl::desc("With enzyme-reverse-loop-entry-recompute, also compute a merge of "
+             "branches once per entry of a loop's reverse"));
+
+llvm::cl::opt<bool> EnzymeSelectStrongZero(
+    "enzyme-select-strong-zero", cl::init(true), cl::Hidden,
+    cl::desc("Treat a zero adjoint as a strong zero in the reverse rules of "
+             "values that reach the result only through select arms"));
 
 llvm::cl::opt<bool> EnzymeInactiveDynamic(
     "enzyme-inactive-dynamic", cl::init(true), cl::Hidden,
@@ -379,9 +401,34 @@ GradientUtils::getInvertedBundles(CallInst *orig, ArrayRef<ValueType> types,
   return Defs;
 }
 
-SmallVector<OperandBundleDef, 1>
-GradientUtils::getAllocationZeroingBundles(CallInst *orig,
-                                           IRBuilder<> &Builder2, bool lookup) {
+bool GradientUtils::canZeroAllocationWithBundle(const CallInst *orig) {
+  if (getFuncNameFromCall(orig) != "julia.gc_alloc_obj")
+    return false;
+  for (unsigned i = 0, e = orig->getNumOperandBundles(); i != e; ++i) {
+    auto tag = orig->getOperandBundleAt(i).getTagName();
+    if (tag == "julia.gc_alloc_ptr_offsets" || tag == "julia.gc_alloc_zeroinit")
+      return true;
+  }
+  return false;
+}
+
+void GradientUtils::markAllocationZeroed(CallInst *alloc) {
+#if LLVM_VERSION_MAJOR >= 15
+  alloc->removeFnAttr(Attribute::AllocKind);
+  alloc->addFnAttr(
+      Attribute::get(alloc->getContext(), Attribute::AllocKind,
+                     uint64_t(AllocFnKind::Alloc | AllocFnKind::Zeroed)));
+#endif
+}
+
+SmallVector<OperandBundleDef, 1> GradientUtils::getAllocationZeroingBundles(
+    CallInst *orig, IRBuilder<> &Builder2, bool lookup, Value *zeroAllSize) {
+  if (zeroAllSize) {
+    // julia.gc_alloc_zeroinit and julia.gc_alloc_ptr_offsets are mutually
+    // exclusive; zeroing the whole object covers the pointer fields.
+    Value *ops[] = {ConstantInt::get(zeroAllSize->getType(), 0), zeroAllSize};
+    return {OperandBundleDef("julia.gc_alloc_zeroinit", ops)};
+  }
   SmallVector<OperandBundleDef, 2> OrigDefs;
   orig->getOperandBundlesAsDefs(OrigDefs);
   SmallVector<OperandBundleDef, 1> Defs;
@@ -620,6 +667,167 @@ Value *GradientUtils::getOrInsertConditionalIndex(Value *val, LoopContext &lc,
   return red;
 }
 
+bool GradientUtils::onlyActiveUseInLoopIsPHI(const Instruction *val,
+                                             const PHINode *phi) const {
+  auto L = OrigLI->getLoopFor(phi->getParent());
+  assert(L);
+  for (auto U : val->users()) {
+    auto I = cast<Instruction>(U);
+    if (I == phi)
+      continue;
+    if (!L->contains(I->getParent()))
+      continue;
+    if (isConstantInstruction(I))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+void GradientUtils::findReassociableAdjoints(Loop *L,
+                                             SmallPtrSetImpl<Value *> &result) {
+  // Memory recurrences, nested loops and atomic accumulation need a separate
+  // independence proof. SSA adjoints of invariant scalar loads are covered:
+  // their memory adjoints are updated outside this loop, by the ordinary rule.
+  if (!L->getSubLoops().empty() || AtomicAdd)
+    return;
+  for (auto BB : L->blocks())
+    for (auto &I : *BB) {
+      if (I.mayWriteToMemory() || I.mayThrow())
+        return;
+      if (auto LI = dyn_cast<LoadInst>(&I))
+        if (!LI->isSimple())
+          return;
+    }
+
+  SmallPtrSet<Instruction *, 16> recurrence;
+  SmallVector<Value *, 16> work;
+  for (auto &Phi : L->getHeader()->phis()) {
+    if (isConstantValue(&Phi))
+      continue;
+    RecurrenceDescriptor RD;
+    if (!RecurrenceDescriptor::isReductionPHI(&Phi, L, RD) ||
+        RD.getRecurrenceKind() != RecurKind::FAdd ||
+        !RD.getFastMathFlags().allowReassoc())
+      return;
+    auto chain = RD.getReductionOpChain(&Phi, L);
+    if (chain.empty())
+      return;
+    SmallPtrSet<Instruction *, 8> members;
+    members.insert(&Phi);
+    members.insert(chain.begin(), chain.end());
+    for (auto I : chain) {
+      if ((I->getOpcode() != Instruction::FAdd &&
+           I->getOpcode() != Instruction::FSub) ||
+          !I->getFastMathFlags().allowReassoc())
+        return;
+      auto A = dyn_cast<Instruction>(I->getOperand(0));
+      auto B = dyn_cast<Instruction>(I->getOperand(1));
+      bool carriesA = A && members.count(A);
+      bool carriesB = B && members.count(B);
+      if (carriesA == carriesB ||
+          (carriesB && I->getOpcode() == Instruction::FSub))
+        return;
+      work.push_back(I->getOperand(carriesA ? 1 : 0));
+    }
+    // A prefix sum observed inside the loop is not an independent reduction.
+    for (auto I : members)
+      for (auto U : I->users()) {
+        auto UI = dyn_cast<Instruction>(U);
+        if (!UI || (!members.count(UI) &&
+                    (L->contains(UI) || I != RD.getLoopExitInstr())))
+          return;
+      }
+    recurrence.insert(members.begin(), members.end());
+  }
+  if (recurrence.empty())
+    return;
+
+  // Walk the per-iteration expressions back to invariant SSA inputs. No
+  // loop-carried value may enter a contribution, even through a predicate.
+  SmallPtrSet<Instruction *, 32> contributors;
+  SmallPtrSet<Value *, 8> invariants;
+  while (!work.empty()) {
+    auto V = work.pop_back_val();
+    if (isConstantValue(V))
+      continue;
+    if (L->isLoopInvariant(V)) {
+      invariants.insert(V);
+      continue;
+    }
+    auto I = dyn_cast<Instruction>(V);
+    if (!I || isa<PHINode>(I) || recurrence.count(I))
+      return;
+    if (!contributors.insert(I).second)
+      continue;
+    if (isa<LoadInst>(I))
+      continue;
+    // An opaque/custom call can couple its adjoints in ways this SSA proof
+    // does not establish. Inlined arithmetic and pure LLVM intrinsics suffice.
+    if (auto CI = dyn_cast<CallInst>(I)) {
+      if (!isa<IntrinsicInst>(CI) || !CI->doesNotAccessMemory())
+        return;
+      for (auto &A : CI->args())
+        work.push_back(A);
+    } else {
+      if (!isa<BinaryOperator>(I) && !isa<UnaryOperator>(I) &&
+          !isa<CastInst>(I) && !isa<SelectInst>(I) && !isa<CmpInst>(I))
+        return;
+      for (auto &A : I->operands())
+        work.push_back(A);
+    }
+  }
+
+  // Remove shared expressions and inputs with another differentiated use.
+  // Propagating the exclusions backwards visits each edge once, including
+  // shared DAGs; doing a use-tree search for every input would be quadratic.
+  SmallVector<Instruction *, 16> excluded;
+  SmallPtrSet<Instruction *, 16> seen;
+  for (auto I : contributors)
+    for (auto U : I->users()) {
+      auto UI = dyn_cast<Instruction>(U);
+      if (!UI || (!contributors.count(UI) && !recurrence.count(UI) &&
+                  !isConstantInstruction(UI))) {
+        excluded.push_back(I);
+        break;
+      }
+    }
+  for (auto BB : L->blocks())
+    for (auto &I : *BB)
+      if (!contributors.count(&I) && !recurrence.count(&I) &&
+          !isConstantInstruction(&I))
+        for (auto &A : I.operands())
+          invariants.erase(A);
+  while (!excluded.empty()) {
+    auto I = excluded.pop_back_val();
+    if (!seen.insert(I).second)
+      continue;
+    for (auto &A : I->operands()) {
+      invariants.erase(A);
+      if (auto AI = dyn_cast<Instruction>(A))
+        if (contributors.count(AI))
+          excluded.push_back(AI);
+    }
+  }
+  result.insert(invariants.begin(), invariants.end());
+}
+
+bool GradientUtils::canReassociateAdjoint(Value *V, BasicBlock *reverseBlock) {
+  auto F = reverseBlockToPrimal.find(reverseBlock);
+  if (F == reverseBlockToPrimal.end() || !OrigLI)
+    return false;
+  auto L = OrigLI->getLoopFor(isOriginal(F->second));
+  if (!L || !L->isLoopInvariant(V))
+    return false;
+  auto found = reassociableAdjoints.find(L);
+  if (found == reassociableAdjoints.end()) {
+    auto &values = reassociableAdjoints[L];
+    findReassociableAdjoints(L, values);
+    return values.count(V);
+  }
+  return found->second.count(V);
+}
+
 bool GradientUtils::assumeDynamicLoopOfSizeOne(Loop *L) const {
   if (!EnzymeInactiveDynamic)
     return false;
@@ -640,6 +848,123 @@ bool GradientUtils::assumeDynamicLoopOfSizeOne(Loop *L) const {
     }
   }
   return true;
+}
+
+bool GradientUtils::isReplayedOnceLatch(const Instruction *term,
+                                        DerivativeMode mode) const {
+  if (mode != DerivativeMode::ReverseModePrimal &&
+      mode != DerivativeMode::ReverseModeGradient)
+    return false;
+  auto BI = dyn_cast<BranchInst>(term);
+  if (!BI || !BI->isConditional())
+    return false;
+  const BasicBlock *BB = BI->getParent();
+  assert(BB->getParent() == oldFunc);
+  auto found = replayedOnceLatches.find(BB);
+  if (found != replayedOnceLatches.end())
+    return found->second;
+
+  auto compute = [&]() {
+    Loop *L = OrigLI->getLoopFor(BB);
+    if (!L || L->getLoopLatch() != BB || L->getExitingBlock() != BB)
+      return false;
+    BasicBlock *exit = nullptr;
+    if (BI->getSuccessor(0) == L->getHeader())
+      exit = BI->getSuccessor(1);
+    else if (BI->getSuccessor(1) == L->getHeader())
+      exit = BI->getSuccessor(0);
+    if (!exit || L->contains(exit))
+      return false;
+    // A dedicated exit: the reverse of the exit block never needs to know
+    // whether it was entered from the loop.
+    for (auto pred : predecessors(exit))
+      if (pred != BB)
+        return false;
+
+    // A latch that never runs keeps the full replay. Every other latch's loop
+    // gets a context in forceAugmentedReturns.
+    if (notForAnalysis.count(const_cast<BasicBlock *>(BB)))
+      return false;
+    Loop *NL = LI.getLoopFor(getNewFromOriginal(BB));
+    if (!NL)
+      return false;
+    // Whether scalar evolution cannot compute the loop's limit. Once the loop
+    // has a context, take the answer getContext recorded, which is the one
+    // the reverse pass uses, and do not query scalar evolution again:
+    // forceAugmentedReturns creates every loop's context and then inserts
+    // placeholder phis without incoming values, one of which can stand among
+    // the leading phis of a block (before an allocation that starts the
+    // block). LLVM 20's loop guards (LoopGuards::collectFromPHI, reached from
+    // howFarToZero) read the first incoming block of each leading phi of a
+    // block above the loop, so a trip-count query from then on reads
+    // uninitialized memory. Without a context, newFunc is still the clone of
+    // oldFunc, without placeholders.
+    auto context = loopContexts.find(NL);
+    if (context != loopContexts.end()) {
+      if (!context->second.dynamic)
+        return false;
+    } else {
+      auto self = const_cast<GradientUtils *>(this);
+      if (self->computeLoopLimit(NL).first != self->SE.getCouldNotCompute())
+        return false;
+    }
+    if (!assumeDynamicLoopOfSizeOne(NL))
+      return false;
+
+    for (auto OB : L->getBlocks()) {
+      for (auto &I : *OB) {
+        // A replay of a single iteration must not change memory that the
+        // loop would have written.
+        if (I.mayWriteToMemory())
+          return false;
+        // A phi outside the loop with an incoming value from inside it is
+        // never recomputed (legalRecompute, isPotentialLastLoopValue), so a
+        // value of the loop used only through such phis reaches the replay
+        // from the tape. Any other use outside the loop could be recomputed
+        // from the replay's single iteration.
+        for (auto U : I.users()) {
+          auto UI = cast<Instruction>(U);
+          if (L->contains(UI->getParent()))
+            continue;
+          if (!isa<PHINode>(UI))
+            return false;
+        }
+      }
+    }
+    return true;
+  };
+  return replayedOnceLatches[BB] = compute();
+}
+
+void GradientUtils::replayLatchesOnce() {
+  assert(mode == DerivativeMode::ReverseModeGradient);
+  for (BasicBlock &OBB : *oldFunc) {
+    auto term = OBB.getTerminator();
+    if (!isReplayedOnceLatch(term, mode))
+      continue;
+    auto OBI = cast<BranchInst>(term);
+    BasicBlock *OHeader = OrigLI->getLoopFor(&OBB)->getHeader();
+    BasicBlock *OExit = OBI->getSuccessor(0) == OHeader ? OBI->getSuccessor(1)
+                                                        : OBI->getSuccessor(0);
+    BasicBlock *NBB = getNewFromOriginal(&OBB);
+    BasicBlock *NHeader = getNewFromOriginal(OHeader);
+    BasicBlock *NExit = getNewFromOriginal(OExit);
+    auto NBI = dyn_cast<BranchInst>(NBB->getTerminator());
+    if (!NBI || !NBI->isConditional() ||
+        !((NBI->getSuccessor(0) == NHeader && NBI->getSuccessor(1) == NExit) ||
+          (NBI->getSuccessor(0) == NExit && NBI->getSuccessor(1) == NHeader))) {
+      std::string str;
+      raw_string_ostream ss(str);
+      ss << "replayed-once latch " << OBB.getName()
+         << " no longer branches to its header and exit: " << *NBB << "\n";
+      report_fatal_error(StringRef(ss.str()));
+    }
+    // The condition was not needed in the reverse, so it was not cached and
+    // its replay was erased. A constant condition keeps every phi of the
+    // header valid; the back edge folds away after differentiation.
+    NBI->setCondition(
+        ConstantInt::getBool(NBI->getContext(), NBI->getSuccessor(0) == NExit));
+  }
 }
 
 DebugLoc GradientUtils::getNewFromOriginal(const DebugLoc L) const {
@@ -755,6 +1080,9 @@ BasicBlock *GradientUtils::isOriginal(const BasicBlock *newinst) const {
   return cast_or_null<BasicBlock>(isOriginal((const Value *)newinst));
 }
 
+static bool safeToRecomputeOnAllPaths(Value *cond, BasicBlock *ctx,
+                                      DominatorTree &DT);
+
 Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
                               const ValueToValueMapTy &available,
                               UnwrapMode unwrapMode, BasicBlock *scope,
@@ -770,11 +1098,6 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
       assert(pair.second->getType());
       assert(pair.first->getType() == pair.second->getType());
     }
-  }
-
-  if (isa<LoadInst>(val) &&
-      cast<LoadInst>(val)->getMetadata("enzyme_mustcache")) {
-    return val;
   }
 
   if (available.count(val)) {
@@ -1323,6 +1646,12 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
     assert(val->getType() == toreturn->getType());
     return toreturn;
   } else if (auto load = dyn_cast<LoadInst>(val)) {
+    // A cached load need not dominate this use (custom-rule return fields
+    // can be produced on only one forward path). Use the normal lookup
+    // fallback instead of returning the forward instruction or reloading it.
+    if (load->getMetadata("enzyme_mustcache"))
+      goto endCheck;
+
     if (load->getMetadata("enzyme_noneedunwrap"))
       return load;
 
@@ -1737,6 +2066,39 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
       return toreturn;
     }
 
+    // Identical arithmetic on each incoming edge does not depend on which
+    // edge was taken. Rebuild it directly, including when the insertion block
+    // is already terminated and cannot host a reconstructed branch diamond.
+    if (!OrigLI->isLoopHeader(origParent)) {
+      if (auto first = dyn_cast<BinaryOperator>(phi->getIncomingValue(0))) {
+        bool identical = true;
+        for (auto &incoming : phi->incoming_values()) {
+          auto other = dyn_cast<BinaryOperator>(incoming);
+          if (!other || !first->isIdenticalTo(other)) {
+            identical = false;
+            break;
+          }
+        }
+        for (auto &operand : first->operands()) {
+          if (auto inst = dyn_cast<Instruction>(operand))
+            if (!DT.dominates(inst, phi))
+              identical = false;
+        }
+        // Unwrapping can request the value outside the original branch.
+        // Do not speculate a potentially trapping operation such as sdiv.
+        if (identical && isSafeToSpeculativelyExecute(first)) {
+          auto result = unwrapM(first, BuilderM, available, unwrapMode,
+                                scope ? scope : phi->getParent(), permitCache);
+          if (result) {
+            if (permitCache)
+              unwrap_cache[BuilderM.GetInsertBlock()][idx.first][idx.second] =
+                  result;
+            return result;
+          }
+        }
+      }
+    }
+
     std::set<BasicBlock *> targetToPreds;
     // Map of function edges to list of values possible
     std::map<std::pair</*pred*/ BasicBlock *, /*successor*/ BasicBlock *>,
@@ -1970,10 +2332,23 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
               goto endCheck;
             }
             auto bi2 = cast<Instruction>(subblock->getTerminator());
-            auto cond2 = getOp(getBranchCondition(bi2));
-            if (cond2 == nullptr) {
-              assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
-              goto endCheck;
+            // Only the forward paths into bi2's two successors ran `subblock`.
+            // Computing its condition cond2 here, before the branch on cond1,
+            // also recomputes it on the path to the third incoming block, from
+            // values the forward pass never computed there. That is only safe
+            // when every instruction it is recomputed from may be speculated;
+            // a recomputed call can throw on those values (Julia's `sqrt` does
+            // for a negative argument). Otherwise compute cond2 in `bsplit`
+            // below, which only the reverse of the two paths reaches.
+            bool cond2BeforeSplit = safeToRecomputeOnAllPaths(
+                getBranchCondition(bi2), phi->getParent(), DT);
+            Value *cond2 = nullptr;
+            if (cond2BeforeSplit) {
+              cond2 = getOp(getBranchCondition(bi2));
+              if (cond2 == nullptr) {
+                assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
+                goto endCheck;
+              }
             }
 
             SmallVector<BasicBlock *, 3> predBlocks = {bi2->getSuccessor(0),
@@ -1990,10 +2365,37 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
             SmallVector<BasicBlock *, 2> blocks;
             SmallVector<BasicBlock *, 2> endingBlocks;
 
-            BasicBlock *last = oldB;
-
             BasicBlock *bret = BasicBlock::Create(
                 val->getContext(), oldB->getName() + "_phimerge", newFunc);
+
+            BasicBlock *bsplit = BasicBlock::Create(
+                val->getContext(), oldB->getName() + "_phisplt", newFunc);
+            bsplit->moveAfter(oldB);
+            if (inReverseBlocks)
+              reverseBlocks[fwd].push_back(bsplit);
+            reverseBlockToPrimal[bsplit] = fwd;
+            BasicBlock *splitEnd = bsplit;
+            if (!cond2BeforeSplit) {
+              BasicBlock *condBlock = BuilderM.GetInsertBlock();
+              for (auto pair : unwrap_cache[condBlock])
+                unwrap_cache[bsplit].insert(pair);
+              for (auto pair : lookup_cache[condBlock])
+                lookup_cache[bsplit].insert(pair);
+              auto condIP = BuilderM.saveIP();
+              BuilderM.SetInsertPoint(bsplit);
+              cond2 = getOp(getBranchCondition(bi2));
+              // Computing cond2 may itself have split `bsplit`: branch on it
+              // where that computation ended.
+              splitEnd = BuilderM.GetInsertBlock();
+              BuilderM.restoreIP(condIP);
+              if (cond2 == nullptr) {
+                eraseBlocks({bsplit}, bret);
+                assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
+                goto endCheck;
+              }
+            }
+
+            BasicBlock *last = splitEnd;
 
             for (size_t i = 0; i < predBlocks.size(); i++) {
               BasicBlock *valparent = (i < 2) ? subblock : block;
@@ -2010,9 +2412,14 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
               reverseBlockToPrimal[blocks[i]] = fwd;
               IRBuilder<> B(blocks[i]);
 
-              for (auto pair : unwrap_cache[oldB])
+              // The reverse of bi2's two successors is entered from
+              // `splitEnd`, so it may reuse what computing cond2 there
+              // computed.
+              BasicBlock *cacheFrom =
+                  (i < 2 && !cond2BeforeSplit) ? splitEnd : oldB;
+              for (auto pair : unwrap_cache[cacheFrom])
                 unwrap_cache[blocks[i]].insert(pair);
-              for (auto pair : lookup_cache[oldB])
+              for (auto pair : lookup_cache[cacheFrom])
                 lookup_cache[blocks[i]].insert(pair);
               auto PB = *done[std::make_pair(valparent, predBlocks[i])].begin();
 
@@ -2043,7 +2450,11 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
                     getOpFull(BuilderM, phi->getIncomingValueForBlock(PB), PB));
 
               if (!vals[i]) {
-                eraseBlocks(blocks, bret);
+                // `bsplit` last: the value blocks may use what it computed.
+                SmallVector<BasicBlock *, 4> toErase(blocks.begin(),
+                                                     blocks.end());
+                toErase.push_back(bsplit);
+                eraseBlocks(toErase, bret);
                 assert(unwrapMode != UnwrapMode::LegalFullUnwrap);
                 goto endCheck;
               }
@@ -2054,12 +2465,6 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
 
             bret->moveAfter(last);
 
-            BasicBlock *bsplit = BasicBlock::Create(
-                val->getContext(), oldB->getName() + "_phisplt", newFunc);
-            bsplit->moveAfter(oldB);
-            if (inReverseBlocks)
-              reverseBlocks[fwd].push_back(bsplit);
-            reverseBlockToPrimal[bsplit] = fwd;
             BuilderM.CreateCondBr(
                 cond1,
                 (done[std::make_pair(block, bi1->getSuccessor(0))].size() == 1)
@@ -2069,7 +2474,7 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
                     ? blocks[2]
                     : bsplit);
 
-            BuilderM.SetInsertPoint(bsplit);
+            BuilderM.SetInsertPoint(splitEnd);
             BuilderM.CreateCondBr(cond2, blocks[0], blocks[1]);
 
             BuilderM.SetInsertPoint(bret);
@@ -2576,6 +2981,103 @@ void GradientUtils::ensureLookupCached(Instruction *inst, bool shouldFree,
   storeInstructionInCache(lctx, inst, cache, TBAA);
 }
 
+bool GradientUtils::isIterationInvariant(const Value *V, const Loop *L,
+                                         unsigned depth) {
+  auto I = dyn_cast<Instruction>(V);
+  if (!I || !L->contains(I->getParent()))
+    return true;
+  // Bound the walk through operands; giving up only keeps the per-iteration
+  // cache.
+  if (depth > 8)
+    return false;
+
+  if (auto LI = dyn_cast<LoadInst>(I)) {
+    // An unordered load reads what the last write to its location stored. Its
+    // value is the same in every iteration if the location is, and no
+    // instruction executed during the loop (one of its instructions, or a
+    // callee of one) writes there.
+    if (!LI->isUnordered())
+      return false;
+    if (!isIterationInvariant(LI->getPointerOperand(), L, depth + 1))
+      return false;
+    auto found = loopWriters.find(L);
+    if (found == loopWriters.end()) {
+      SmallVector<Instruction *, 4> writers;
+      for (auto BB : L->blocks())
+        for (auto &W : *BB) {
+          if (!W.mayWriteToMemory())
+            continue;
+          // As for the uncacheable-load analysis, a fence orders other
+          // threads' accesses and writes nothing itself.
+          if (isa<FenceInst>(&W))
+            continue;
+          writers.push_back(&W);
+        }
+      found = loopWriters.emplace(L, std::move(writers)).first;
+    }
+    const Value *base = getBaseObject(LI->getPointerOperand());
+    for (auto W : found->second) {
+      // A write through the object the load reads from counts as a write of
+      // what it reads, whatever alias analysis concludes from attributes (it
+      // takes a store through a `noalias readonly` argument to write nothing).
+      const Value *dest = nullptr;
+      if (auto SI = dyn_cast<StoreInst>(W))
+        dest = SI->getPointerOperand();
+      else if (auto RMW = dyn_cast<AtomicRMWInst>(W))
+        dest = RMW->getPointerOperand();
+      else if (auto CX = dyn_cast<AtomicCmpXchgInst>(W))
+        dest = CX->getPointerOperand();
+      else if (auto MI = dyn_cast<MemIntrinsic>(W))
+        dest = MI->getDest();
+      if (dest && getBaseObject(dest) == base)
+        return false;
+      if (writesToMemoryReadBy(&TR, *OrigAA, TLI, const_cast<LoadInst *>(LI),
+                               W))
+        return false;
+    }
+    return true;
+  }
+
+  // Instructions that compute their result from their operands alone.
+  if (!isa<GetElementPtrInst>(I) && !isa<CastInst>(I) &&
+      !isa<BinaryOperator>(I) && !isa<CmpInst>(I) &&
+      !isa<ExtractValueInst>(I) && !isa<SelectInst>(I))
+    return false;
+  for (auto &op : I->operands())
+    if (!isIterationInvariant(op, L, depth + 1))
+      return false;
+  return true;
+}
+
+BasicBlock *
+GradientUtils::iterationInvariantCacheScope(const Instruction *orig) {
+  assert(orig->getParent()->getParent() == oldFunc);
+  auto found = iterationInvariantScopes.find(orig);
+  if (found != iterationInvariantScopes.end())
+    return found->second;
+
+  BasicBlock *scope = nullptr;
+  // Per-thread caches of OpenMP outlined regions keep their own layout.
+  if (EnzymeLoopInvariantCache && !omp) {
+    const Loop *outermost = nullptr;
+    for (const Loop *L = OrigLI->getLoopFor(orig->getParent()); L;
+         L = L->getParentLoop()) {
+      if (!isIterationInvariant(orig, L))
+        break;
+      outermost = L;
+    }
+    // Preprocessing gives every loop a preheader, which lies in the loops
+    // around `outermost` and no others, so a cache scoped there has one entry
+    // per entry of `outermost`. Every execution of `orig` in that entry
+    // stores the same value into it.
+    if (outermost)
+      if (auto preheader = outermost->getLoopPreheader())
+        scope = cast<BasicBlock>(getNewFromOriginal(preheader));
+  }
+  iterationInvariantScopes[orig] = scope;
+  return scope;
+}
+
 Value *GradientUtils::fixLCSSA(Instruction *inst, BasicBlock *forwardBlock,
                                bool legalInBlock) {
   assert(inst->getName() != "<badref>");
@@ -2804,7 +3306,8 @@ static Value *rebuildUncachedTapeArg(GradientUtils &gutils,
 }
 
 Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
-                                      int idx, bool replace) {
+                                      int idx, bool replace,
+                                      const Instruction *orig) {
   assert(malloc);
   assert(BuilderQ.GetInsertBlock()->getParent() == newFunc);
   assert(isOriginalBlock(*BuilderQ.GetInsertBlock()));
@@ -2813,6 +3316,22 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     assert(!tape);
     return malloc;
   }
+
+  // The block whose loops index this cache, when the value does not change
+  // across iterations of some loops around it (iterationInvariantCacheScope).
+  // The augmented pass, which writes the tape, and the reverse pass, which
+  // reads it, decide this from the same original instruction. A cache that
+  // already exists keeps its own scope.
+  BasicBlock *hoisted = nullptr;
+  if (!orig)
+    if (auto inst = dyn_cast<Instruction>(malloc))
+      orig = isOriginal(inst);
+  if (orig)
+    hoisted = iterationInvariantCacheScope(orig);
+  if (hoisted)
+    if (auto found = findInMap(scopeMap, malloc))
+      if (found->second.Block != hoisted)
+        hoisted = nullptr;
 
 #ifndef NDEBUG
   if (auto CI = dyn_cast<CallInst>(malloc)) {
@@ -2890,6 +3409,18 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     Value *ret =
         (idx < 0) ? tape : BuilderQ.CreateExtractValue(tape, {(unsigned)idx});
 
+    // A value read back from the tape has the type of the value that was
+    // stored there. Say so, as a lookup of a cached value does: differentiating
+    // this function again otherwise meets an integer of unknown type, which may
+    // be a pointer, so it counts as active and its arithmetic has no derivative.
+    MDNode *tapeValueType = nullptr;
+    if (isa<Instruction>(malloc))
+      if (auto *origInst = isOriginal(malloc)) {
+        TypeTree TT = TR.query(origInst);
+        if (TT.isKnown())
+          tapeValueType = TT.toMD(malloc->getContext());
+      }
+
     if (ret->getType()->isEmptyTy()) {
       if (auto inst = dyn_cast_or_null<Instruction>(malloc)) {
         if (inst->getType() != ret->getType()) {
@@ -2916,6 +3447,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     if (auto inst = dyn_cast<Instruction>(malloc))
       ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0,
                          inst->getParent());
+    if (hoisted)
+      ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0, hoisted);
     if (auto found = findInMap(scopeMap, malloc)) {
       ctx = found->second;
     }
@@ -2960,7 +3493,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                                 /*inForwardPass*/ true, nullptr,
                                 LimitContext(
                                     /*ReverseLimit*/ reverseBlocks.size() > 0,
-                                    BuilderQ.GetInsertBlock()))
+                                    hoisted ? hoisted
+                                            : BuilderQ.GetInsertBlock()))
                                 .size();
              i < limit; ++i) {
           if (!isa<PointerType>(innerType)) {
@@ -3029,7 +3563,7 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
       }
 
       LimitContext lctx(/*ReverseLimit*/ reverseBlocks.size() > 0,
-                        BuilderQ.GetInsertBlock());
+                        hoisted ? hoisted : BuilderQ.GetInsertBlock());
       AllocaInst *cache =
           createCacheForScope(lctx, innerType, "mdyncache_fromtape",
                               ((DiffeGradientUtils *)this)->FreeMemory, false);
@@ -3067,6 +3601,10 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
         llvm::errs() << *ret << "\n";
       }
       assert(malloc->getType() == ret->getType());
+
+      if (tapeValueType)
+        if (auto *retInst = dyn_cast<Instruction>(ret))
+          retInst->setMetadata("enzyme_type", tapeValueType);
 
       if (replace) {
         auto found = newToOriginalFn.find(malloc);
@@ -3120,6 +3658,9 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                                << " idx=" << idx << " - tape=" << *tape << "\n";
                 }
                 assert(li->getType() == replacewith->getType());
+                if (tapeValueType)
+                  if (auto *replaceInst = dyn_cast<Instruction>(replacewith))
+                    replaceInst->setMetadata("enzyme_type", tapeValueType);
                 li->replaceAllUsesWith(replacewith);
               } else {
                 auto phi =
@@ -3261,6 +3802,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     if (auto inst = dyn_cast<Instruction>(malloc))
       ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0,
                          inst->getParent());
+    if (hoisted)
+      ctx = LimitContext(/*ReverseLimit*/ reverseBlocks.size() > 0, hoisted);
     if (auto found = findInMap(scopeMap, malloc)) {
       ctx = found->second;
     }
@@ -3302,7 +3845,7 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     ensureLookupCached(
         cast<Instruction>(malloc),
         /*shouldFree=*/reverseBlocks.size() > 0,
-        /*scope*/ nullptr,
+        /*scope*/ hoisted,
         cast<Instruction>(malloc)->getMetadata(LLVMContext::MD_tbaa));
     auto found2 = scopeMap.find(malloc);
     assert(found2 != scopeMap.end());
@@ -3329,7 +3872,8 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                               /*inForwardPass*/ true, nullptr,
                               LimitContext(
                                   /*ReverseLimit*/ reverseBlocks.size() > 0,
-                                  BuilderQ.GetInsertBlock()))
+                                  hoisted ? hoisted
+                                          : BuilderQ.GetInsertBlock()))
                               .size();
            i < limit; ++i) {
         innerType = innerType->getPointerElementType();
@@ -3801,13 +4345,20 @@ BasicBlock *GradientUtils::prepRematerializedLoopEntry(LoopContext &lc) {
 
               anti = shadowHandlers[funcName](NB, orig, args, this);
             } else {
-              auto Defs =
-                  getAllocationZeroingBundles(orig, NB, /*lookup*/ true);
+              // On a Julia that zeroes allocations in late-gc-lowering, let it
+              // zero the whole shadow instead of emitting a memset.
+              bool zeroWithBundle = !hasMetadata(orig, "enzyme_fromstack") &&
+                                    canZeroAllocationWithBundle(orig);
+              auto Defs = getAllocationZeroingBundles(orig, NB, /*lookup*/ true,
+                                                      zeroWithBundle ? args[1]
+                                                                     : nullptr);
               auto rule = [&]() {
                 Value *anti = NB.CreateCall(orig->getFunctionType(),
                                             orig->getCalledOperand(), args,
                                             Defs, orig->getName() + "'mi");
                 cast<CallInst>(anti)->setAttributes(orig->getAttributes());
+                if (zeroWithBundle)
+                  markAllocationZeroed(cast<CallInst>(anti));
                 cast<CallInst>(anti)->setCallingConv(orig->getCallingConv());
                 cast<CallInst>(anti)->setDebugLoc(
                     getNewFromOriginal(I.getDebugLoc()));
@@ -3848,12 +4399,13 @@ BasicBlock *GradientUtils::prepRematerializedLoopEntry(LoopContext &lc) {
                 anti = replacement;
               }
 
-              applyChainRule(
-                  NB,
-                  [&](Value *anti) {
-                    zeroKnownAllocation(NB, anti, args, funcName, TLI, orig);
-                  },
-                  anti);
+              if (!zeroWithBundle)
+                applyChainRule(
+                    NB,
+                    [&](Value *anti) {
+                      zeroKnownAllocation(NB, anti, args, funcName, TLI, orig);
+                    },
+                    anti);
             }
           } else {
             llvm_unreachable("Unknown shadow rematerialization value");
@@ -3921,9 +4473,10 @@ BasicBlock *GradientUtils::prepRematerializedLoopEntry(LoopContext &lc) {
           newDest = remap(SI->getDefaultDest());
         else {
           for (auto cas : SI->cases()) {
-            if (!notForAnalysis.count(cas.getCaseSuccessor()))
+            if (!notForAnalysis.count(cas.getCaseSuccessor())) {
               newDest = remap(cas.getCaseSuccessor());
-            break;
+              break;
+            }
           }
         }
         if (!newDest) {
@@ -7130,6 +7683,251 @@ static bool addRecsCorrespond(const SCEVAddRecExpr *ar1,
   return !L1->contains(L2) && !L2->contains(L1);
 }
 
+GradientUtils::LoopEntryRecompute GradientUtils::mergeRecomputesAtLoopEntry(
+    PHINode *phi, const BasicBlock *origExit, IRBuilder<> &BuilderM,
+    unsigned depth) {
+  if (!EnzymeReverseLoopEntryMerges)
+    return LoopEntryRecompute::No;
+  // A loop-carried phi depends on the iteration it is read for. legalRecompute
+  // below refuses one that reads the last value of a finished loop.
+  BasicBlock *parent = phi->getParent();
+  BasicBlock *origParent = isOriginal(parent);
+  if (!origParent || OrigLI->isLoopHeader(origParent) ||
+      phi->getNumIncomingValues() == 0)
+    return LoopEntryRecompute::No;
+  ValueToValueMapTy noneAvailable;
+  if (!legalRecompute(phi, noneAvailable, &BuilderM) ||
+      !shouldRecompute(phi, noneAvailable, &BuilderM))
+    return LoopEntryRecompute::No;
+
+  for (auto &op : phi->incoming_values())
+    if (auto opinst = dyn_cast<Instruction>(op))
+      if (recomputesAnywhereInReverse(opinst, origExit, BuilderM, depth + 1,
+                                      /*inMerge*/ true) ==
+          LoopEntryRecompute::No)
+        return LoopEntryRecompute::No;
+
+  // The recomputation branches again on the conditions that chose the path, in
+  // the blocks between the merge and the block that dominates it. They have to
+  // be readable there too, and no loop may lie between.
+  const Loop *mergeLoop = LI.getLoopFor(parent);
+  SmallVector<BasicBlock *, 8> todo(phi->block_begin(), phi->block_end());
+  SmallPtrSet<BasicBlock *, 8> seen;
+  while (!todo.empty()) {
+    BasicBlock *block = todo.pop_back_val();
+    if (!seen.insert(block).second)
+      continue;
+    if (seen.size() > 16 || LI.getLoopFor(block) != mergeLoop)
+      return LoopEntryRecompute::No;
+    Instruction *term = block->getTerminator();
+    Value *cond = nullptr;
+    if (auto SI = dyn_cast<SwitchInst>(term))
+      cond = SI->getCondition();
+    else if (!isAnyBranch(term))
+      return LoopEntryRecompute::No;
+    else if (!isUnconditionalBranch(term))
+      cond = getBranchCondition(term);
+    if (auto condinst = dyn_cast_or_null<Instruction>(cond))
+      if (recomputesAnywhereInReverse(condinst, origExit, BuilderM, depth + 1,
+                                      /*inMerge*/ true) ==
+          LoopEntryRecompute::No)
+        return LoopEntryRecompute::No;
+    if (DT.dominates(block, parent))
+      continue;
+    for (BasicBlock *pred : predecessors(block))
+      todo.push_back(pred);
+  }
+  return LoopEntryRecompute::Merge;
+}
+
+bool GradientUtils::primalValueAvailableInReverse(
+    const BasicBlock *origDef, const BasicBlock *origUse) const {
+  if (!BlocksDominatingAllReturns.count(origDef))
+    return false;
+
+  // The original SSA value is the last forward iteration's value. It is the
+  // right value only if the definition and use share no enclosing loop.
+  for (Loop *L = OrigLI->getLoopFor(origDef); L; L = L->getParentLoop())
+    if (L->contains(origUse))
+      return false;
+  return true;
+}
+
+GradientUtils::LoopEntryRecompute GradientUtils::recomputesAnywhereInReverse(
+    Instruction *inst, const BasicBlock *origExit, IRBuilder<> &BuilderM,
+    unsigned depth, bool inMerge) {
+  if (inversionAllocs && inst->getParent() == inversionAllocs)
+    return LoopEntryRecompute::Plain;
+  // Every lookup of a value along a chain asks this again for the values below
+  // it, and legalRecompute can walk the function. Loop-carried phis end the
+  // recursion, so it never meets the entry made here before it is settled.
+  auto key = std::make_tuple((const Instruction *)inst, origExit, inMerge);
+  auto found = recomputableAtLoopEntry.find(key);
+  if (found != recomputableAtLoopEntry.end())
+    return found->second;
+  recomputableAtLoopEntry[key] = LoopEntryRecompute::No;
+  if (depth > 32)
+    return LoopEntryRecompute::No;
+
+  // Only values of the original function: shadows and caches have their own
+  // rules about where they may be read in the reverse pass.
+  Instruction *orig = isOriginal(inst);
+  if (!orig)
+    return LoopEntryRecompute::No;
+
+  // lookupM can use this value directly from the forward pass. Its operands
+  // need not be recomputable: for example, an allocation that still dominates
+  // the reverse pass, or a scalar loaded before its memory was overwritten.
+  // Register reduction can ask lookupM to recompute even a dominating value.
+  if (!EnzymeRegisterReduce)
+    if (primalValueAvailableInReverse(orig->getParent(), origExit))
+      return recomputableAtLoopEntry[key] = LoopEntryRecompute::Plain;
+
+  if (auto phi = dyn_cast<PHINode>(inst)) {
+    // The induction variable of a loop still running at the exit is read from
+    // that loop's reverse counter, wherever it is read.
+    LoopContext lc;
+    if (getContext(phi->getParent(), lc) && lc.var == phi)
+      return recomputableAtLoopEntry[key] =
+                 OrigLI->getLoopFor(orig->getParent())->contains(origExit)
+                     ? LoopEntryRecompute::Plain
+                     : LoopEntryRecompute::No;
+    // Any other phi is rebuilt as a branch on what chose its path.
+    return recomputableAtLoopEntry[key] =
+               mergeRecomputesAtLoopEntry(phi, origExit, BuilderM, depth);
+  }
+
+  if (isa<LoadInst>(inst)) {
+    // A load may stand for another instruction of the original function, which
+    // legalRecompute judges by that instruction.
+    auto origLoad = dyn_cast<LoadInst>(orig);
+    if (!origLoad)
+      return LoopEntryRecompute::No;
+    // Such memory is only valid again once the reverse pass has replayed its
+    // allocation and stores, which it does at a position of its own.
+    for (const auto &pair : rematerializableAllocations)
+      if (llvm::is_contained(pair.second.loads, origLoad))
+        return LoopEntryRecompute::No;
+  } else if (isa<CallInst>(inst)) {
+    // legalRecompute below decides which calls can run again. An allocation it
+    // may allow is the reverse pass's to replay.
+    if (rematerializableAllocations.count(orig))
+      return LoopEntryRecompute::No;
+  } else if (!isa<GetElementPtrInst>(inst) && !isa<CastInst>(inst) &&
+             !isa<BinaryOperator>(inst) && !isa<UnaryOperator>(inst) &&
+             !isa<CmpInst>(inst) && !isa<SelectInst>(inst) &&
+             !isa<ExtractValueInst>(inst) && !isa<FreezeInst>(inst)) {
+    return LoopEntryRecompute::No;
+  }
+
+  ValueToValueMapTy noneAvailable;
+  if (!legalRecompute(inst, noneAvailable, &BuilderM) ||
+      !shouldRecompute(inst, noneAvailable, &BuilderM)) {
+    // What a merge computes on one of its paths may be read from a cache, such
+    // as the result of a call that carries derivatives: the recomputation reads
+    // it on that path only, for the same indices wherever it is placed. A value
+    // of a sibling loop is read through the last value of that loop.
+    if (!inMerge)
+      return LoopEntryRecompute::No;
+    const Loop *defLoop = OrigLI->getLoopFor(orig->getParent());
+    return recomputableAtLoopEntry[key] =
+               (!defLoop || defLoop->contains(origExit))
+                   ? LoopEntryRecompute::Plain
+                   : LoopEntryRecompute::No;
+  }
+
+  LoopEntryRecompute result = LoopEntryRecompute::Plain;
+  for (auto &op : inst->operands())
+    if (auto opinst = dyn_cast<Instruction>(op)) {
+      auto opresult = recomputesAnywhereInReverse(opinst, origExit, BuilderM,
+                                                  depth + 1, inMerge);
+      if (opresult == LoopEntryRecompute::No)
+        return LoopEntryRecompute::No;
+      if (opresult == LoopEntryRecompute::Merge)
+        result = LoopEntryRecompute::Merge;
+    }
+  return recomputableAtLoopEntry[key] = result;
+}
+
+BasicBlock *GradientUtils::reverseLoopEntryForRecompute(
+    Instruction *inst, IRBuilder<> &BuilderM,
+    const ValueToValueMapTy &available, bool &branches) {
+  branches = false;
+  // The reverse of an OpenMP outlined region keeps its own loop structure.
+  if (!EnzymeReverseLoopEntryRecompute || omp)
+    return nullptr;
+  if (mode != DerivativeMode::ReverseModeCombined &&
+      mode != DerivativeMode::ReverseModeGradient)
+    return nullptr;
+
+  Instruction *orig = isOriginal(inst);
+  if (!orig)
+    return nullptr;
+
+  // Blocks that replay a loop's forward pass (prepRematerializedLoopEntry) also
+  // map to a forward block, but are not its reverse.
+  BasicBlock *reverse = BuilderM.GetInsertBlock();
+  BasicBlock *forward = originalForReverseBlock(*reverse);
+  auto foundReverse = reverseBlocks.find(forward);
+  if (foundReverse == reverseBlocks.end() ||
+      !llvm::is_contained(foundReverse->second, reverse))
+    return nullptr;
+  BasicBlock *origUse = isOriginal(forward);
+  if (!origUse)
+    return nullptr;
+
+  // Only out of an innermost loop, and one level: the entry of a loop's reverse
+  // is itself in the loop around it, which is not innermost. Going further
+  // would compute less often, but a Memory the value is read from must then
+  // stay rooted across every call in the loops in between, a store per root per
+  // call.
+  const Loop *L = OrigLI->getLoopFor(origUse);
+  BasicBlock *origDef = orig->getParent();
+  if (!L || !L->getSubLoops().empty() || L->contains(origDef))
+    return nullptr;
+  // A definition in a sibling loop is read through the last value of that loop.
+  const Loop *defLoop = OrigLI->getLoopFor(origDef);
+  if (defLoop && !defLoop->contains(L))
+    return nullptr;
+
+  // The reverse of the loop's one exit (not counting blocks that only lead to
+  // unreachable) dominates all of the loop's reverse. Every forward path to
+  // that exit has run the definition, for the indices of the loops around it,
+  // which still have the same values here. So the recomputation only reads
+  // memory the primal read, and evaluates nothing the primal did not.
+  SmallPtrSet<BasicBlock *, 8> exits;
+  getExitBlocks(L, exits);
+  if (exits.size() != 1)
+    return nullptr;
+  BasicBlock *origExit = *exits.begin();
+  if (defLoop && !defLoop->contains(origExit))
+    return nullptr;
+  if (!OrigDT->dominates(origDef, origExit))
+    return nullptr;
+  auto foundExit = reverseBlocks.find(getNewFromOriginal(origExit));
+  if (foundExit == reverseBlocks.end() || foundExit->second.empty())
+    return nullptr;
+  BasicBlock *entry = foundExit->second.back();
+
+  // What the caller made available in its own block must not be needed: lookupM
+  // reads the loop counters again in the entry.
+  for (const auto &pair : available) {
+    auto phi = dyn_cast<PHINode>(const_cast<Value *>(pair.first));
+    LoopContext lc;
+    if (!phi || !getContext(phi->getParent(), lc) || lc.var != phi)
+      return nullptr;
+  }
+
+  IRBuilder<> B(entry);
+  if (hasTerminator(entry))
+    B.SetInsertPoint(entry->getTerminator());
+  auto recompute = recomputesAnywhereInReverse(inst, origExit, B);
+  if (recompute == LoopEntryRecompute::No)
+    return nullptr;
+  branches = recompute == LoopEntryRecompute::Merge;
+  return entry;
+}
+
 Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
                               const ValueToValueMapTy &incoming_available,
                               bool tryLegalRecomputeCheck, BasicBlock *scope) {
@@ -7245,36 +8043,12 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
       }
       assert(orig);
 
-      // TODO upgrade this to be all returns that this could enter from
-      bool legal = BlocksDominatingAllReturns.count(orig);
-      if (legal) {
-
+      if (BlocksDominatingAllReturns.count(orig)) {
         BasicBlock *forwardBlock =
             isOriginal(originalForReverseBlock(*BuilderM.GetInsertBlock()));
         assert(forwardBlock);
-
-        // Don't allow this if we're not definitely using the last iteration of
-        // this value
-        //   + either because the value isn't in a loop
-        //   + or because the forward of the block usage location isn't in a
-        //   loop (thus last iteration)
-        //   + or because the loop nests share no ancestry
-
-        bool loopLegal = true;
-        for (Loop *idx = OrigLI->getLoopFor(orig); idx != nullptr;
-             idx = idx->getParentLoop()) {
-          for (Loop *fdx = OrigLI->getLoopFor(forwardBlock); fdx != nullptr;
-               fdx = fdx->getParentLoop()) {
-            if (idx == fdx) {
-              loopLegal = false;
-              break;
-            }
-          }
-        }
-
-        if (loopLegal) {
+        if (primalValueAvailableInReverse(orig, forwardBlock))
           return inst;
-        }
       }
     }
   }
@@ -7289,6 +8063,51 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
       assert(result->getType());
       result = BuilderM.CreateBitCast(result, val->getType());
       assert(result->getType() == inst->getType());
+      return result;
+    }
+  }
+
+  // A value that does not change in a loop around this reverse block is the
+  // same for every iteration of that loop's reverse, so compute it once on
+  // entry rather than again in each block of the reverse that uses it.
+  if (!reduceRegister && tryLegalRecomputeCheck &&
+      !isOriginalBlock(*BuilderM.GetInsertBlock()) &&
+      BuilderM.GetInsertBlock() != inversionAllocs) {
+    bool branches = false;
+    if (BasicBlock *entry = reverseLoopEntryForRecompute(
+            inst, BuilderM, incoming_available, branches)) {
+      IRBuilder<> B(entry);
+      // unwrapM rebuilds a merge of branches by ending the block it is in, so
+      // the block's own terminator moves to a new block that follows them.
+      BasicBlock *tail = nullptr;
+      if (hasTerminator(entry)) {
+        if (branches && !lookup_cache[entry].count(val)) {
+          tail = BasicBlock::Create(entry->getContext(),
+                                    entry->getName() + "_loopentry", newFunc);
+          tail->moveAfter(entry);
+          entry->getTerminator()->moveBefore(*tail, tail->end());
+          tail->replaceSuccessorsPhiUsesWith(entry, tail);
+          B.SetInsertPoint(entry);
+        } else {
+          B.SetInsertPoint(entry->getTerminator());
+        }
+      }
+      B.SetCurrentDebugLocation(BuilderM.getCurrentDebugLocation());
+      B.setFastMathFlags(BuilderM.getFastMathFlags());
+      Value *result = lookupM(val, B);
+      if (tail) {
+        BasicBlock *last = B.GetInsertBlock();
+        BasicBlock *fwd = reverseBlockToPrimal[entry];
+        tail->moveAfter(last);
+        B.CreateBr(tail);
+        reverseBlocks[fwd].push_back(tail);
+        reverseBlockToPrimal[tail] = fwd;
+        for (auto pair : unwrap_cache[last])
+          unwrap_cache[tail].insert(pair);
+        for (auto pair : lookup_cache[last])
+          lookup_cache[tail].insert(pair);
+      }
+      lookup_cache[BuilderM.GetInsertBlock()][val] = result;
       return result;
     }
   }
@@ -7527,6 +8346,21 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
                       //    << " step2: " << *ar2->getStepRecurrence(SE) <<
                       //    "\n";
 
+                      // Equal recurrences in sibling loops have equal values
+                      // at corresponding iterations, but distinct reverse
+                      // counters. Read the earlier cache at this loop's index,
+                      // not at the earlier loop's (possibly uninitialized)
+                      // reverse counter. Keep the outer cache dimensions in
+                      // the same loop nest; other nests need their own mapping.
+                      if (ar1->getLoop() != ar2->getLoop()) {
+                        if (ar1->getLoop()->getParentLoop() !=
+                            ar2->getLoop()->getParentLoop())
+                          continue;
+                        auto current = available.find(l1.var);
+                        if (current == available.end() || !current->second)
+                          continue;
+                        available[l2.var] = current->second;
+                      }
                       inst = li2;
                       break;
                     }
@@ -8245,6 +9079,24 @@ Value *GradientUtils::lookupM(Value *val, IRBuilder<> &BuilderM,
     }
   }
 
+  // A value the same in every iteration of some loops around it is cached
+  // once per entry of the outermost such loop, as cacheForReverse does, which
+  // takes over a cache made here and must find it in that scope: the reverse
+  // pass looks up the shadow of a load before it visits the load. So the
+  // shadow of a load is scoped as the load is.
+  if (scopeI == inst->getParent() && scopeMap.find(inst) == scopeMap.end()) {
+    const Instruction *origForScope = isOriginal(inst);
+    if (!origForScope)
+      for (const auto &pair : invertedPointers)
+        if (pair.second == inst) {
+          origForScope = dyn_cast<LoadInst>(pair.first);
+          break;
+        }
+    if (origForScope)
+      if (auto hoisted = iterationInvariantCacheScope(origForScope))
+        scopeI = hoisted;
+  }
+
   ensureLookupCached(inst, /*shouldFree*/ true, scopeI,
                      inst->getMetadata(LLVMContext::MD_tbaa));
   bool isi1 = inst->getType()->isIntegerTy() &&
@@ -8308,6 +9160,278 @@ BasicBlock *GradientUtils::originalForReverseBlock(BasicBlock &BB2) const {
 //   * If replacePHIs isn't null, do not perform the branch and instead replace
 //   the PHI's with the derived condition as to whether we should branch to a
 //   particular target
+/// Whether `cond` can be recomputed on every path into the reverse of `ctx`,
+/// including paths on which the forward pass never computed it: every
+/// instruction it is computed from that is not guaranteed to have run before
+/// `ctx` must be safe to execute on values that block never saw.
+static bool safeToRecomputeOnAllPaths(Value *cond, BasicBlock *ctx,
+                                      DominatorTree &DT) {
+  SmallVector<Instruction *, 8> todo;
+  SmallPtrSet<Instruction *, 8> seen;
+  if (auto I = dyn_cast<Instruction>(cond))
+    todo.push_back(I);
+  while (!todo.empty()) {
+    auto I = todo.pop_back_val();
+    if (!seen.insert(I).second)
+      continue;
+    if (DT.dominates(I->getParent(), ctx))
+      continue;
+    if (isa<PHINode>(I) || !isSafeToSpeculativelyExecute(I))
+      return false;
+    for (auto &op : I->operands())
+      if (auto OI = dyn_cast<Instruction>(op))
+        todo.push_back(OI);
+  }
+  return true;
+}
+
+bool GradientUtils::branchByRecomputedPredicates(
+    BasicBlock *ctx, IRBuilder<> &BuilderM,
+    const std::map<BasicBlock *,
+                   std::vector<std::pair</*pred*/ BasicBlock *,
+                                         /*successor*/ BasicBlock *>>>
+        &targetToPreds,
+    const std::map<std::pair<BasicBlock *, BasicBlock *>,
+                   std::set<BasicBlock *>> &done,
+    const std::map<BasicBlock *, PHINode *> *replacePHIs) {
+  if (!EnzymeRecomputeBranchPredicates)
+    return false;
+  // Outside a loop the cache is a single slot, which later passes fold into
+  // the branches that fill it. Inside one it holds an entry per iteration.
+  if (!LI.getLoopFor(ctx))
+    return false;
+  // The conditions are looked up as reverse-pass values.
+  if (isOriginalBlock(*BuilderM.GetInsertBlock()))
+    return false;
+
+  // The region: the source of every edge on a path into a target, up to the
+  // first block on each path that dominates ctx. That block is the same on
+  // every path, the root, and the forward pass ran it whenever it ran ctx.
+  SmallSetVector<BasicBlock *, 8> region;
+  for (const auto &pair : done)
+    region.insert(pair.first.first);
+  if (region.size() > 64)
+    return false;
+  BasicBlock *root = nullptr;
+  for (auto B : region)
+    if (DT.dominates(B, ctx)) {
+      if (root)
+        return false;
+      root = B;
+    }
+  if (!root)
+    return false;
+
+  // Every path from root to a target edge must lie in one iteration of every
+  // loop around it: no block but root may be a loop header (the walk that
+  // built `done` does not follow backedges), and the order below must exist.
+  for (auto B : region) {
+    auto term = B->getTerminator();
+    if (!term || (!isAnyBranch(term) && !isa<SwitchInst>(term)))
+      return false;
+    if (B != root)
+      if (auto L = LI.getLoopFor(B))
+        if (L->getHeader() == B)
+          return false;
+  }
+  std::map<BasicBlock *, unsigned> inDegree;
+  for (const auto &pair : done)
+    if (region.count(pair.first.second) && pair.first.second != root)
+      inDegree[pair.first.second]++;
+    else if (pair.first.second == root)
+      return false;
+  SmallVector<BasicBlock *, 8> order;
+  order.push_back(root);
+  for (size_t i = 0; i < order.size(); ++i) {
+    BasicBlock *B = order[i];
+    SmallPtrSet<BasicBlock *, 4> succs;
+    for (BasicBlock *S : successors(B))
+      if (done.count(std::make_pair(B, S)) && region.count(S) &&
+          succs.insert(S).second)
+        if (--inDegree[S] == 0)
+          order.push_back(S);
+  }
+  if (order.size() != region.size())
+    return false;
+
+  // Every condition is evaluated on every path into ctx, also on paths on
+  // which the forward pass never computed it, so it must be safe to compute
+  // there, and from recomputed values only: a cache of a value the forward
+  // pass computed on some paths only would be read where it was never
+  // written. Values of blocks that dominate ctx ran whenever ctx ran.
+  const ValueToValueMapTy noAvailable;
+  for (auto B : region) {
+    auto term = B->getTerminator();
+    Value *cond = nullptr;
+    if (isConditionalBranch(term))
+      cond = getBranchCondition(term);
+    else if (auto SI = dyn_cast<SwitchInst>(term))
+      cond = SI->getCondition();
+    if (!cond)
+      continue;
+    if (!safeToRecomputeOnAllPaths(cond, ctx, DT))
+      return false;
+    SmallVector<Instruction *, 8> todo;
+    SmallPtrSet<Instruction *, 8> seen;
+    if (auto I = dyn_cast<Instruction>(cond))
+      todo.push_back(I);
+    while (!todo.empty()) {
+      auto I = todo.pop_back_val();
+      if (!seen.insert(I).second)
+        continue;
+      if (DT.dominates(I->getParent(), ctx))
+        continue;
+      if (!legalRecompute(I, noAvailable, &BuilderM) ||
+          !shouldRecompute(I, noAvailable, &BuilderM))
+        return false;
+      for (auto &op : I->operands())
+        if (auto OI = dyn_cast<Instruction>(op))
+          todo.push_back(OI);
+    }
+  }
+  if (replacePHIs)
+    for (const auto &pair : *replacePHIs)
+      if (targetToPreds.find(pair.first) == targetToPreds.end())
+        return false;
+
+  // Replay the forward decisions: reach[B] holds iff the forward pass ran B in
+  // this execution of the region. Conjunctions and disjunctions are selects,
+  // so a condition of a block that did not run never decides anything.
+  LLVMContext &C = BuilderM.getContext();
+  Value *True = ConstantInt::getTrue(C);
+  Value *False = ConstantInt::getFalse(C);
+  std::map<BasicBlock *, Value *> conds;
+  auto edgeTaken = [&](BasicBlock *B, BasicBlock *S) -> Value * {
+    auto term = B->getTerminator();
+    if (isUnconditionalBranch(term))
+      return True;
+    auto found = conds.find(B);
+    Value *cond;
+    if (found != conds.end())
+      cond = found->second;
+    else {
+      Value *orig = isConditionalBranch(term)
+                        ? getBranchCondition(term)
+                        : cast<SwitchInst>(term)->getCondition();
+      cond = conds[B] = lookupM(orig, BuilderM);
+    }
+    if (isConditionalBranch(term)) {
+      bool to0 = term->getSuccessor(0) == S, to1 = term->getSuccessor(1) == S;
+      if (to0 && to1)
+        return True;
+      return to0 ? cond : BuilderM.CreateNot(cond);
+    }
+    auto SI = cast<SwitchInst>(term);
+    Value *taken = False;
+    Value *isDefault = True;
+    for (auto c : SI->cases()) {
+      Value *eq = BuilderM.CreateICmpEQ(cond, c.getCaseValue());
+      isDefault = BuilderM.CreateSelect(eq, False, isDefault);
+      if (c.getCaseSuccessor() == S)
+        taken = BuilderM.CreateSelect(eq, True, taken);
+    }
+    if (SI->getDefaultDest() == S)
+      taken = BuilderM.CreateSelect(isDefault, True, taken);
+    return taken;
+  };
+  std::map<BasicBlock *, Value *> reach;
+  reach[root] = True;
+  for (auto B : order) {
+    if (B != root) {
+      Value *r = False;
+      // Each distinct edge once: a switch can list a successor many times.
+      SmallPtrSet<BasicBlock *, 4> seenPreds;
+      for (BasicBlock *P : predecessors(B)) {
+        if (!seenPreds.insert(P).second)
+          continue;
+        if (!done.count(std::make_pair(P, B)) || !reach.count(P))
+          continue;
+        r = BuilderM.CreateSelect(
+            BuilderM.CreateSelect(reach[P], edgeTaken(P, B), False), True, r);
+      }
+      reach[B] = r;
+    }
+  }
+  // Number the targets in the order the region reaches their edges, so the
+  // emitted code does not depend on where blocks happen to be allocated.
+  std::map<BasicBlock *, size_t> position;
+  for (size_t i = 0; i < order.size(); ++i)
+    position[order[i]] = i;
+  auto edgeRank = [&](const std::pair<BasicBlock *, BasicBlock *> &edge) {
+    size_t succ = 0;
+    auto term = edge.first->getTerminator();
+    while (succ < term->getNumSuccessors() &&
+           term->getSuccessor(succ) != edge.second)
+      ++succ;
+    return std::make_pair(position[edge.first], succ);
+  };
+  SmallVector<std::pair<std::pair<size_t, size_t>, BasicBlock *>, 4> ranked;
+  for (const auto &pair : targetToPreds) {
+    auto best = edgeRank(pair.second.front());
+    for (const auto &edge : pair.second)
+      best = std::min(best, edgeRank(edge));
+    ranked.push_back(std::make_pair(best, pair.first));
+  }
+  std::sort(ranked.begin(), ranked.end());
+  SmallVector<BasicBlock *, 4> targets;
+  std::map<BasicBlock *, Value *> targetTaken;
+  for (const auto &rankedTarget : ranked) {
+    BasicBlock *target = rankedTarget.second;
+    const auto &preds = targetToPreds.find(target)->second;
+    SmallVector<std::pair<BasicBlock *, BasicBlock *>, 4> edges;
+    for (const auto &edge : preds)
+      if (std::find(edges.begin(), edges.end(), edge) == edges.end())
+        edges.push_back(edge);
+    std::sort(edges.begin(), edges.end(),
+              [&](const std::pair<BasicBlock *, BasicBlock *> &a,
+                  const std::pair<BasicBlock *, BasicBlock *> &b) {
+                return edgeRank(a) < edgeRank(b);
+              });
+    Value *t = False;
+    for (const auto &edge : edges)
+      t = BuilderM.CreateSelect(
+          BuilderM.CreateSelect(reach[edge.first],
+                                edgeTaken(edge.first, edge.second), False),
+          True, t);
+    targets.push_back(target);
+    targetTaken[target] = t;
+  }
+
+  if (replacePHIs == nullptr) {
+    assert(BuilderM.GetInsertBlock()->size() == 0 ||
+           !isAnyBranch(&BuilderM.GetInsertBlock()->back()));
+    if (targets.size() == 1) {
+      BuilderM.CreateBr(targets[0]);
+    } else if (targets.size() == 2) {
+      BuilderM.CreateCondBr(targetTaken[targets[1]], targets[1], targets[0]);
+    } else {
+      IntegerType *T =
+          targets.size() < 256 ? Type::getInt8Ty(C) : Type::getInt32Ty(C);
+      Value *which = ConstantInt::get(T, targets.size() - 1);
+      for (size_t i = targets.size() - 1; i-- > 0;)
+        which = BuilderM.CreateSelect(targetTaken[targets[i]],
+                                      ConstantInt::get(T, i), which);
+      auto swit =
+          BuilderM.CreateSwitch(which, targets.back(), targets.size() - 1);
+      for (unsigned i = 0; i < targets.size() - 1; ++i)
+        swit->addCase(ConstantInt::get(T, i), targets[i]);
+    }
+  } else {
+    for (const auto &pair : *replacePHIs) {
+      Value *val = targetTaken[pair.first];
+      if (&*BuilderM.GetInsertPoint() == pair.second) {
+        if (pair.second->getNextNode())
+          BuilderM.SetInsertPoint(pair.second->getNextNode());
+        else
+          BuilderM.SetInsertPoint(pair.second->getParent());
+      }
+      pair.second->replaceAllUsesWith(val);
+      pair.second->eraseFromParent();
+    }
+  }
+  return true;
+}
+
 void GradientUtils::branchToCorrespondingTarget(
     BasicBlock *ctx, IRBuilder<> &BuilderM,
     const std::map<BasicBlock *,
@@ -8558,13 +9682,17 @@ void GradientUtils::branchToCorrespondingTarget(
           if (!bi2)
             goto rnextpair;
 
+          // Replacing phis needs cond2 here, before any branch, so it is also
+          // computed on the path to uniqueTargets[0], where the forward pass
+          // never ran `subblock`. Split on it only if that is safe; otherwise
+          // fall back to caching which edge was taken.
+          if (replacePHIs != nullptr &&
+              !safeToRecomputeOnAllPaths(getBranchCondition(bi2), ctx, DT))
+            goto rnextpair;
+
           // Condition cond1 splits off uniqueTargets[0] from
           // the remainder of foundTargets.
           auto cond1 = lookupM(getBranchCondition(bi1), BuilderM);
-
-          // Condition cond2 splits off the two blocks in
-          // (foundTargets-uniqueTargets) from each other.
-          auto cond2 = lookupM(getBranchCondition(bi2), BuilderM);
 
           if (replacePHIs == nullptr) {
             BasicBlock *staging =
@@ -8578,14 +9706,35 @@ void GradientUtils::branchToCorrespondingTarget(
                 return staging;
               }
             };
+            // Only the forward paths into the two merged targets ran
+            // `subblock`, so cond2 is only computed on those paths. Look it up
+            // in `staging`, which only they reach: before the branch on cond1
+            // it would also be recomputed on the path to uniqueTargets[0],
+            // from values the forward pass never computed there, and a
+            // recomputed call can throw on them (Julia's `sqrt` does for a
+            // negative argument).
+            BasicBlock *current = BuilderM.GetInsertBlock();
+            auto found = reverseBlockToPrimal.find(current);
+            if (found != reverseBlockToPrimal.end())
+              reverseBlockToPrimal[staging] = found->second;
+            for (auto pair : unwrap_cache[current])
+              unwrap_cache[staging].insert(pair);
+            for (auto pair : lookup_cache[current])
+              lookup_cache[staging].insert(pair);
             BuilderM.CreateCondBr(cond1, stagingIfNeeded(bi1->getSuccessor(0)),
                                   stagingIfNeeded(bi1->getSuccessor(1)));
             BuilderM.SetInsertPoint(staging);
+            // Condition cond2 splits off the two blocks in
+            // (foundTargets-uniqueTargets) from each other.
+            auto cond2 = lookupM(getBranchCondition(bi2), BuilderM);
             BuilderM.CreateCondBr(
                 cond2,
                 *done[std::make_pair(subblock, bi2->getSuccessor(0))].begin(),
                 *done[std::make_pair(subblock, bi2->getSuccessor(1))].begin());
           } else {
+            // Condition cond2 splits off the two blocks in
+            // (foundTargets-uniqueTargets) from each other.
+            auto cond2 = lookupM(getBranchCondition(bi2), BuilderM);
             Value *otherBranch = nullptr;
             for (unsigned i = 0; i < 2; ++i) {
               Value *val = cond1;
@@ -8795,6 +9944,14 @@ fast:;
   return;
 
 nofast:;
+
+  // Two or three targets split by one or two branches are handled above; any
+  // other merge is decided from its branch conditions when they can be
+  // recomputed, and only otherwise from a cache of the edge taken, which in a
+  // loop costs one entry per iteration.
+  if (branchByRecomputedPredicates(ctx, BuilderM, targetToPreds, done,
+                                   replacePHIs))
+    return;
 
   // if freeing reverseblocks must exist
   assert(reverseBlocks.size());
@@ -9106,6 +10263,22 @@ void GradientUtils::computeMinCache() {
         continue;
       bool multiLevel = DifferentialUseAnalysis::is_value_needed_in_reverse<
           QueryType::Primal>(this, V, minCutMode, FullSeen, notForAnalysis);
+      // A cycle through a rematerialized allocation and its stores can leave
+      // provisional false entries in FullSeen. Recheck the allocation without
+      // those entries so required loads and their pointer operands remain
+      // connected to the stored values in the cache graph. Only true results
+      // are independent of the recursion's starting point.
+      if (!multiLevel && rematerializableAllocations.count(V)) {
+        std::map<UsageKey, bool> RematSeen;
+        for (auto &entry : FullSeen)
+          if (entry.second)
+            RematSeen.insert(entry);
+        multiLevel = DifferentialUseAnalysis::is_value_needed_in_reverse<
+            QueryType::Primal>(this, V, minCutMode, RematSeen, notForAnalysis);
+        for (auto &entry : RematSeen)
+          if (entry.second)
+            FullSeen[entry.first] = true;
+      }
       if (!multiLevel) {
         continue;
       }
@@ -9750,7 +10923,35 @@ void SubTransferHelper(GradientUtils *gutils, DerivativeMode mode,
   }
 }
 
-void GradientUtils::computeForwardingProperties(Instruction *V) {
+// Whether call, which only reads through its pointer operand idx, may still
+// write storage that operand owns. A readonly operand only promises that the
+// callee writes nothing through pointers based on it. A Julia array header is
+// such an operand: a callee that fills the array (before Julia 1.11) loads the
+// data pointer from the header and writes the elements through it, so the
+// header is readonly while the storage the allocation owns is written. The
+// callee writes no such storage when it writes no memory that existed before
+// the call (read-only-or-throw), or when its body shows that the only owned
+// storage it writes belongs to other arguments (getArgumentOwnedStorageWrites).
+static bool mayWriteOwnedStorageOfReadOnlyOperand(
+    CallInst *call, unsigned idx, TargetLibraryInfo &TLI,
+    ArgumentOwnedWritesCache &ownedWrites) {
+  if (isLocalReadOnlyOrThrow(call))
+    return false;
+  auto Callee = call->getCalledFunction();
+  if (!Callee || Callee->empty() ||
+      Callee->getCallingConv() != call->getCallingConv())
+    return true;
+  ArgumentOwnedWrites writes;
+  if (!getArgumentOwnedStorageWrites(*Callee, TLI, writes, ownedWrites))
+    return true;
+  for (auto &write : writes)
+    if (write.first == idx)
+      return true;
+  return false;
+}
+
+void GradientUtils::computeForwardingProperties(
+    Instruction *V, ArgumentOwnedWritesCache &ownedWrites) {
   if (!EnzymeRematerialize)
     return;
 
@@ -9800,6 +11001,28 @@ void GradientUtils::computeForwardingProperties(Instruction *V) {
     if (notForAnalysis.count(cur->getParent()))
       continue;
     if (isPointerArithmeticInst(cur)) {
+      if (auto phi = dyn_cast<PHINode>(cur)) {
+        auto loop = OrigLI->getLoopFor(phi->getParent());
+        if (loop && loop->getHeader() == phi->getParent() &&
+            loop->contains(V)) {
+          for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+            if (phi->getIncomingValue(i) != prev ||
+                !loop->contains(phi->getIncomingBlock(i)))
+              continue;
+            // Loop replay keeps one current instance of each allocation.
+            // A backedge carries the previous instance: rebuilding the current
+            // one would make its initialization and reverse users read that
+            // instance instead, potentially before its stores have run.
+            EmitWarning("NotPromotable", *cur, " Could not promote allocation ",
+                        *V, " carried across a loop backedge by ", *cur);
+            promotable = false;
+            shadowpromotable = false;
+            break;
+          }
+          if (!promotable)
+            break;
+        }
+      }
       for (auto u : cur->users()) {
         if (auto I = dyn_cast<Instruction>(u))
           todo.push_back(std::make_pair(I, (Value *)cur));
@@ -9906,6 +11129,21 @@ void GradientUtils::computeForwardingProperties(Instruction *V) {
         bool NoCapture = isNoCapture(CI, idx);
 
         bool ReadOnly = isReadOnly(CI, idx);
+
+        // Memory that may hold pointers can lead to storage the allocation
+        // owns but the operand is not based on, such as the elements of a
+        // Julia array, which are reached through the data pointer stored in
+        // its header (see EnzymeJuliaAddrLoad above). Rematerializing the
+        // allocation recreates that storage without the callee's writes.
+        if (ReadOnly && EnzymeJuliaAddrLoad && !CI->onlyReadsMemory() &&
+            !(TT == BaseType::Integer || TT.isFloat()) &&
+            mayWriteOwnedStorageOfReadOnlyOperand(CI, idx, TLI,
+                                                  ownedWrites)) {
+          EmitWarning("NotPromotable", *cur, " Allocation ", *V,
+                      " may have storage it owns written by readonly operand ",
+                      idx, " of ", *cur);
+          ReadOnly = false;
+        }
 
         bool WriteOnly = isWriteOnly(CI, idx);
 
@@ -10307,6 +11545,9 @@ int GradientUtils::getIndex(
 
 void GradientUtils::computeGuaranteedFrees() {
   SmallPtrSet<CallInst *, 2> allocsToPromote;
+  // getArgumentOwnedStorageWrites answers for computeForwardingProperties,
+  // which reads but does not change the module.
+  ArgumentOwnedWritesCache ownedWrites;
 
   DenseMap<Metadata *, SmallVector<CallInst *>> cache_frees;
   for (auto &BB : *oldFunc) {
@@ -10328,7 +11569,7 @@ void GradientUtils::computeGuaranteedFrees() {
       continue;
     for (auto &I : BB) {
       if (auto AI = dyn_cast<AllocaInst>(&I))
-        computeForwardingProperties(AI);
+        computeForwardingProperties(AI, ownedWrites);
 
       auto CI = dyn_cast<CallInst>(&I);
       if (!CI)
@@ -10391,7 +11632,7 @@ void GradientUtils::computeGuaranteedFrees() {
     // the derivative of store needs to redo the store,
     // isValueNeededInReverse needs to know to preserve the
     // store operands in this case, etc
-    computeForwardingProperties(V);
+    computeForwardingProperties(V, ownedWrites);
   }
 }
 
@@ -10963,5 +12204,86 @@ void GradientUtils::replaceAndRemoveUnwrapCacheFor(llvm::Value *A,
   }
   for (auto I : toErase) {
     erase(I);
+  }
+}
+
+bool GradientUtils::strongZeroFor(const llvm::Value *orig) {
+  if (strongZero)
+    return true;
+  if (!EnzymeSelectStrongZero)
+    return false;
+  if (mode != DerivativeMode::ReverseModeGradient &&
+      mode != DerivativeMode::ReverseModeCombined)
+    return false;
+  if (!selectMaskedComputed) {
+    computeSelectMasked();
+    selectMaskedComputed = true;
+  }
+  return selectMasked.count(orig);
+}
+
+// Fills selectMasked. A value is masked when it is a floating-point
+// instruction of oldFunc whose every use is a value operand of a select, a
+// comparison (which carries no derivative), or another masked value, and which
+// reaches at least one select that way. A select passes no adjoint to the
+// operand it did not pick, so in the reverse pass a masked value has a zero
+// adjoint on exactly the executions where the primal discarded it. That is
+// where LLVM's speculation of a guarded branch into a select (SimplifyCFG's
+// two-entry phi folding, InstCombine folding an operation into a select with a
+// constant arm, GVN folding a repeated guard) evaluates operands the source
+// never computed, such as 1 / 0 or x * x for a rejected nonfinite x.
+// Even without a pole, an operand can be nonfinite or have overflowed in an
+// earlier multiplication. Keep every masked instruction: checkedMul/checkedDiv
+// already omit checks when their partial is a safe floating-point constant.
+void GradientUtils::computeSelectMasked() {
+  SmallPtrSet<const Instruction *, 16> cand;
+  for (auto &BB : *oldFunc)
+    for (auto &I : BB)
+      if (I.getType()->isFPOrFPVectorTy() && !I.use_empty())
+        cand.insert(&I);
+  auto compatibleUse = [&](const Use &U) {
+    auto *user = dyn_cast<Instruction>(U.getUser());
+    if (!user)
+      return false;
+    if (isa<SelectInst>(user))
+      return U.getOperandNo() != 0;
+    if (isa<FCmpInst>(user))
+      return true;
+    return cand.count(user) != 0;
+  };
+  SmallVector<const Instruction *, 16> work(cand.begin(), cand.end());
+  while (!work.empty()) {
+    auto *I = work.pop_back_val();
+    if (!cand.count(I))
+      continue;
+    bool ok = true;
+    for (const Use &U : I->uses())
+      if (!compatibleUse(U)) {
+        ok = false;
+        break;
+      }
+    if (ok)
+      continue;
+    cand.erase(I);
+    for (const Value *op : I->operands())
+      if (auto *OI = dyn_cast<Instruction>(op))
+        if (cand.count(OI))
+          work.push_back(OI);
+  }
+  SmallVector<const Instruction *, 16> reach;
+  for (auto *I : cand)
+    for (const Use &U : I->uses())
+      if (isa<SelectInst>(U.getUser()) && U.getOperandNo() != 0) {
+        reach.push_back(I);
+        break;
+      }
+  while (!reach.empty()) {
+    auto *I = reach.pop_back_val();
+    if (!selectMasked.insert(I).second)
+      continue;
+    for (const Value *op : I->operands())
+      if (auto *OI = dyn_cast<Instruction>(op))
+        if (cand.count(OI) && !selectMasked.count(OI))
+          reach.push_back(OI);
   }
 }

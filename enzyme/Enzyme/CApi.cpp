@@ -731,7 +731,7 @@ LLVMValueRef EnzymeCreatePrimalAndGradient(
           .todiff = cast<Function>(unwrap(todiff)),
           .retType = (DIFFE_TYPE)retType,
           .constant_args = nconstant_args,
-          .subsequent_calls_may_write = (bool)subsequent_calls_may_write,
+          .subsequent_calls_may_write = subsequent_calls_may_write,
           .overwritten_args = overwritten_args,
           .returnUsed = (bool)returnValue,
           .shadowReturnUsed = (bool)dretUsed,
@@ -916,6 +916,7 @@ uint8_t EnzymeCheckedMergeTypeTree(CTypeTreeRef dst, CTypeTreeRef src,
 
 void EnzymeTypeTreeOnlyEq(CTypeTreeRef CTT, int64_t x) {
   // TODO only inst
+  ((TypeTree *)CTT)->ensureKnownOffset(x);
   *(TypeTree *)CTT = ((TypeTree *)CTT)->Only(x, nullptr);
 }
 void EnzymeTypeTreeData0Eq(CTypeTreeRef CTT) {
@@ -938,6 +939,10 @@ void EnzymeTypeTreeShiftIndiciesEq(CTypeTreeRef CTT, const char *datalayout,
                                    int64_t offset, int64_t maxSize,
                                    uint64_t addOffset) {
   DataLayout DL(datalayout);
+  // The C API constructs explicit frontend layouts. Internal ShiftIndices calls
+  // retain the inference bound and cannot grow it along pointer recurrences.
+  if (maxSize >= 0 && addOffset <= INT64_MAX - maxSize)
+    ((TypeTree *)CTT)->ensureKnownOffset(addOffset + maxSize);
   *(TypeTree *)CTT =
       ((TypeTree *)CTT)->ShiftIndices(DL, offset, maxSize, addOffset);
 }
@@ -946,6 +951,7 @@ void EnzymeTypeTreeInsertEq(CTypeTreeRef CTT, const int64_t *indices,
   std::vector<int> seq;
   for (size_t i = 0; i < len; i++) {
     seq.push_back(indices[i]);
+    ((TypeTree *)CTT)->ensureKnownOffset(indices[i]);
   }
   ((TypeTree *)CTT)->insert(seq, eunwrap(ct, *unwrap(ctx)));
 }

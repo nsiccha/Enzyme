@@ -92,8 +92,21 @@ llvm::cl::opt<bool>
     EnzymeBlasCopy("enzyme-blas-copy", cl::init(true), cl::Hidden,
                    cl::desc("Use blas copy calls to cache vectors"));
 llvm::cl::opt<bool>
-    EnzymeFastMath("enzyme-fast-math", cl::init(true), cl::Hidden,
-                   cl::desc("Use fast math on derivative compuation"));
+    EnzymeFastMath("enzyme-fast-math", cl::init(false), cl::Hidden,
+                   cl::desc("Use fast math on derivative computation"));
+// The fast-math flags derivative arithmetic carries while enzyme-fast-math is
+// off: 1 reassoc, 2 nnan, 4 ninf, 8 nsz, 16 arcp, 32 contract, 64 afn. The
+// default, nsz and contract, never regroups an expression, so a representable
+// derivative cannot underflow or overflow through reordering (reassoc turned
+// (adjoint / y) * c into (adjoint * c) / y), and it assumes nothing about NaN
+// or infinity. nsz lets `adjoint + 0.0` fold, which strict arithmetic forbids
+// since -0.0 + 0.0 is +0.0; contract only fuses a multiply and an add, rounding
+// once. 0 is fully strict arithmetic.
+llvm::cl::opt<int> EnzymeFastMathFlags(
+    "enzyme-fast-math-flags", cl::init(8 | 32), cl::Hidden,
+    cl::desc("Fast-math flags on derivative computation when "
+             "enzyme-fast-math is off (1 reassoc, 2 nnan, 4 ninf, 8 nsz, "
+             "16 arcp, 32 contract, 64 afn)"));
 llvm::cl::opt<bool> EnzymeMemmoveWarning(
     "enzyme-memmove-warning", cl::init(true), cl::Hidden,
     cl::desc("Warn if using memmove implementation as a fallback for memmove"));
@@ -2356,6 +2369,209 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
   return res;
 }
 
+// A BLAS routine that computes `out := ... + scale * out` does not read `out`
+// when `scale` is zero: it overwrites it. The adjoint of what `out` held before
+// the call (and, in forward mode, the tangent's contribution from it) is then
+// exactly zero, whatever the adjoint of the result holds. Multiplying by the
+// scale, as `scal` and `lascl` do, keeps a NaN or an infinity there, since
+// 0 * NaN and 0 * Inf are NaN, and a shadow that is used again (a second
+// reverse pass over the same shadow memory, a later write to the same output)
+// then carries that NaN into every later derivative. So this writes
+// `out[i, j] = scale == 0 ? 0 : scale * out[i, j]`, without the fast-math flags
+// that would let the select be folded into the product, and leaves `out` alone
+// when the scale is one. An output that is one block of values, a vector with
+// increment one or a full matrix without padding between its columns, is
+// cleared with a memset or scaled in a single loop.
+void callScaleOrZero(IRBuilder<> &B, Module &M, IntegerType *IT, Type *fpTy,
+                     Value *layout, Value *uplo, Value *m, Value *n,
+                     Value *scale, Value *out, Value *ld, bool absLd,
+                     ArrayRef<OperandBundleDef> bundles, bool byRef,
+                     bool scaleByRef, bool cblas) {
+  assert(fpTy->isFloatingPointTy());
+  auto &Ctx = M.getContext();
+  IntegerType *CT = IntegerType::get(Ctx, 8);
+
+  // Take the arguments out of the BLAS calling convention.
+  Value *nV = load_if_ref(B, IT, n, byRef);
+  Value *mV = m ? load_if_ref(B, IT, m, byRef) : ConstantInt::get(IT, 1);
+  Value *ldV = load_if_ref(B, IT, ld, byRef);
+  Value *scaleV = load_if_ref(B, fpTy, scale, scaleByRef);
+  if (absLd) {
+    // The elements of a vector with a negative increment lie at the same
+    // addresses as with its absolute value.
+    ldV = B.CreateSelect(B.CreateICmpSLT(ldV, ConstantInt::get(IT, 0)),
+                         B.CreateNeg(ldV), ldV);
+  }
+
+  // Row-major storage of a matrix is column-major storage of its transpose.
+  Value *isRow = nullptr;
+  if (cblas && layout) {
+    isRow = B.CreateICmpEQ(
+        layout, ConstantInt::get(layout->getType(), /*CblasRowMajor*/ 101));
+    Value *rows = B.CreateSelect(isRow, nV, mV);
+    nV = B.CreateSelect(isRow, mV, nV);
+    mV = rows;
+  }
+
+  // 'U' and 'L' name a triangle (with its diagonal); anything else is the full
+  // matrix, as for lacpy and lascl.
+  Value *uploV = ConstantInt::get(CT, 'G');
+  if (uplo) {
+    Value *u = load_if_ref(B, CT, uplo, byRef);
+    auto names = [&](char upper, char lower, unsigned cblasEnum) {
+      Value *res =
+          B.CreateOr(B.CreateICmpEQ(u, ConstantInt::get(u->getType(), upper)),
+                     B.CreateICmpEQ(u, ConstantInt::get(u->getType(), lower)));
+      // Under the CBLAS ABI the triangle is an enum, CblasUpper or CblasLower.
+      if (!byRef)
+        res = B.CreateOr(
+            res, B.CreateICmpEQ(u, ConstantInt::get(u->getType(), cblasEnum)));
+      return res;
+    };
+    Value *isU = names('U', 'u', 121);
+    Value *isL = names('L', 'l', 122);
+    if (isRow) {
+      Value *upper = B.CreateSelect(isRow, isL, isU);
+      isL = B.CreateSelect(isRow, isU, isL);
+      isU = upper;
+    }
+    uploV = B.CreateSelect(isU, ConstantInt::get(CT, 'U'),
+                           B.CreateSelect(isL, ConstantInt::get(CT, 'L'),
+                                          ConstantInt::get(CT, 'G')));
+  }
+
+  unsigned AS = 0;
+  if (auto OPT = dyn_cast<PointerType>(out->getType()))
+    AS = OPT->getAddressSpace();
+  PointerType *PT = getPointerType(fpTy, AS);
+  Value *outV = out->getType()->isIntegerTy() ? B.CreateIntToPtr(out, PT)
+                                              : B.CreatePointerCast(out, PT);
+
+  std::string name = "__enzyme_scale_or_zero_" + tofltstr(fpTy) + "_" +
+                     std::to_string(IT->getBitWidth());
+  if (AS != 0)
+    name += "_as" + std::to_string(AS);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx),
+                                       {CT, IT, IT, fpTy, PT, IT}, false);
+  Function *F = cast<Function>(M.getOrInsertFunction(name, FT).getCallee());
+
+  if (F->empty()) {
+    F->setLinkage(Function::LinkageTypes::InternalLinkage);
+#if LLVM_VERSION_MAJOR >= 16
+    F->setOnlyAccessesArgMemory();
+#else
+    F->addFnAttr(Attribute::ArgMemOnly);
+#endif
+    F->addFnAttr(Attribute::NoUnwind);
+    F->addFnAttr(Attribute::AlwaysInline);
+    addFunctionNoCapture(F, 4);
+
+    auto fuplo = F->arg_begin();
+    fuplo->setName("uplo");
+    auto fm = fuplo + 1;
+    fm->setName("m");
+    auto fn = fm + 1;
+    fn->setName("n");
+    auto fscale = fn + 1;
+    fscale->setName("scale");
+    auto fout = fscale + 1;
+    fout->setName("out");
+    auto fld = fout + 1;
+    fld->setName("ld");
+
+    BasicBlock *entry = BasicBlock::Create(Ctx, "entry", F);
+    BasicBlock *init = BasicBlock::Create(Ctx, "init", F);
+    BasicBlock *flat = BasicBlock::Create(Ctx, "flat", F);
+    BasicBlock *flatzero = BasicBlock::Create(Ctx, "flat.zero", F);
+    BasicBlock *flatscale = BasicBlock::Create(Ctx, "flat.scale", F);
+    BasicBlock *col = BasicBlock::Create(Ctx, "col", F);
+    BasicBlock *row = BasicBlock::Create(Ctx, "row", F);
+    BasicBlock *colend = BasicBlock::Create(Ctx, "col.end", F);
+    BasicBlock *end = BasicBlock::Create(Ctx, "end", F);
+
+    Value *zero = ConstantInt::get(IT, 0);
+    Value *one = ConstantInt::get(IT, 1);
+
+    // Nothing to do for an empty output, nor for a scale of one, which BLAS
+    // does not apply either.
+    IRBuilder<> B1(entry);
+    B1.CreateCondBr(
+        B1.CreateOr(
+            B1.CreateOr(B1.CreateICmpSLE(fm, zero), B1.CreateICmpSLE(fn, zero)),
+            B1.CreateFCmpOEQ(fscale, ConstantFP::get(fpTy, 1.0), "identity")),
+        end, init);
+
+    IRBuilder<> B2(init);
+    Value *overwrite =
+        B2.CreateFCmpOEQ(fscale, ConstantFP::get(fpTy, 0.0), "overwrite");
+    Value *upper = B2.CreateICmpEQ(fuplo, ConstantInt::get(CT, 'U'), "upper");
+    Value *lower = B2.CreateICmpEQ(fuplo, ConstantInt::get(CT, 'L'), "lower");
+    // Without a triangle and without padding between the columns the output
+    // is one block of m * n values.
+    Value *contiguous = B2.CreateAnd(B2.CreateNot(B2.CreateOr(upper, lower)),
+                                     B2.CreateICmpEQ(fld, fm), "contiguous");
+    B2.CreateCondBr(contiguous, flat, col);
+
+    IRBuilder<> BF(flat);
+    Value *total = BF.CreateMul(fm, fn, "total", true, true);
+    BF.CreateCondBr(overwrite, flatzero, flatscale);
+
+    IRBuilder<> BZ(flatzero);
+    auto elSize = (M.getDataLayout().getTypeSizeInBits(fpTy) + 7) / 8;
+    BZ.CreateMemSet(
+        BZ.CreatePointerCast(fout, getPointerType(Type::getInt8Ty(Ctx), AS)),
+        BZ.getInt8(0),
+        BZ.CreateMul(total, ConstantInt::get(IT, elSize), "", true, true),
+        MaybeAlign());
+    BZ.CreateBr(end);
+
+    IRBuilder<> BS(flatscale);
+    PHINode *k = BS.CreatePHI(IT, 2, "k");
+    k->addIncoming(zero, flat);
+    Value *kptr = BS.CreateInBoundsGEP(fpTy, fout, k, "out.k");
+    BS.CreateStore(BS.CreateFMul(fscale, BS.CreateLoad(fpTy, kptr), "scaled.k"),
+                   kptr);
+    Value *knext = BS.CreateAdd(k, one, "k.next", true, true);
+    k->addIncoming(knext, flatscale);
+    BS.CreateCondBr(BS.CreateICmpEQ(knext, total), end, flatscale);
+
+    IRBuilder<> B3(col);
+    PHINode *j = B3.CreatePHI(IT, 2, "j");
+    j->addIncoming(zero, init);
+    Value *jnext = B3.CreateAdd(j, one, "j.next", true, true);
+    // Rows [first, last) of column j: all of them, those up to the diagonal
+    // for 'U', those from the diagonal on for 'L'.
+    Value *last = B3.CreateSelect(
+        upper, B3.CreateSelect(B3.CreateICmpSLT(jnext, fm), jnext, fm), fm,
+        "last");
+    Value *first = B3.CreateSelect(
+        lower, B3.CreateSelect(B3.CreateICmpSLT(j, fm), j, fm), zero, "first");
+    Value *offset = B3.CreateMul(j, fld, "col.offset", true, true);
+    B3.CreateCondBr(B3.CreateICmpSLT(first, last), row, colend);
+
+    IRBuilder<> B4(row);
+    PHINode *i = B4.CreatePHI(IT, 2, "i");
+    i->addIncoming(first, col);
+    Value *ptr = B4.CreateInBoundsGEP(
+        fpTy, fout, B4.CreateAdd(i, offset, "", true, true), "out.i");
+    Value *scaled = B4.CreateFMul(fscale, B4.CreateLoad(fpTy, ptr), "scaled");
+    B4.CreateStore(
+        B4.CreateSelect(overwrite, ConstantFP::get(fpTy, 0.0), scaled), ptr);
+    Value *inext = B4.CreateAdd(i, one, "i.next", true, true);
+    i->addIncoming(inext, row);
+    B4.CreateCondBr(B4.CreateICmpEQ(inext, last), colend, row);
+
+    IRBuilder<> B5(colend);
+    j->addIncoming(jnext, colend);
+    B5.CreateCondBr(B5.CreateICmpEQ(jnext, fn), end, col);
+
+    IRBuilder<> B6(end);
+    B6.CreateRetVoid();
+  }
+
+  B.CreateCall(F, {uploV, mV, nV, scaleV, outV, ldV}, bundles);
+}
+
 Function *getOrInsertMemcpyStrided(Module &M, Type *elementType, PointerType *T,
                                    Type *IT, unsigned dstalign,
                                    unsigned srcalign) {
@@ -3505,8 +3721,8 @@ bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
                               llvm::TargetLibraryInfo &TLI, ScalarEvolution &SE,
                               llvm::LoopInfo &LI, llvm::DominatorTree &DT,
                               llvm::Instruction *maybeReader,
-                              llvm::Instruction *maybeWriter,
-                              llvm::Loop *scope) {
+                              llvm::Instruction *maybeWriter, llvm::Loop *scope,
+                              AllocWrittenBeforeLoadCache *cache) {
   using namespace llvm;
   if (!writesToMemoryReadBy(TR, AA, TLI, maybeReader, maybeWriter))
     return false;
@@ -3604,7 +3820,7 @@ bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
 
   if (loadPtr && storePtr)
     if (auto alias = arePointersGuaranteedNoAlias(TLI, AA, DT, LI, loadPtr,
-                                                  storePtr, true))
+                                                  storePtr, true, cache, TR))
       if (*alias)
         return false;
 
@@ -4431,7 +4647,7 @@ llvm::Optional<BlasInfo> extractBLAS(llvm::StringRef in)
 #endif
 {
   static const char *extractable[] = {
-      "dot",   "scal", "axpy",  "axpby", "gemv",  "gemm",  "spmv",
+      "dot",   "scal", "axpy",  "axpby", "lascl", "gemv",  "gemm",  "spmv",
       "syrk",  "nrm2", "trmm",  "trmv",  "symm",  "potrf", "potrs",
       "copy",  "spmv", "syr2k", "potrs", "getrf", "getrs", "trtrs",
       "getri", "symv", "lacpy", "trsv",
@@ -4591,8 +4807,18 @@ llvm::Value *SanitizeDerivatives(llvm::Value *val, llvm::Value *toset,
 
 llvm::FastMathFlags getFast() {
   llvm::FastMathFlags f;
-  if (EnzymeFastMath)
+  if (EnzymeFastMath) {
     f.set();
+    return f;
+  }
+  int flags = EnzymeFastMathFlags;
+  f.setAllowReassoc(flags & 1);
+  f.setNoNaNs(flags & 2);
+  f.setNoInfs(flags & 4);
+  f.setNoSignedZeros(flags & 8);
+  f.setAllowReciprocal(flags & 16);
+  f.setAllowContract(flags & 32);
+  f.setApproxFunc(flags & 64);
   return f;
 }
 
@@ -5534,6 +5760,283 @@ bool notCaptured(llvm::Value *V, llvm::TargetLibraryInfo *TLI) {
   return notCapturedBefore(V, nullptr, 0, nullptr, TLI);
 }
 
+// Whether an instruction between alloc_call and ld may write memory that ld
+// reads. alloc_call is ld's base object, so the answer depends on ld alone and
+// is kept in cache when one is given.
+bool isAllocWrittenBeforeLoad(LoopInfo &LI, AAResults &AA,
+                              TargetLibraryInfo &TLI, Instruction *alloc_call,
+                              LoadInst *ld,
+                              AllocWrittenBeforeLoadCache *cache) {
+  if (cache) {
+    auto found = cache->find(ld);
+    if (found != cache->end())
+      return found->second;
+  }
+  bool alloc_written = false;
+  allInstructionsBetween(LI, alloc_call, ld, [&](Instruction *I) -> bool {
+    if (!I->mayWriteToMemory())
+      return /*earlyBreak*/ false;
+
+    if (writesToMemoryReadBy(nullptr, AA, TLI,
+                             /*maybeReader*/ ld,
+                             /*maybeWriter*/ I)) {
+      alloc_written = true;
+      return /*earlyBreak*/ true;
+    }
+    return /*earlyBreak*/ false;
+  });
+  if (cache)
+    (*cache)[ld] = alloc_written;
+  return alloc_written;
+}
+
+bool isJuliaArrayResize(StringRef name) {
+  if (startsWith(name, "ijl_"))
+    name = name.substr(1);
+  return name == "jl_array_grow_end" || name == "jl_array_grow_beg" ||
+         name == "jl_array_grow_at" || name == "jl_array_del_end" ||
+         name == "jl_array_del_beg" || name == "jl_array_del_at" ||
+         name == "jl_array_sizehint" || name == "jl_array_ptr_1d_push" ||
+         name == "jl_array_ptr_1d_append";
+}
+
+Value *getPointerFieldOwner(Value *ptr, int64_t &offset, const DataLayout &DL) {
+  Value *base = GetPointerBaseWithConstantOffset(ptr, offset, DL);
+  while (auto CI = dyn_cast<CallInst>(base)) {
+    if (getFuncNameFromCall(CI) != "julia.pointer_from_objref")
+      break;
+    int64_t more = 0;
+    base = GetPointerBaseWithConstantOffset(CI->getArgOperand(0), more, DL);
+    offset += more;
+  }
+  return base;
+}
+
+bool getFreshPointerField(CallInst *alloc, int64_t &field) {
+  if (!isNoAlias(alloc))
+    return false;
+  auto F = alloc->getCalledFunction();
+  if (!F || !F->hasFnAttribute("enzyme_fresh_pointer"))
+    return false;
+  return !F->getFnAttribute("enzyme_fresh_pointer")
+              .getValueAsString()
+              .getAsInteger(10, field) &&
+         field >= 0;
+}
+
+bool getFreshPointerHeaderAllocations(Value *header, int64_t offset,
+                                      SmallVectorImpl<CallInst *> &allocs) {
+  header = header->stripPointerCasts();
+  SmallVector<Value *, 2> headers;
+  if (auto PN = dyn_cast<PHINode>(header)) {
+    for (auto &V : PN->incoming_values())
+      headers.push_back(V->stripPointerCasts());
+  } else if (auto SI = dyn_cast<SelectInst>(header)) {
+    headers.push_back(SI->getTrueValue()->stripPointerCasts());
+    headers.push_back(SI->getFalseValue()->stripPointerCasts());
+  } else {
+    headers.push_back(header);
+  }
+  size_t start = allocs.size();
+  for (auto V : headers) {
+    auto alloc = dyn_cast<CallInst>(V);
+    int64_t field;
+    if (!alloc || !getFreshPointerField(alloc, field) || field != offset)
+      break;
+    allocs.push_back(alloc);
+  }
+  if (allocs.size() - start == headers.size())
+    return true;
+  allocs.resize(start);
+  return false;
+}
+
+bool getFreshPointerAllocations(LoadInst *ld,
+                                SmallVectorImpl<CallInst *> &allocs) {
+  if (!ld->isSimple() || !ld->getType()->isPointerTy())
+    return false;
+  const auto &DL = ld->getModule()->getDataLayout();
+  int64_t offset = 0;
+  auto base = getPointerFieldOwner(ld->getPointerOperand(), offset, DL);
+  return getFreshPointerHeaderAllocations(base, offset, allocs);
+}
+
+// Calls f on every instruction that may run after an execution of def and
+// before the next execution of use, given that def dominates use: those on
+// paths from def to use that do not run def again. In a loop containing both,
+// the instructions after use in one iteration therefore do not count, unlike
+// for allInstructionsBetween: the next iteration runs def again before use.
+// f returning true stops the walk. Returns false, without calling f, when
+// def does not dominate use (a path from the entry reaches use without it).
+static bool
+forInstructionsFromDefToUse(Instruction *def, Instruction *use,
+                            llvm::function_ref<bool(Instruction *)> f) {
+  BasicBlock *defBB = def->getParent();
+  BasicBlock *useBB = use->getParent();
+  if (defBB == useBB) {
+    if (!def->comesBefore(use))
+      return false;
+    for (auto I = def->getNextNode(); I != use; I = I->getNextNode())
+      if (f(I))
+        break;
+    return true;
+  }
+  // Blocks that reach use without passing def's block; reaching the entry
+  // that way means def does not dominate use.
+  SmallPtrSet<BasicBlock *, 16> back;
+  SmallVector<BasicBlock *, 16> todo(pred_begin(useBB), pred_end(useBB));
+  while (!todo.empty()) {
+    auto BB = todo.pop_back_val();
+    if (BB == defBB || !back.insert(BB).second)
+      continue;
+    if (pred_empty(BB))
+      return false;
+    todo.append(pred_begin(BB), pred_end(BB));
+  }
+  if (pred_empty(useBB))
+    return false;
+  // Blocks def's block reaches without passing it again.
+  SmallPtrSet<BasicBlock *, 16> fwd;
+  todo.append(succ_begin(defBB), succ_end(defBB));
+  while (!todo.empty()) {
+    auto BB = todo.pop_back_val();
+    if (BB == defBB || !fwd.insert(BB).second)
+      continue;
+    todo.append(succ_begin(BB), succ_end(BB));
+  }
+  for (auto I = def->getNextNode(); I; I = I->getNextNode())
+    if (f(I))
+      return true;
+  for (auto BB : fwd) {
+    if (BB == useBB || !back.count(BB))
+      continue;
+    for (auto &I : *BB)
+      if (f(&I))
+        return true;
+  }
+  // All of use's block when a cycle avoiding def's block returns to it, else
+  // the part before use.
+  for (auto &I : *useBB) {
+    if (&I == use && !back.count(useBB))
+      break;
+    if (f(&I))
+      return true;
+  }
+  return true;
+}
+
+namespace {
+// State shared by the walks of one isFreshPointerFieldWrittenBefore query,
+// which proves other allocations' fields unchanged too (see below).
+struct FreshFieldQuery {
+  LoopInfo &LI;
+  AAResults &AA;
+  llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory;
+  // Allocations whose field is being proven unchanged; meeting one again
+  // answers conservatively.
+  SmallPtrSet<CallInst *, 4> active{};
+  // Whether the storage a load names is proven fresh, per load.
+  DenseMap<LoadInst *, bool> freshLoads{};
+};
+} // namespace
+
+static bool isFreshPointerFieldWrittenBefore(FreshFieldQuery &Q,
+                                             CallInst *alloc, int64_t offset,
+                                             Instruction *before);
+
+// Whether ld loads the fresh field of allocations other than alloc, each
+// still holding the allocator's pointer, so that the storage it names is new
+// memory distinct from alloc and from everything else that existed before.
+static bool loadsOtherFreshStorage(FreshFieldQuery &Q, LoadInst *ld,
+                                   CallInst *alloc) {
+  auto found = Q.freshLoads.find(ld);
+  if (found != Q.freshLoads.end())
+    return found->second;
+  SmallVector<CallInst *, 2> owners;
+  bool fresh = getFreshPointerAllocations(ld, owners) &&
+               !llvm::is_contained(owners, alloc);
+  if (fresh) {
+    int64_t offset = 0;
+    getPointerFieldOwner(ld->getPointerOperand(), offset,
+                         ld->getModule()->getDataLayout());
+    for (auto owner : owners)
+      if (Q.active.count(owner) ||
+          isFreshPointerFieldWrittenBefore(Q, owner, offset, ld)) {
+        fresh = false;
+        break;
+      }
+  }
+  return Q.freshLoads[ld] = fresh;
+}
+
+static bool isFreshPointerFieldWrittenBefore(FreshFieldQuery &Q,
+                                             CallInst *alloc, int64_t offset,
+                                             Instruction *before) {
+  const auto &DL = alloc->getModule()->getDataLayout();
+  // The header from its start through the field: a superset of the field.
+  MemoryLocation field(
+      alloc, LocationSize::precise(
+                 offset + DL.getPointerSize(cast<PointerType>(alloc->getType())
+                                                ->getAddressSpace())));
+  Q.active.insert(alloc);
+  bool written = false;
+  auto visit = [&](Instruction *I) -> bool {
+    if (I == before || !I->mayWriteToMemory())
+      return /*earlyBreak*/ false;
+    if (auto CB = dyn_cast<CallBase>(I)) {
+      if (isReadOnlyOrThrow(CB) ||
+          (Q.writesOnlyNewMemory && Q.writesOnlyNewMemory(CB)))
+        return /*earlyBreak*/ false;
+      // Resizing this array leaves its field naming storage made for it, the
+      // old or storage the resize allocates.
+      if (isJuliaArrayResize(getFuncNameFromCall(CB)) && CB->arg_size() > 0 &&
+          getBaseObject(CB->getArgOperand(0)) == alloc)
+        return /*earlyBreak*/ false;
+    }
+    // A write through a pointer loaded from this allocation's fresh field
+    // writes the storage the field names, which is separate from the header
+    // (Julia's inline array data follows the header fields): until some other
+    // write changes the field, which this walk checks, the field names that
+    // storage. A write into the fresh storage of another allocation, whose
+    // field is proven unchanged in turn, cannot reach this header either, as
+    // when a loop fills one new array with others it allocates and fills. A
+    // load through a merge of headers is left to alias analysis.
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(I))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(I))
+      ptr = MI->getRawDest();
+    if (ptr)
+      if (auto ld = dyn_cast<LoadInst>(getBaseObject(ptr))) {
+        SmallVector<CallInst *, 2> owners;
+        if (getFreshPointerAllocations(ld, owners) && owners.size() == 1 &&
+            owners[0] == alloc)
+          return /*earlyBreak*/ false;
+        if (loadsOtherFreshStorage(Q, ld, alloc))
+          return /*earlyBreak*/ false;
+      }
+    if (isModSet(Q.AA.getModRefInfo(I, field))) {
+      written = true;
+      return /*earlyBreak*/ true;
+    }
+    return /*earlyBreak*/ false;
+  };
+  // An allocation dominates the uses of its result, the usual case; a header
+  // merged from several allocations takes the conservative walk.
+  if (!forInstructionsFromDefToUse(alloc, before, visit))
+    allInstructionsBetween(Q.LI, alloc, before, visit);
+  Q.active.erase(alloc);
+  return written;
+}
+
+bool isFreshPointerFieldWrittenBefore(
+    LoopInfo &LI, AAResults &AA, CallInst *alloc, int64_t offset,
+    Instruction *before,
+    llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory) {
+  FreshFieldQuery Q{LI, AA, writesOnlyNewMemory};
+  return isFreshPointerFieldWrittenBefore(Q, alloc, offset, before);
+}
+
 // Compare two pointers whose (single) base objects are lhs and rhs.
 // Return true if guaranteed not to alias
 // Return false if guaranteed to alias [with possible offset depending on flag].
@@ -5546,7 +6049,9 @@ static llvm::Optional<bool>
 areBaseObjectsGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
                                 llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                                 llvm::Value *op0, llvm::Value *op1,
-                                llvm::Value *lhs, llvm::Value *rhs) {
+                                llvm::Value *lhs, llvm::Value *rhs,
+                                AllocWrittenBeforeLoadCache *cache,
+                                const TypeResults *TR) {
   if (lhs == rhs) {
     return false;
   }
@@ -5653,19 +6158,8 @@ areBaseObjectsGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
         // know that there is no way to dataflow end into start, so we now
         // merely must prove there is no way to dataflow start into end.
 
-        bool alloc_written = false;
-        allInstructionsBetween(LI, alloc_call, ld, [&](Instruction *I) -> bool {
-          if (!I->mayWriteToMemory())
-            return /*earlyBreak*/ false;
-
-          if (writesToMemoryReadBy(nullptr, AA, TLI,
-                                   /*maybeReader*/ ld,
-                                   /*maybeWriter*/ I)) {
-            alloc_written = true;
-            return /*earlyBreak*/ true;
-          }
-          return /*earlyBreak*/ false;
-        });
+        bool alloc_written =
+            isAllocWrittenBeforeLoad(LI, AA, TLI, alloc_call, ld, cache);
 
         if (!alloc_written && end_base != alloc_call) {
           // If end is marked noalias at the time of construction it
@@ -5697,6 +6191,16 @@ areBaseObjectsGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
                                           /*includebin*/ true)) {
                 worklist.push_back(U);
               } else if (auto LI = dyn_cast<LoadInst>(U)) {
+                // Only values which may contain an address can expose the
+                // allocation's initialized pointers. Capturing an array size
+                // (for example in a bounds-error argument) does not expose its
+                // backing buffer. Use Enzyme's inferred type, not LLVM's value
+                // type: an integer load can carry a pointer through ptrtoint.
+                if (TR) {
+                  auto type = TR->query(LI)[{-1}];
+                  if (type == BaseType::Integer || type.isFloat())
+                    continue;
+                }
                 alloc_loads.push_back(LI);
               }
             }
@@ -5741,7 +6245,8 @@ llvm::Optional<bool>
 arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
                              llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                              llvm::Value *op0, llvm::Value *op1,
-                             bool offsetAllowed) {
+                             bool offsetAllowed, AllocWrittenBeforeLoadCache *cache,
+                             const TypeResults *TR) {
   // Look through phis and selects: a pointer such as `xp = phi [x2, &s[i]]`
   // may be based on any of several objects, and the per-object reasoning
   // below (noalias, not captured, ...) is only valid for a single, known base.
@@ -5753,7 +6258,7 @@ arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
 
   if (lhsObjs.size() == 1 && rhsObjs.size() == 1)
     return areBaseObjectsGuaranteedNoAlias(TLI, AA, DT, LI, op0, op1,
-                                           lhsObjs[0], rhsObjs[0]);
+                                           lhsObjs[0], rhsObjs[0], cache, TR);
 
   // With several candidate bases, the pointers are guaranteed not to alias
   // only if every pair of candidates is. A shared candidate means they may
@@ -5763,7 +6268,7 @@ arePointersGuaranteedNoAlias(TargetLibraryInfo &TLI, llvm::AAResults &AA,
       if (lhs == rhs)
         return {};
       auto res =
-          areBaseObjectsGuaranteedNoAlias(TLI, AA, DT, LI, lhs, rhs, lhs, rhs);
+          areBaseObjectsGuaranteedNoAlias(TLI, AA, DT, LI, lhs, rhs, lhs, rhs, cache, TR);
       if (!res || !*res)
         return {};
     }
@@ -5816,6 +6321,9 @@ llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
       case SRetRootMovement::SRetPointerToRootPointer: {
         Value *outloc = constantInBoundsGEPHelper(B, jltype, sret, path);
         outloc = B.CreateLoad(ty, outloc);
+        outloc = B.CreatePointerCast(
+            outloc,
+            getPointerType(StructType::get(outloc->getContext(), {}), Tracked));
         B.CreateStore(outloc, loc);
         break;
       }
@@ -5828,7 +6336,10 @@ llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
         break;
       }
       case SRetRootMovement::RootPointerToSRetValue: {
-        loc = B.CreateLoad(ty, loc);
+        loc = B.CreateLoad(
+            getPointerType(StructType::get(loc->getContext(), {}), Tracked),
+            loc);
+        loc = B.CreatePointerCast(loc, ty);
         val = B.CreateInsertValue(val, loc, path);
         break;
       }
@@ -5840,7 +6351,10 @@ llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
       }
       case SRetRootMovement::RootPointerToSRetPointer: {
         Value *outloc = constantInBoundsGEPHelper(B, jltype, sret, path);
-        loc = B.CreateLoad(ty, loc);
+        loc = B.CreateLoad(
+            getPointerType(StructType::get(loc->getContext(), {}), Tracked),
+            loc);
+        loc = B.CreatePointerCast(loc, ty);
         extracted.push_back(loc);
         B.CreateStore(loc, outloc);
         break;

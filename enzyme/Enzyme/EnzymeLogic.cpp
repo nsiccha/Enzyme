@@ -66,6 +66,7 @@
 #include "llvm/IR/Verifier.h"
 
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 
@@ -95,6 +96,9 @@
 #define removeAttribute removeAttributeAtIndex
 
 using namespace llvm;
+
+// Enzyme.cpp: whether read-only-or-throw inference runs.
+extern llvm::cl::opt<bool> EnzymeDetectReadThrow;
 
 extern "C" {
 llvm::cl::opt<bool>
@@ -192,6 +196,51 @@ writesOnlyUncapturedLocalOrNoaliasArgMemory(Instruction *I,
   return isUncapturedLocalOrNoaliasArgMemory(getBaseObject(ptr), TLI);
 }
 
+// What the writes that follow a call in its caller may store
+// (subsequent_calls_may_write): the called function cannot see them, so they
+// may overwrite memory it read. 0 means no such writes, and every other value
+// means some, so code that reads the value as a bool stays conservative.
+// SubsequentWriteAny (what `true` meant) covers any write.
+// SubsequentWritePointers covers stores of pointer values only, such as a
+// pointer stored back into the object it was loaded from. Such a store cannot
+// overwrite memory that holds integers or floats: in C that is strict
+// aliasing, and Julia keeps object references only where its garbage
+// collector looks for them, never inside numeric data. Stores of numbers stay
+// Any: Julia may reinterpret floating-point data as integers in place.
+enum : uint8_t {
+  SubsequentWriteAny = 1,
+  SubsequentWritePointers = 2,
+};
+
+// The kind of subsequent write that I is.
+static uint8_t subsequentWriteKind(Instruction *I) {
+  if (auto SI = dyn_cast<StoreInst>(I))
+    if (SI->getValueOperand()->getType()->isPointerTy())
+      return SubsequentWritePointers;
+  return SubsequentWriteAny;
+}
+
+// writes with the writes of kind added. Any absorbs the other kinds, so equal
+// meanings make equal cache keys.
+static uint8_t addSubsequentWrite(uint8_t writes, uint8_t kind) {
+  writes |= kind;
+  return (writes & SubsequentWriteAny) ? SubsequentWriteAny : writes;
+}
+
+// Whether memory known to hold values of type CT cannot hold a pointer.
+static bool holdsNoPointers(ConcreteType CT) {
+  return CT == BaseType::Integer || CT.isFloat();
+}
+
+// Whether writes may overwrite memory read as values of type read.
+static bool subsequentWritesMayOverwrite(uint8_t writes, ConcreteType read) {
+  if (writes == 0)
+    return false;
+  if (writes & SubsequentWriteAny)
+    return true;
+  return !holdsNoPointers(read);
+}
+
 struct CacheAnalysis {
 
   const ValueMap<const CallInst *, SmallPtrSet<const CallInst *, 1>>
@@ -206,10 +255,11 @@ struct CacheAnalysis {
   DominatorTree &OrigDT;
   TargetLibraryInfo &TLI;
   const SmallPtrSetImpl<BasicBlock *> &unnecessaryBlocks;
-  const bool subsequent_calls_may_write;
+  const uint8_t subsequent_calls_may_write;
   const std::vector<bool> &overwritten_args;
   DerivativeMode mode;
   std::map<Value *, bool> seen;
+  AllocWrittenBeforeLoadCache allocWrittenBeforeLoad;
   bool omp;
   CacheAnalysis(
       const ValueMap<const CallInst *, SmallPtrSet<const CallInst *, 1>>
@@ -219,7 +269,7 @@ struct CacheAnalysis {
       TypeResults &TR, AAResults &AA, Function *oldFunc, ScalarEvolution &SE,
       LoopInfo &OrigLI, DominatorTree &OrigDT, TargetLibraryInfo &TLI,
       const SmallPtrSetImpl<BasicBlock *> &unnecessaryBlocks,
-      bool subsequent_calls_may_write,
+      uint8_t subsequent_calls_may_write,
       const std::vector<bool> &overwritten_args, DerivativeMode mode, bool omp)
       : allocationsWithGuaranteedFree(allocationsWithGuaranteedFree),
         rematerializableAllocations(rematerializableAllocations), TR(TR),
@@ -228,15 +278,272 @@ struct CacheAnalysis {
         subsequent_calls_may_write(subsequent_calls_may_write),
         overwritten_args(overwritten_args), mode(mode), omp(omp) {}
 
-  /// Whether the memory at obj may be overwritten after this function
-  /// returns. Unknown writes (subsequent_calls_may_write) may overwrite any
-  /// memory not local to this function. Otherwise the caller only wrote to
-  /// its own uncaptured memory, which this function can only reach through an
+  // Whether call may write through an sret-like pointer argument: the only
+  // existing memory a local read-only-or-throw function may write
+  // (DetectReadonlyOrThrowFn). Without a known callee, assume it may.
+  static bool hasSretLikeArgument(CallBase *call) {
+    auto Callee = call->getCalledFunction();
+    for (size_t i = 0; i < call->arg_size(); i++) {
+      if (!call->getArgOperand(i)->getType()->isPointerTy())
+        continue;
+      if (!Callee || call->paramHasAttr(i, Attribute::StructRet) ||
+          i >= Callee->arg_size() ||
+          Callee->getAttribute(i + AttributeList::FirstArgIndex,
+                               "enzymejl_returnRoots")
+              .isValid() ||
+          Callee->getAttribute(i + AttributeList::FirstArgIndex,
+                               "enzymejl_sret_union_bytes")
+              .isValid())
+        return true;
+    }
+    return false;
+  }
+
+  std::map<std::pair<CallInst *, CallInst *>, bool> unexposedAllocations;
+
+  // Whether no use of alloc, including pointers loaded transitively from it,
+  // can expose its storage to callsite. Reject passing even a nocapture
+  // argument: the call could read through it or return one of its fields.
+  // Uses that cannot reach callsite are irrelevant, but a use after the call
+  // in a loop can reach the next iteration and must count. Following loads
+  // also catches publication of the owned buffer without its header. A
+  // loaded value that type analysis knows holds no pointer, such as an
+  // element of a Float64 array read back, cannot name the storage, so its
+  // uses need not be followed.
+  bool allocationUnexposedToCall(CallInst *alloc, CallInst *callsite) {
+    auto key = std::make_pair(alloc, callsite);
+    auto found = unexposedAllocations.find(key);
+    if (found != unexposedAllocations.end())
+      return found->second;
+    SmallVector<Value *, 16> todo{alloc};
+    SmallPtrSet<Value *, 32> seen;
+    while (!todo.empty()) {
+      auto V = todo.pop_back_val();
+      if (!seen.insert(V).second)
+        continue;
+      for (auto U : V->users()) {
+        auto I = dyn_cast<Instruction>(U);
+        if (!I)
+          return unexposedAllocations[key] = false;
+        if (!isPotentiallyReachable(I, callsite, nullptr, &OrigDT, &OrigLI))
+          continue;
+        if (isa<CmpInst>(I) || isa<BranchInst>(I) || isa<SwitchInst>(I))
+          continue;
+        if (auto SI = dyn_cast<StoreInst>(I)) {
+          if (SI->getValueOperand() != V)
+            continue;
+        } else if (auto MI = dyn_cast<MemIntrinsic>(I)) {
+          if (auto MT = dyn_cast<MemTransferInst>(MI)) {
+            if (MT->getRawSource() == V)
+              return unexposedAllocations[key] = false;
+          }
+          if (MI->getRawDest() == V)
+            continue;
+        } else if (isa<LoadInst>(I) && holdsNoPointers(TR.query(I)[{-1}])) {
+          continue;
+        } else if (isPointerArithmeticInst(I) || isa<LoadInst>(I) ||
+                   isa<SelectInst>(I) || isa<ExtractValueInst>(I) ||
+                   isa<InsertValueInst>(I)) {
+          todo.push_back(I);
+          continue;
+        }
+        return unexposedAllocations[key] = false;
+      }
+    }
+    return unexposedAllocations[key] = true;
+  }
+
+  // Whether I only writes storage the call could not reach: created after
+  // callsite, or still unexposed to it. That storage is either a noalias
+  // allocation the call dominates, written directly (a box or tuple a later
+  // statement fills), or fresh owned storage such an allocation's header
+  // points to: an allocator may initialize a field with a pointer to fresh
+  // owned storage, and its enzyme_fresh_pointer attribute gives that field's
+  // byte offset. A header merged from several such allocations qualifies, a
+  // merge with any other object does not. The allocation-order proof requires
+  // a callsite outside loops: a later dynamic execution could otherwise have
+  // seen the allocation. The use proof includes such later executions.
+  bool writesToNewOwnedStorage(Instruction *I, CallInst *callsite) {
+    bool callOutsideLoop = !OrigLI.getLoopFor(callsite->getParent());
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(I))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(I))
+      ptr = MI->getRawDest();
+    if (!ptr)
+      return false;
+    Value *obj = getBaseObject(ptr);
+    if (auto fresh = dyn_cast<CallInst>(obj))
+      return callOutsideLoop && OrigDT.dominates(callsite, fresh) &&
+             isNoAlias(fresh);
+    auto ld = dyn_cast<LoadInst>(obj);
+    if (!ld)
+      return false;
+    SmallVector<CallInst *, 2> allocs;
+    if (!getFreshPointerAllocations(ld, allocs))
+      return false;
+    for (auto alloc : allocs)
+      if (!(callOutsideLoop && OrigDT.dominates(callsite, alloc)) &&
+          !allocationUnexposedToCall(alloc, callsite))
+        return false;
+    int64_t offset = 0;
+    getPointerFieldOwner(ld->getPointerOperand(), offset,
+                         oldFunc->getParent()->getDataLayout());
+    for (auto alloc : allocs)
+      // The cache is keyed by the load alone, which holds only while the
+      // load has a single base allocation.
+      if (isAllocWrittenBeforeLoad(OrigLI, AA, TLI, alloc, ld,
+                                   allocs.size() == 1 ? &allocWrittenBeforeLoad
+                                                      : nullptr) &&
+          isFreshPointerFieldWrittenBefore(OrigLI, AA, alloc, offset, ld,
+                                           writesOnlyItsOwnMemory))
+        return false;
+    return true;
+  }
+
+  // Whether call writes only memory created during it and stack slots, so no
+  // allocation that existed before it (see isFreshPointerFieldWrittenBefore):
+  // a local read-only-or-throw call whose sret-like arguments, through which
+  // it may write, are stack slots.
+  static bool writesOnlyItsOwnMemory(CallBase *call) {
+    if (!isLocalReadOnlyOrThrow(call))
+      return false;
+    auto Callee = call->getCalledFunction();
+    for (size_t i = 0; i < call->arg_size(); i++) {
+      Value *arg = call->getArgOperand(i);
+      if (!arg->getType()->isPointerTy() || isa<AllocaInst>(getBaseObject(arg)))
+        continue;
+      if (!Callee || call->paramHasAttr(i, Attribute::StructRet) ||
+          i >= Callee->arg_size() ||
+          Callee
+              ->getAttribute(i + AttributeList::FirstArgIndex,
+                             "enzymejl_returnRoots")
+              .isValid() ||
+          Callee
+              ->getAttribute(i + AttributeList::FirstArgIndex,
+                             "enzymejl_sret_union_bytes")
+              .isValid())
+        return false;
+    }
+    return true;
+  }
+
+  // getArgumentOwnedStorageWrites answers per callee.
+  ArgumentOwnedWritesCache argumentOwnedWrites;
+
+  // Whether call writes only memory created during it and storage owned by
+  // arguments that are allocations made after callsite, such as Julia's
+  // _mapreducedim! filling the result array that reducedim_initarray just
+  // returned. Each such argument must be a fresh allocation the callsite
+  // dominates (getFreshPointerHeaderAllocations) whose fresh field, the one
+  // the callee writes through, is unchanged up to the call. That storage did
+  // not exist when the callsite read its operands. As in
+  // writesToNewOwnedStorage, the callsite must be outside loops. This reads
+  // the callee's body like read-only-or-throw inference
+  // (DetectReadonlyOrThrowFn), so -enzyme-detect-readthrow=0 disables it too.
+  bool writesOnlyStorageOfNewArguments(CallBase *call, CallInst *callsite) {
+    if (!EnzymeDetectReadThrow)
+      return false;
+    if (OrigLI.getLoopFor(callsite->getParent()))
+      return false;
+    auto Callee = call->getCalledFunction();
+    if (!Callee || Callee->empty() ||
+        Callee->getCallingConv() != call->getCallingConv() ||
+        hasSretLikeArgument(call))
+      return false;
+    ArgumentOwnedWrites writes;
+    if (!getArgumentOwnedStorageWrites(*Callee, TLI, writes,
+                                       argumentOwnedWrites))
+      return false;
+    for (auto &write : writes) {
+      if (write.first >= call->arg_size())
+        return false;
+      SmallVector<CallInst *, 2> allocs;
+      if (!getFreshPointerHeaderAllocations(call->getArgOperand(write.first),
+                                            write.second, allocs))
+        return false;
+      for (auto alloc : allocs)
+        if (!OrigDT.dominates(callsite, alloc) ||
+            isFreshPointerFieldWrittenBefore(OrigLI, AA, alloc, write.second,
+                                             call, writesOnlyItsOwnMemory))
+          return false;
+    }
+    return true;
+  }
+
+  // Names the first write after callsite that may write memory the callee
+  // read through pointers it loaded (subsequent_calls_may_write), with the
+  // object it writes and, for storage named by a loaded pointer, the object
+  // that pointer was loaded from.
+  static void emitUnknownWrite(CallInst *callsite, Instruction *write) {
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(write))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(write))
+      ptr = MI->getRawDest();
+    if (!ptr) {
+      EmitWarning("UncacheableArg", *callsite, "Callsite ", *callsite,
+                  " followed by unknown write ", *write);
+      return;
+    }
+    Value *obj = getBaseObject(ptr);
+    Value *owner = obj;
+    if (auto ld = dyn_cast<LoadInst>(obj))
+      owner = getBaseObject(ld->getPointerOperand());
+    EmitWarning("UncacheableArg", *callsite, "Callsite ", *callsite,
+                " followed by unknown write ", *write, " to ", *obj,
+                " owned by ", *owner);
+  }
+
+  // Whether obj, the base object of a callsite operand, is a pointer this
+  // function received: an argument, or a field of an aggregate argument (as
+  // Julia passes a kernel's arrays, all in one struct). Such a pointer cannot
+  // point to an object this function creates. BasicAA concludes that for an
+  // argument, but does not look through extractvalue.
+  static bool isReceivedPointer(Value *obj) {
+    while (auto EVI = dyn_cast<ExtractValueInst>(obj))
+      obj = EVI->getAggregateOperand();
+    return isa<Argument>(obj);
+  }
+
+  // Whether I writes only an object this function creates: a stack slot, or
+  // the result of a noalias call such as an allocation. A pointer the
+  // function received (isReceivedPointer) cannot point to it.
+  static bool writesOnlyCreatedObject(Instruction *I) {
+    Value *ptr = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(I))
+      ptr = SI->getPointerOperand();
+    else if (auto MI = dyn_cast<MemIntrinsic>(I))
+      ptr = MI->getRawDest();
+    if (!ptr)
+      return false;
+    Value *obj = getBaseObject(ptr);
+    if (isa<AllocaInst>(obj))
+      return true;
+    auto call = dyn_cast<CallBase>(obj);
+    return call && isNoAlias(call);
+  }
+
+  /// Whether the memory at obj, read as values of type read, may be
+  /// overwritten after this function returns. Unknown writes
+  /// (subsequent_calls_may_write) may overwrite any memory not local to this
+  /// function, except that stores of pointers only cannot overwrite memory
+  /// read as integers or floats. Otherwise the caller only wrote to its own
+  /// uncaptured memory, which this function can only reach through an
   /// argument, so only an argument marked overwritten can be.
-  bool is_origin_overwritten(Value *obj) {
-    if (subsequent_calls_may_write)
+  bool is_origin_overwritten(Value *obj,
+                             ConcreteType read = BaseType::Unknown) {
+    if (subsequentWritesMayOverwrite(subsequent_calls_may_write, read))
       return is_value_mustcache_from_origin(obj);
     return is_overwritten_argument(obj);
+  }
+
+  /// The one type of all memory that pointer p points to, or Unknown when
+  /// that memory may hold values of different types.
+  ConcreteType pointeeType(Value *p) {
+    if (!p->getType()->isPointerTy())
+      return BaseType::Unknown;
+    return TR.query(p)[{0, -1}];
   }
 
   std::map<Value *, bool> seen_argument;
@@ -436,7 +743,7 @@ struct CacheAnalysis {
       return false;
 
     // Check if pointer operand is overwritten after this function returns.
-    bool can_modref = is_origin_overwritten(obj);
+    bool can_modref = is_origin_overwritten(obj, TR.query(&li)[{-1}]);
 
     if (!can_modref && checkFunction) {
       allFollowersOf(&li, [&](Instruction *inst2) {
@@ -457,8 +764,21 @@ struct CacheAnalysis {
           }
         }
 
+        // A call that writes no memory which existed before it, except on
+        // paths that throw, cannot overwrite what li read: inst2 follows li,
+        // so that memory existed when the call began. This is the exception
+        // compute_overwritten_args_for_one_callsite makes for what a callee
+        // read. writesToMemoryReadBy makes it only for the non-local variant,
+        // because it does not know which of the two runs first, and the local
+        // variant writes memory it returns. Writes through sret-like
+        // arguments name existing memory, so such a call is checked below.
+        if (auto CB = dyn_cast<CallBase>(inst2))
+          if (isLocalReadOnlyOrThrow(CB) && !hasSretLikeArgument(CB))
+            return false;
+
         if (!overwritesToMemoryReadBy(&TR, AA, TLI, SE, OrigLI, OrigDT, &li,
-                                      inst2)) {
+                                      inst2, /*scope*/ nullptr,
+                                      &allocWrittenBeforeLoad)) {
           return false;
         }
 
@@ -552,7 +872,7 @@ struct CacheAnalysis {
     return can_modref_map;
   }
 
-  std::pair<bool, std::vector<bool>>
+  std::pair<uint8_t, std::vector<bool>>
   compute_overwritten_args_for_one_callsite(CallInst *callsite_op) {
     auto Fn = getFunctionFromCall(callsite_op);
     if (!Fn)
@@ -607,6 +927,8 @@ struct CacheAnalysis {
     SmallVector<Value *, 4> args;
     SmallVector<Value *, 4> objs;
     SmallVector<bool, 4> args_safe;
+    // Whether each argument points to memory known to hold no pointers.
+    SmallVector<bool, 4> args_no_pointers;
 
     // First, we need to propagate the uncacheable status from the parent
     // function to the callee.
@@ -621,7 +943,10 @@ struct CacheAnalysis {
 
       objs.push_back(obj);
 
-      bool init_safe = !is_origin_overwritten(obj);
+      ConcreteType read = pointeeType(callsite_op->getArgOperand(i));
+      args_no_pointers.push_back(holdsNoPointers(read));
+
+      bool init_safe = !is_origin_overwritten(obj, read);
       if (!init_safe) {
         if (!TR.anyPointer(obj))
           init_safe = true;
@@ -636,7 +961,7 @@ struct CacheAnalysis {
       args_safe.push_back(init_safe);
     }
 
-    bool next_subsequent_inst_may_write = subsequent_calls_may_write;
+    uint8_t next_subsequent_inst_may_write = subsequent_calls_may_write;
 
     // Second, we check for memory modifications that can occur in the
     // continuation of the
@@ -683,19 +1008,40 @@ struct CacheAnalysis {
       if (!inst2->mayWriteToMemory())
         return false;
 
-      // A call that writes memory existing before it only on paths that throw
-      // cannot overwrite anything the callee read: if it throws, the reverse
-      // pass never runs.
+      // Memory only the callee's own runtime can access, such as what
+      // julia.write_barrier records, is not memory the call read.
       if (auto CB = dyn_cast<CallBase>(inst2))
-        if (isReadOnlyOrThrow(CB))
+        if (CB->onlyAccessesInaccessibleMemory())
           return false;
 
-      // A write to uncaptured local or noalias argument memory is not an
-      // unknown write: the callee can only reach that memory through an
-      // argument, which is marked overwritten below.
-      if (!writesOnlyUncapturedLocalOrNoaliasArgMemory(inst2, TLI))
-        next_subsequent_inst_may_write = true;
+      // A call that writes no memory which existed before it, except on paths
+      // that throw, cannot overwrite what the callee read. writesToMemoryReadBy
+      // makes the same exception for a load in this function. The local
+      // variant also allows writes through sret-like arguments, which name
+      // existing memory; such a call is handled below like any other write.
+      if (auto CB = dyn_cast<CallBase>(inst2))
+        if (isReadOnlyOrThrow(CB) ||
+            (isLocalReadOnlyOrThrow(CB) && !hasSretLikeArgument(CB)) ||
+            writesOnlyStorageOfNewArguments(CB, callsite_op))
+          return false;
 
+      if (writesToNewOwnedStorage(inst2, callsite_op))
+        return false;
+
+      const uint8_t kind = subsequentWriteKind(inst2);
+
+      // A write to uncaptured local memory is not an unknown write: the callee
+      // can only reach that memory through an argument, which is marked
+      // overwritten below. An unknown write adds its kind: after stores of
+      // pointers only, the callee may keep numbers it reads.
+      if (!writesOnlyUncapturedLocalOrNoaliasArgMemory(inst2, TLI)) {
+        uint8_t next = addSubsequentWrite(next_subsequent_inst_may_write, kind);
+        if (next != next_subsequent_inst_may_write &&
+            !(next_subsequent_inst_may_write & SubsequentWriteAny))
+          emitUnknownWrite(callsite_op, inst2);
+        next_subsequent_inst_may_write = next;
+      }
+      const bool writesCreatedObject = writesOnlyCreatedObject(inst2);
       for (unsigned i = 0; i < args.size(); ++i) {
         if (!args_safe[i])
           continue;
@@ -708,7 +1054,13 @@ struct CacheAnalysis {
         if (!TR.anyPointer(args[i]))
           continue;
 
+        // A store of a pointer does not overwrite memory that holds no
+        // pointers (see SubsequentWritePointers).
+        if (kind == SubsequentWritePointers && args_no_pointers[i])
+          continue;
+
         if (!callsite_op->getArgOperand(i)->getType()->isPointerTy() ||
+            (!writesCreatedObject || !isReceivedPointer(objs[i])) &&
             writesToMemoryReadBy(
                 AA, TLI, MemoryLocation::getForArgument(callsite_op, i, TLI),
                 inst2)) {
@@ -767,9 +1119,9 @@ struct CacheAnalysis {
   //   the set of uncacheable arguments for each callsite inside the function. A
   //   pointer argument is uncacheable at a callsite if the memory pointed to
   //   might be modified after that callsite.
-  std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+  std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
   compute_overwritten_args_for_callsites() {
-    std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+    std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
         overwritten_args_map;
 
     for (auto &B : *oldFunc) {
@@ -788,7 +1140,8 @@ struct CacheAnalysis {
           // For all other calls, we compute the uncacheable args for this
           // callsite.
           overwritten_args_map.insert(
-              std::pair<CallInst *, std::pair<bool, const std::vector<bool>>>(
+              std::pair<CallInst *,
+                        std::pair<uint8_t, const std::vector<bool>>>(
                   op, compute_overwritten_args_for_one_callsite(op)));
         }
       }
@@ -1019,7 +1372,8 @@ void calculateUnusedValuesInFunction(
               num++;
             }
           }
-          if (num > 1 || mode != DerivativeMode::ReverseModeGradient) {
+          if (mode != DerivativeMode::ReverseModeGradient ||
+              (num > 1 && !gutils->isReplayedOnceLatch(inst, mode))) {
             return UseReq::Need;
           }
         }
@@ -1787,17 +2141,52 @@ bool legalCombinedForwardReverse(
   if (!legal)
     return false;
 
+  // What moves is placed after the combined call in the reverse block of the
+  // call, so it runs only when the call runs. An instruction moves only if
+  // every path to it passes through the call.
+  auto dominatedByCall = [&](Instruction *inst) {
+    if (gutils->OrigDT->dominates(origop->getParent(), inst->getParent()))
+      return true;
+    if (EnzymePrintPerf) {
+      if (called)
+        llvm::errs() << " [dom] failed to replace function "
+                     << (called->getName()) << " due to " << *inst << "\n";
+      else
+        llvm::errs() << " [dom] failed to replace function " << (*calledValue)
+                     << " due to " << *inst << "\n";
+    }
+    return false;
+  };
+
+  unsigned reachableReturns = 0;
+  bool movesReturn = false;
   allFollowersOf(origop, [&](Instruction *inst) {
     if (auto ri = dyn_cast<ReturnInst>(inst)) {
       auto find = replacedReturns.find(ri);
       if (find != replacedReturns.end()) {
-        postCreate.push_back(find->second);
+        ++reachableReturns;
+        // The store of the primal return value moves only when the returned
+        // value moves. Otherwise it stays in the forward pass, which runs
+        // whether or not the call does.
+        if (usetree.count(ri)) {
+          if (!dominatedByCall(ri)) {
+            legal = false;
+            return true;
+          }
+          movesReturn = true;
+          postCreate.push_back(find->second);
+        }
         return false;
       }
     }
 
     if (usetree.count(inst) == 0 || unnecessaryInstructions.count(inst))
       return false;
+    if (!dominatedByCall(inst)) {
+      legal = false;
+      // Early exit
+      return true;
+    }
     if (inst->getParent() != origop->getParent()) {
       // Don't move a writing instruction (may change speculatable/etc things)
       if (inst->mayWriteToMemory()) {
@@ -1834,6 +2223,22 @@ bool legalCombinedForwardReverse(
 
   if (!legal)
     return false;
+
+  // A moved store of the return value runs after the call whichever return
+  // the forward pass took, so it must be the only return the call reaches.
+  if (movesReturn && reachableReturns > 1) {
+    if (EnzymePrintPerf) {
+      if (called)
+        llvm::errs() << " [ret] failed to replace function "
+                     << (called->getName()) << " due to " << reachableReturns
+                     << " reachable returns\n";
+      else
+        llvm::errs() << " [ret] failed to replace function " << (*calledValue)
+                     << " due to " << reachableReturns
+                     << " reachable returns\n";
+    }
+    return false;
+  }
 
   if (EnzymePrintPerf) {
     if (called)
@@ -1878,6 +2283,9 @@ void clearFunctionAttributes(Function *f) {
       "enzyme_ta_norecur",
       "enzyme_ReadOnlyOrThrow",
       "enzyme_LocalReadOnlyOrThrow",
+      // DetectReadonlyOrThrow may infer it for a function returning a fresh
+      // allocation; a derivative returns other values.
+      "enzyme_fresh_pointer",
   };
 
   for (auto attr : strfnattrs) {
@@ -2119,7 +2527,8 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
     RequestContext context, Function *todiff, DIFFE_TYPE retType,
     ArrayRef<DIFFE_TYPE> constant_args, TypeAnalysis &TA, bool returnUsed,
     bool shadowReturnUsed, const FnTypeInfo &oldTypeInfo_,
-    bool subsequent_calls_may_write, const std::vector<bool> _overwritten_args,
+    uint8_t subsequent_calls_may_write,
+    const std::vector<bool> _overwritten_args,
     const std::vector<bool> &nowrite_shadows, bool forceAnonymousTape,
     bool runtimeActivity, bool strongZero, unsigned width, bool AtomicAdd,
     bool omp) {
@@ -2602,7 +3011,7 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
                    *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
                    subsequent_calls_may_write, _overwritten_argsPP,
                    DerivativeMode::ReverseModePrimal, omp);
-  const std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map = CA.compute_overwritten_args_for_callsites();
   gutils->overwritten_args_map_ptr = &overwritten_args_map;
 
@@ -4449,7 +4858,7 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
                    *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
                    key.subsequent_calls_may_write, _overwritten_argsPP,
                    key.mode, omp);
-  const std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map =
           (augmenteddata) ? augmenteddata->overwritten_args_map
                           : CA.compute_overwritten_args_for_callsites();
@@ -4692,8 +5101,10 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
                              key.retType);
   }
 
-  if (key.mode == DerivativeMode::ReverseModeGradient)
+  if (key.mode == DerivativeMode::ReverseModeGradient) {
     restoreCache(gutils, mapping, guaranteedUnreachable);
+    gutils->replayLatchesOnce();
+  }
 
   gutils->eraseFictiousPHIs();
 
@@ -4832,7 +5243,8 @@ Function *EnzymeLogic::CreateForwardDiff(
     ArrayRef<DIFFE_TYPE> constant_args, TypeAnalysis &TA, bool returnUsed,
     DerivativeMode mode, bool freeMemory, bool runtimeActivity, bool strongZero,
     unsigned width, llvm::Type *additionalArg, const FnTypeInfo &oldTypeInfo_,
-    bool subsequent_calls_may_write, const std::vector<bool> _overwritten_args,
+    uint8_t subsequent_calls_may_write,
+    const std::vector<bool> _overwritten_args,
     const AugmentedReturn *augmenteddata, bool omp) {
 
   TimeTraceScope timeScope("CreateForwardDiff", todiff->getName());
@@ -5103,6 +5515,12 @@ Function *EnzymeLogic::CreateForwardDiff(
     if (EmitNoDerivativeError(ss.str(), todiff, context)) {
       auto newFunc = gutils->newFunc;
       delete gutils;
+      // Later calls get this function from ForwardCachedFunctions without a
+      // request of their own, so raise the error in its body too, as
+      // CreateAugmentedPrimal does. Otherwise they reach its bare unreachable.
+      IRBuilder<> b(&*newFunc->getEntryBlock().begin());
+      RequestContext context2{nullptr, &b};
+      EmitNoDerivativeError(ss.str(), todiff, context2);
       return newFunc;
     }
     llvm::errs() << "mod: " << *todiff->getParent() << "\n";
@@ -5144,7 +5562,7 @@ Function *EnzymeLogic::CreateForwardDiff(
         PPC.FAM.getResult<ScalarEvolutionAnalysis>(*gutils->oldFunc),
         *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
         subsequent_calls_may_write, _overwritten_argsPP, mode, omp);
-    const std::map<CallInst *, std::pair<bool, const std::vector<bool>>>
+    const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
         overwritten_args_map = CA.compute_overwritten_args_for_callsites();
     gutils->overwritten_args_map_ptr = &overwritten_args_map;
     can_modref_map = std::make_unique<const std::map<Instruction *, bool>>(

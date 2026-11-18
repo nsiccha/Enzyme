@@ -73,6 +73,7 @@
 #include "llvm-c/Core.h"
 
 class GradientUtils;
+struct ArgumentOwnedWritesCache;
 extern llvm::StringMap<std::function<llvm::Value *(
     llvm::IRBuilder<> &, llvm::CallInst *, llvm::ArrayRef<llvm::Value *>,
     GradientUtils *)>>
@@ -141,10 +142,25 @@ public:
   DerivativeMode mode;
   llvm::Function *oldFunc;
   llvm::ValueMap<const llvm::Value *, InvertedPointerVH> invertedPointers;
+
+  /// A combined forward and reverse function keeps its caches to itself, so
+  /// their layout needs no agreement with a separate reverse function.
+  bool groupPackedCaches() const override {
+    return mode == DerivativeMode::ReverseModeCombined;
+  }
   llvm::DominatorTree *OrigDT;
   llvm::PostDominatorTree *OrigPDT;
   llvm::LoopInfo *OrigLI;
   llvm::ScalarEvolution *OrigSE;
+
+  /// Original, loop-invariant values whose independent adjoint contributions
+  /// belong exclusively to reassociable additive reductions. Compute once per
+  /// leaf loop; never infer permission from unrelated fast arithmetic.
+  llvm::DenseMap<const llvm::Loop *, llvm::SmallPtrSet<llvm::Value *, 8>>
+      reassociableAdjoints;
+  void findReassociableAdjoints(llvm::Loop *L,
+                                llvm::SmallPtrSetImpl<llvm::Value *> &result);
+  bool canReassociateAdjoint(llvm::Value *V, llvm::BasicBlock *reverseBlock);
 
   /// (Original) Blocks which dominate all returns
   llvm::SmallPtrSet<llvm::BasicBlock *, 4> BlocksDominatingAllReturns;
@@ -186,7 +202,7 @@ public:
   llvm::SmallPtrSet<llvm::Instruction *, 4> unnecessaryIntermediates;
 
   const std::map<llvm::Instruction *, bool> *can_modref_map;
-  const std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       *overwritten_args_map_ptr;
   const llvm::SmallPtrSetImpl<const llvm::Value *> *unnecessaryValuesP;
   //! In the reverse pass of split mode, the augmented pass's unnecessary values
@@ -202,10 +218,20 @@ public:
 
   /// The Julia allocation zeroing bundles (julia.gc_alloc_ptr_offsets,
   /// julia.gc_alloc_zeroinit[_indirect]) of orig, for use on a shadow
-  /// allocation of the same size.
+  /// allocation of the same size. If zeroAllSize is given, instead return a
+  /// julia.gc_alloc_zeroinit bundle that zeroes all zeroAllSize bytes.
   llvm::SmallVector<llvm::OperandBundleDef, 1>
   getAllocationZeroingBundles(llvm::CallInst *orig, llvm::IRBuilder<> &Builder2,
-                              bool lookup);
+                              bool lookup, llvm::Value *zeroAllSize = nullptr);
+
+  /// Whether Julia can zero a shadow of orig in late-gc-lowering, in place of
+  /// a memset: orig is a julia.gc_alloc_obj that carries the zeroing bundles
+  /// of julia#60924, so this Julia version supports them.
+  static bool canZeroAllocationWithBundle(const llvm::CallInst *orig);
+
+  /// Mark a shadow allocation that a julia.gc_alloc_zeroinit bundle zeroes as
+  /// allockind("alloc,zeroed"), so that LLVM and Julia's AllocOpt know.
+  static void markAllocationZeroed(llvm::CallInst *alloc);
 
   bool usedInRooting(const llvm::CallBase *orig,
                      llvm::ArrayRef<ValueType> types, const llvm::Value *val,
@@ -225,7 +251,31 @@ public:
   llvm::Value *getOrInsertConditionalIndex(llvm::Value *val, LoopContext &lc,
                                            bool pickTrue);
 
+  /// Whether the loop-carried value \p val of the header phi \p phi (both in
+  /// the original function) has no active use inside the phi's loop other than
+  /// the phi itself, i.e. only its value after the loop is differentiated.
+  bool onlyActiveUseInLoopIsPHI(const llvm::Instruction *val,
+                                const llvm::PHINode *phi) const;
+
   bool assumeDynamicLoopOfSizeOne(llvm::Loop *L) const override;
+
+  /// Whether, in a split derivative (\p mode ReverseModePrimal or
+  /// ReverseModeGradient), the reverse function replays the loop exited by the
+  /// conditional branch \p term of the original function only once, so that
+  /// the replay needs no condition for \p term. That holds when \p term is the
+  /// loop's latch and only exiting branch, the loop's limit cannot be computed
+  /// and assumeDynamicLoopOfSizeOne holds (its reverse already runs one
+  /// iteration), its exit is dedicated, it writes no memory, and its values
+  /// leave it only through phis, which are cached rather than recomputed.
+  bool isReplayedOnceLatch(const llvm::Instruction *term,
+                           DerivativeMode mode) const;
+  /// isReplayedOnceLatch per latch block of the original function, computed
+  /// at the first query so that later changes to newFunc cannot change it.
+  mutable std::map<const llvm::BasicBlock *, bool> replayedOnceLatches;
+
+  /// In the reverse function of a split derivative, make each latch for which
+  /// isReplayedOnceLatch holds branch to its exit.
+  void replayLatchesOnce();
 
   llvm::DebugLoc getNewFromOriginal(const llvm::DebugLoc L) const;
 
@@ -333,7 +383,8 @@ public:
   llvm::ValueMap<llvm::Value *, ShadowRematerializer> backwardsOnlyShadows;
   std::vector<bool> nowrite_shadows;
 
-  void computeForwardingProperties(llvm::Instruction *V);
+  void computeForwardingProperties(llvm::Instruction *V,
+                                   ArgumentOwnedWritesCache &ownedWrites);
   void computeGuaranteedFrees();
 
 private:
@@ -409,8 +460,80 @@ public:
       std::map<std::pair<llvm::Instruction *, CacheType>, int> &mapping,
       llvm::IRBuilder<> &);
 
+  /// `orig`, when given, is the instruction of the original function whose
+  /// value (or shadow) `malloc` is; it chooses the loops that index the cache
+  /// (iterationInvariantCacheScope). Without it, `malloc` itself is used when
+  /// it is an original instruction.
   llvm::Value *cacheForReverse(llvm::IRBuilder<> &BuilderQ, llvm::Value *malloc,
-                               int idx, bool replace = true);
+                               int idx, bool replace = true,
+                               const llvm::Instruction *orig = nullptr);
+
+  /// The block whose loops index the cache of `orig`, an instruction of the
+  /// original function, or null to keep one entry per iteration of every loop
+  /// around it. A value that is the same in every iteration of some loops
+  /// around it (a load through an address those loops do not change, of
+  /// memory no instruction in them may write) is cached once per entry of the
+  /// outermost such loop: the result is that loop's preheader in newFunc.
+  /// The answer depends on the original function only, so the augmented
+  /// forward pass and the reverse pass that reads its tape agree on it.
+  llvm::BasicBlock *iterationInvariantCacheScope(const llvm::Instruction *orig);
+
+  /// The reverse block in which `inst` can be recomputed once per entry of the
+  /// reverse of the innermost loop that BuilderM's block belongs to, or null if
+  /// it must be recomputed where it is used. `inst` must be defined in a loop
+  /// around that loop or in no loop, and that loop must have one exit, which
+  /// `inst` dominates. Sets `branches` if recomputing it branches, which needs
+  /// the end of a block without a terminator.
+  llvm::BasicBlock *
+  reverseLoopEntryForRecompute(llvm::Instruction *inst,
+                               llvm::IRBuilder<> &BuilderM,
+                               const llvm::ValueToValueMapTy &available,
+                               bool &branches);
+
+  /// Whether lookupM can directly use a forward SSA value defined in origDef
+  /// at the reverse of origUse. Both blocks belong to the original function.
+  bool primalValueAvailableInReverse(const llvm::BasicBlock *origDef,
+                                     const llvm::BasicBlock *origUse) const;
+
+  /// Whether a value can be recomputed the same way from any position after a
+  /// loop exit's reverse block, and if so whether that takes a branch.
+  enum class LoopEntryRecompute { No, Plain, Merge };
+
+  /// Whether `inst` and everything it is computed from are recomputed the same
+  /// way from any position after `origExit`'s reverse block: plain operations
+  /// of the original function, merges of branches, induction variables of loops
+  /// around `origExit`, memory the reverse pass does not rematerialize, and
+  /// forward values that lookupM can use directly.
+  /// `inMerge` says the value is only read on one path of a merge, where it may
+  /// also come from a cache.
+  LoopEntryRecompute recomputesAnywhereInReverse(
+      llvm::Instruction *inst, const llvm::BasicBlock *origExit,
+      llvm::IRBuilder<> &BuilderM, unsigned depth = 0, bool inMerge = false);
+
+  /// The same for a phi that is not an induction variable: its incoming values
+  /// and the conditions that choose between them.
+  LoopEntryRecompute
+  mergeRecomputesAtLoopEntry(llvm::PHINode *phi,
+                             const llvm::BasicBlock *origExit,
+                             llvm::IRBuilder<> &BuilderM, unsigned depth);
+
+  /// The answers of recomputesAnywhereInReverse.
+  std::map<std::tuple<const llvm::Instruction *, const llvm::BasicBlock *, bool>,
+           LoopEntryRecompute>
+      recomputableAtLoopEntry;
+
+private:
+  /// Whether `V` has one value in all iterations of `L` (a loop of the
+  /// original function) within one execution of `L`.
+  bool isIterationInvariant(const llvm::Value *V, const llvm::Loop *L,
+                            unsigned depth = 0);
+  /// Instructions of a loop of the original function that may write memory.
+  std::map<const llvm::Loop *, llvm::SmallVector<llvm::Instruction *, 4>>
+      loopWriters;
+  std::map<const llvm::Instruction *, llvm::BasicBlock *>
+      iterationInvariantScopes;
+
+public:
 
   llvm::ArrayRef<llvm::WeakTrackingVH> getTapeValues() const {
     return addedTapeVals;
@@ -426,7 +549,20 @@ public:
   // functions with inf
   bool strongZero;
 
+  // Whether the reverse rules of `orig`, an instruction of oldFunc, treat a
+  // zero adjoint as a strong zero: always under strongZero, and otherwise when
+  // `orig` reaches the function's results only through the value operands of
+  // selects and is a pole (a division, a remainder, a call) or computed from
+  // one. Such a value has a zero adjoint whenever no select picks it, and LLVM
+  // speculates guarded code into select arms (`c ? 1 / x : 0` becomes
+  // `select c, 1 / x, 0`), whose partials can then be infinite or NaN.
+  bool strongZeroFor(const llvm::Value *orig);
+
 private:
+  bool selectMaskedComputed = false;
+  llvm::SmallPtrSet<const llvm::Value *, 4> selectMasked;
+  void computeSelectMasked();
+
   unsigned width;
 
 public:
@@ -599,6 +735,25 @@ public:
       const std::map<llvm::BasicBlock *, llvm::PHINode *> *replacePHIs =
           nullptr);
 
+private:
+  /// branchToCorrespondingTarget for any number of targets, without a cache:
+  /// replays the forward pass's branch decisions between the nearest block
+  /// dominating `ctx` and the edges into the targets from their recomputed
+  /// conditions. `done` maps each edge of that region to the targets reachable
+  /// through it. Returns false, emitting nothing, when some condition would
+  /// have to be cached or is unsafe to evaluate on paths the forward pass did
+  /// not take, or when the region is not an acyclic part of one iteration.
+  bool branchByRecomputedPredicates(
+      llvm::BasicBlock *ctx, llvm::IRBuilder<> &BuilderM,
+      const std::map<llvm::BasicBlock *,
+                     std::vector<std::pair</*pred*/ llvm::BasicBlock *,
+                                           /*successor*/ llvm::BasicBlock *>>>
+          &targetToPreds,
+      const std::map<std::pair<llvm::BasicBlock *, llvm::BasicBlock *>,
+                     std::set<llvm::BasicBlock *>> &done,
+      const std::map<llvm::BasicBlock *, llvm::PHINode *> *replacePHIs);
+
+public:
   void getReverseBuilder(llvm::IRBuilder<> &Builder2, bool original = true);
 
   void getForwardBuilder(llvm::IRBuilder<> &Builder2);

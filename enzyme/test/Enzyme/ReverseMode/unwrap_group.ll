@@ -54,7 +54,7 @@ declare dso_local void @__enzyme_autodiff(i8*, double*, double*, i32*) local_unn
 ; CHECK: bb12:                                             ; preds = %bb5
 ; CHECK-NEXT:   store double 0.000000e+00, double* %arg, align 8, !alias.scope ![[ARG_SC]], !noalias ![[NA_SC]]
 ; CHECK-NEXT:   store double 0.000000e+00, double* %"arg'", align 8, !alias.scope ![[NA_SC]], !noalias ![[ARG_SC]]
-; CHECK-NEXT:   br i1 %tmp, label %invert, label %invertbb5
+; CHECK-NEXT:   br i1 %tmp, label %invert, label %invertbb12.loopexit
 
 ; CHECK: invert.critedge:                                  ; preds = %0
 ; CHECK-NEXT:   store double 0.000000e+00, double* %arg, align 8, !alias.scope ![[ARG_SC]], !noalias ![[NA_SC]]
@@ -64,13 +64,11 @@ declare dso_local void @__enzyme_autodiff(i8*, double*, double*, i32*) local_unn
 ; CHECK: invert:                                           ; preds = %invert.critedge, %invertbb5, %bb12
 ; CHECK-NEXT:   ret void
 
-; CHECK: invertbb5:                                        ; preds = %bb12, %incinvertbb5
-; CHECK-NEXT:   %"iv'ac.0" = phi i64 [ %[[i5:.+]], %incinvertbb5 ], [ 199, %bb12 ]
+; CHECK: invertbb5:                                        ; preds = %invertbb12.loopexit, %incinvertbb5
+; CHECK-NEXT:   %"iv'ac.0" = phi i64 [ 199, %invertbb12.loopexit ], [ %[[i5:.+]], %incinvertbb5 ]
 ; CHECK-NEXT:   %"tmp7'ipg_unwrap" = getelementptr inbounds double, double* %"arg'", i64 %"iv'ac.0"
 ; CHECK-NEXT:   %[[i1:.+]] = load double, double* %"tmp7'ipg_unwrap", align 8, !alias.scope ![[NA_SC]], !noalias ![[ARG_SC]]
 ; CHECK-NEXT:   store double 0.000000e+00, double* %"tmp7'ipg_unwrap", align 8, !alias.scope ![[NA_SC]], !noalias ![[ARG_SC]]
-; CHECK-NEXT:   %tmp3_unwrap = load i32, i32* %arg1, align 4, !alias.scope ![[ARG1_SC]], !noalias ![[NA1_SC]], !invariant.group ![[INVG]]
-; CHECK-NEXT:   %tmp4_unwrap = sitofp i32 %tmp3_unwrap to double
 ; CHECK-NEXT:   %[[m0diffetmp8:.+]] = fmul fast double %[[i1]], %tmp4_unwrap
 ; CHECK-NEXT:   %[[i2:.+]] = load double, double* %"tmp7'ipg_unwrap", align 8, !alias.scope ![[NA_SC]], !noalias ![[ARG_SC]]
 ; CHECK-NEXT:   %[[i3:.+]] = fadd fast double %[[i2]], %[[m0diffetmp8]]
@@ -80,5 +78,10 @@ declare dso_local void @__enzyme_autodiff(i8*, double*, double*, i32*) local_unn
 
 ; CHECK: incinvertbb5:                                     ; preds = %invertbb5
 ; CHECK-NEXT:   %[[i5]] = add nsw i64 %"iv'ac.0", -1
+; CHECK-NEXT:   br label %invertbb5
+
+; CHECK: invertbb12.loopexit:                              ; preds = %bb12
+; CHECK-NEXT:   %tmp3_unwrap = load i32, i32* %arg1, align 4, !alias.scope ![[ARG1_SC]], !noalias ![[NA1_SC]], !invariant.group ![[INVG]]
+; CHECK-NEXT:   %tmp4_unwrap = sitofp i32 %tmp3_unwrap to double
 ; CHECK-NEXT:   br label %invertbb5
 ; CHECK-NEXT: }

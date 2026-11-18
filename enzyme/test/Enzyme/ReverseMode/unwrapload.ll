@@ -133,7 +133,7 @@ declare dso_local double @__enzyme_autodiff(i8*, double*, double*, i64*)
 ; SHARED-NEXT:   %iv = phi i64 [ %iv.next, %exit ], [ 0, %entry ]
 ; SHARED-NEXT:   %iv.next = add nuw nsw i64 %iv, 1
 ; SHARED-NEXT:   %1 = getelementptr inbounds i64, i64* %[[a19cache]], i64 %iv
-; SHARED-NEXT:   %a19 = load i64, i64* %1, align 8, !invariant.group !1
+; SHARED-NEXT:   %a19 = load i64, i64* %1, align 8, !invariant.group !{{[0-9]+}}, !enzyme_type !{{[0-9]+}}
 ; SHARED-NEXT:   br label %loop2
 
 ; SHARED: loop2:                                            ; preds = %loop2, %loop1

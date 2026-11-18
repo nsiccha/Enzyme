@@ -25,6 +25,7 @@
 #ifndef ENZYME_UTILS_H
 #define ENZYME_UTILS_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -966,6 +967,27 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
                      const llvm::ArrayRef<llvm::OperandBundleDef> bundles,
                      bool byRef, bool cublas, bool julia_decl);
 
+/// Scale, in place, the adjoint or tangent of an output that a BLAS routine
+/// wrote as `out := ... + scale * out`, following BLAS's own semantics for the
+/// scale: when it is zero the routine never read the output, so the entries are
+/// overwritten with zero and not multiplied by it (0 * NaN and 0 * Inf are
+/// NaN). The entries are those of an m x n matrix with leading dimension ld,
+/// restricted to the triangle `uplo` names if it names one. A vector with
+/// increment inc is the 1 x n matrix with leading dimension |inc|: pass
+/// `uplo == nullptr`, `m == nullptr` and `absLd == true`.
+///
+/// Every value is in the calling convention of the BLAS routine being
+/// differentiated (`byRef`, `cblas` with its `layout`), except `scale`, which
+/// `scaleByRef` describes, and `out`, which may also be an integer holding the
+/// address.
+void callScaleOrZero(llvm::IRBuilder<> &B, llvm::Module &M,
+                     llvm::IntegerType *IT, llvm::Type *fpTy,
+                     llvm::Value *layout, llvm::Value *uplo, llvm::Value *m,
+                     llvm::Value *n, llvm::Value *scale, llvm::Value *out,
+                     llvm::Value *ld, bool absLd,
+                     llvm::ArrayRef<llvm::OperandBundleDef> bundles, bool byRef,
+                     bool scaleByRef, bool cblas);
+
 /// Create function for type that performs memcpy with a stride
 llvm::Function *getOrInsertMemcpyStrided(llvm::Module &M,
                                          llvm::Type *elementType,
@@ -1253,6 +1275,66 @@ bool writesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
                           llvm::Instruction *maybeReader,
                           llvm::Instruction *maybeWriter);
 
+/// For each load out of a fresh allocation or alloca, whether memory that the
+/// load reads may be written between the allocation and the load (see
+/// arePointersGuaranteedNoAlias). The answer depends on the load alone, so a
+/// caller that compares many pointers within one unchanged function can keep
+/// the answers here instead of rescanning the function for every pair.
+using AllocWrittenBeforeLoadCache = llvm::DenseMap<llvm::LoadInst *, bool>;
+
+bool isAllocWrittenBeforeLoad(llvm::LoopInfo &LI, llvm::AAResults &AA,
+                              llvm::TargetLibraryInfo &TLI,
+                              llvm::Instruction *alloc_call, llvm::LoadInst *ld,
+                              AllocWrittenBeforeLoadCache *cache);
+
+/// An allocator may initialize a field of the object it returns with a pointer
+/// to fresh storage the object owns; its enzyme_fresh_pointer attribute gives
+/// that field's byte offset. Whether ld loads such a field: its pointer is a
+/// constant offset from a header that is a noalias call to such an allocator
+/// declaring that offset, or a phi or select merging only such calls (Julia
+/// allocates a broadcast's output on each of its branches). On success the
+/// allocations are appended to allocs. That the field still holds the
+/// allocator's pointer at ld is a separate question, which
+/// isAllocWrittenBeforeLoad answers for each allocation.
+bool getFreshPointerAllocations(
+    llvm::LoadInst *ld, llvm::SmallVectorImpl<llvm::CallInst *> &allocs);
+
+/// Whether name is one of Julia's runtime functions that resize the array they
+/// take first (push!, append!, resize! and friends on Julia 1.10): they write
+/// only that array's header and the storage it owns, which they may replace
+/// with storage they allocate.
+bool isJuliaArrayResize(llvm::StringRef name);
+
+/// The object whose field ptr points to, with that field's byte offset in
+/// offset: GetPointerBaseWithConstantOffset, which also looks through
+/// julia.pointer_from_objref. Julia takes an object's address that way to
+/// read its fields for a foreign call, such as an array's data pointer for a
+/// BLAS routine.
+llvm::Value *getPointerFieldOwner(llvm::Value *ptr, int64_t &offset,
+                                  const llvm::DataLayout &DL);
+
+/// Whether alloc is a noalias call to an allocator declaring a fresh field
+/// (enzyme_fresh_pointer); field receives that field's byte offset.
+bool getFreshPointerField(llvm::CallInst *alloc, int64_t &field);
+
+/// Whether header, with pointer casts stripped, is a noalias call to an
+/// allocator declaring offset as its fresh field, or a phi or select merging
+/// only such calls (see getFreshPointerAllocations). On success the
+/// allocations are appended to allocs.
+bool getFreshPointerHeaderAllocations(
+    llvm::Value *header, int64_t offset,
+    llvm::SmallVectorImpl<llvm::CallInst *> &allocs);
+
+/// Whether an instruction between alloc, a call getFreshPointerField accepts,
+/// and before (exclusive) may change the pointer in alloc's fresh field. A
+/// write through that pointer does not: it writes the storage the field names,
+/// not the field. Neither does a call that writes only memory created during
+/// it, as writesOnlyNewMemory may show (alloc existed before the call).
+bool isFreshPointerFieldWrittenBefore(
+    llvm::LoopInfo &LI, llvm::AAResults &AA, llvm::CallInst *alloc,
+    int64_t offset, llvm::Instruction *before,
+    llvm::function_ref<bool(llvm::CallBase *)> writesOnlyNewMemory = nullptr);
+
 // A more advanced version of writesToMemoryReadBy, where the writing
 // instruction comes after the reading function. Specifically, even if the two
 // instructions may access the same location, this variant checks whether
@@ -1264,13 +1346,11 @@ bool writesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
 //      load A[i-1]
 //      store A[i] = ...
 //   }
-bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
-                              llvm::TargetLibraryInfo &TLI,
-                              llvm::ScalarEvolution &SE, llvm::LoopInfo &LI,
-                              llvm::DominatorTree &DT,
-                              llvm::Instruction *maybeReader,
-                              llvm::Instruction *maybeWriter,
-                              llvm::Loop *scope = nullptr);
+bool overwritesToMemoryReadBy(
+    const TypeResults *TR, llvm::AAResults &AA, llvm::TargetLibraryInfo &TLI,
+    llvm::ScalarEvolution &SE, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
+    llvm::Instruction *maybeReader, llvm::Instruction *maybeWriter,
+    llvm::Loop *scope = nullptr, AllocWrittenBeforeLoadCache *cache = nullptr);
 static inline void
 /// Call the function f for all instructions that happen between inst1 and inst2
 /// If the function returns true, the iteration will early exit
@@ -1286,29 +1366,24 @@ allInstructionsBetween(llvm::LoopInfo &LI, llvm::Instruction *inst1,
       return;
   }
 
-  std::set<llvm::Instruction *> instructions;
-
   llvm::Loop *l1 = LI.getLoopFor(inst1->getParent());
   while (l1 && !l1->contains(inst2->getParent()))
     l1 = l1->getParentLoop();
 
-  // Do all instructions from inst1 up to first instance of inst2's start block
+  // Do all instructions from inst1 up to first instance of inst2's start
+  // block. Every instruction of a reached block is in between, so keep the
+  // blocks rather than each of their instructions.
+  llvm::SmallPtrSet<llvm::BasicBlock *, 16> blocks;
   {
     std::deque<llvm::BasicBlock *> todo;
-    std::set<llvm::BasicBlock *> done;
     for (auto suc : llvm::successors(inst1->getParent())) {
       todo.push_back(suc);
     }
     while (todo.size()) {
       auto BB = todo.front();
       todo.pop_front();
-      if (done.count(BB))
+      if (!blocks.insert(BB).second)
         continue;
-      done.insert(BB);
-
-      for (auto &ni : *BB) {
-        instructions.insert(&ni);
-      }
       for (auto suc : llvm::successors(BB)) {
         if (!l1 || suc != l1->getHeader()) {
           todo.push_back(suc);
@@ -1318,7 +1393,7 @@ allInstructionsBetween(llvm::LoopInfo &LI, llvm::Instruction *inst1,
   }
 
   allPredecessorsOf(inst2, [&](llvm::Instruction *I) -> bool {
-    if (instructions.find(I) == instructions.end())
+    if (!blocks.count(I->getParent()))
       return /*earlyReturn*/ false;
     return f(I);
   });
@@ -2936,7 +3011,9 @@ llvm::Optional<bool>
 arePointersGuaranteedNoAlias(llvm::TargetLibraryInfo &TLI, llvm::AAResults &AA,
                              llvm::DominatorTree &DT, llvm::LoopInfo &LI,
                              llvm::Value *op0, llvm::Value *op1,
-                             bool offsetAllowed = false);
+                             bool offsetAllowed = false,
+                             AllocWrittenBeforeLoadCache *cache = nullptr,
+                             const TypeResults *TR = nullptr);
 
 /// MPI routines recognized by Enzyme, keyed by their lowercase,
 /// underscore-free base name and mapped to the canonical C name (without the
@@ -3121,6 +3198,14 @@ convertSRetTypeFromString(llvm::StringRef str, llvm::LLVMContext *C = nullptr) {
     llvm::SmallVector<llvm::Type *, 2> elts;
     elts.push_back(
         getPointerType(llvm::StructType::get(*C, {}), AddressSpace::Tracked));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  if (str == "test_type7") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 2> elts;
+    elts.push_back(
+        getPointerType(llvm::Type::getInt8Ty(*C), AddressSpace::Tracked));
     elts.push_back(llvm::Type::getInt64Ty(*C));
     return llvm::StructType::get(*C, elts);
   }

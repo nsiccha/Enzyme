@@ -1098,6 +1098,34 @@ void DifferentialUseAnalysis::minCut(const DataLayout &DL, LoopInfo &OrigLI,
     }
   }
 
+  // A load of a derived Julia pointer, such as an array's data pointer, cannot
+  // be cached, and the fix ups above can leave one in the cut: moving a cut off
+  // a GEP of it lands on the load. Unless it must be cached, such a load can be
+  // recomputed (see is_load_uncacheable), so cut what it loads from instead,
+  // through any casts, down to values that can be cached.
+  auto isDerivedPointerLoad = [&](Value *V) {
+    if (!EnzymeJuliaAddrLoad || !isa<LoadInst>(V) || Recomputes.count(V))
+      return false;
+    auto PT = dyn_cast<PointerType>(V->getType());
+    return PT && PT->getAddressSpace() == 13;
+  };
+  SmallVector<Value *, 2> derivedLoads;
+  for (auto V : MinReq)
+    if (isDerivedPointerLoad(V))
+      derivedLoads.push_back(V);
+  while (derivedLoads.size()) {
+    auto V = derivedLoads.pop_back_val();
+    MinReq.remove(V);
+    for (auto &pair : Orig) {
+      if (!pair.second.count(Node(V, false)))
+        continue;
+      if (hasNoCache(pair.first.V) || isDerivedPointerLoad(pair.first.V))
+        derivedLoads.push_back(pair.first.V);
+      else
+        MinReq.insert(pair.first.V);
+    }
+  }
+
   // Fix up non-repeatable writing calls that chain within rematerialized
   // allocations. We could iterate from the keys of the valuemap, but that would
   // be a non-determinstic ordering.
@@ -1351,6 +1379,11 @@ bool checkLoopyReductionPHI(const GradientUtils *gutils,
   L->getExitBlocks(exitBlocks);
   if (exitBlocks.size() != 1)
     return false;
+  // The reverse pass only takes the reduction rewrite, and so only reads the
+  // start value, when the division's intermediate values have no active use
+  // inside the loop.
+  if (!gutils->onlyActiveUseInLoopIsPHI(userInst, P0))
+    return false;
 
   return true;
 }
@@ -1402,6 +1435,8 @@ void pushLoopyPHIPreheader(const GradientUtils *gutils, llvm::Value *V,
     SmallVector<BasicBlock *, 2> exitBlocks;
     L->getExitBlocks(exitBlocks);
     if (exitBlocks.size() != 1)
+      return;
+    if (!gutils->onlyActiveUseInLoopIsPHI(userInst, P0))
       return;
 
     while (Pstart) {

@@ -1775,6 +1775,34 @@ void emit_dag(bool forward, Twine resultVarName, const DagInit *ruleDag,
     return;
   }
   if (Def->isSubClassOf("BlasCall")) {
+    // A BlasCall with an asserting inactive argument only refuses the case its
+    // shadows select (e.g. an active beta in gemm's forward rule): raise the
+    // error and build no call. A call without that argument would have the
+    // wrong arity, which the declaration's attributor then reads out of range.
+    for (size_t i = 0; i < ruleDag->getNumArgs(); i++) {
+      auto argDag = dyn_cast<DagInit>(ruleDag->getArg(i));
+      if (!argDag)
+        continue;
+      auto argDef = cast<DefInit>(argDag->getOperator())->getDef();
+      if ((argDef->getName() == "InactiveArgSpec" ||
+           argDef->isSubClassOf("InactiveArgSpec")) &&
+          argDef->getValueAsBit("asserting")) {
+        if (forward)
+          emit_if_rule_condition(pattern, ruleDag, "", "      ", os);
+        os << "        {\n";
+        os << "            std::string s;\n";
+        os << "            llvm::raw_string_ostream ss(s);\n";
+        os << "            ss << \"in Mode: \" << to_string(Mode) << \"\\n\";\n";
+        os << "            ss << \"cannot handle blas argument within "
+           << pattern.getName() << " of \" << call;\n";
+        os << "            EmitNoDerivativeError(ss.str(), call, gutils, "
+              "Builder2);\n";
+        os << "        }\n";
+        if (forward)
+          os << "        }\n";
+        return;
+      }
+    }
     if (forward)
       emit_if_rule_condition(pattern, ruleDag, "", "      ", os);
     const auto dfnc_name = Def->getValueAsString("s");
@@ -1979,6 +2007,106 @@ void emit_dag(bool forward, Twine resultVarName, const DagInit *ruleDag,
           "byRef)\n";
     os << "                     );\n";
 
+    os << "        }\n";
+    return;
+  }
+  if (Def->isSubClassOf("ScaleOrZero")) {
+    // (ScaleOrZero<""> (BlasCall<"scal"> $n, $scale, (Shadow $x)))
+    // (ScaleOrZero<""> (BlasCall<"lascl"> $layout, $type, $kl, $ku,
+    //                    Constant<"1.0">, $scale, $m, $n, (Shadow $A), $info))
+    //
+    // The wrapped call says what is scaled, and by what. Except under cuBLAS,
+    // whose data is not in host memory, the scaling is written out so that a
+    // zero scale overwrites instead of multiplying (see callScaleOrZero).
+    if (ruleDag->getNumArgs() != 1)
+      PrintFatalError(pattern.getLoc(), "ScaleOrZero wraps one BlasCall");
+    const auto callDag = dyn_cast<DagInit>(ruleDag->getArg(0));
+    const auto callDef =
+        callDag ? cast<DefInit>(callDag->getOperator())->getDef() : nullptr;
+    if (!callDef || !callDef->isSubClassOf("BlasCall"))
+      PrintFatalError(pattern.getLoc(), "ScaleOrZero wraps one BlasCall");
+    const auto fnName = callDef->getValueAsString("s");
+    const bool isVec = fnName == "scal";
+    if (!isVec && fnName != "lascl")
+      PrintFatalError(pattern.getLoc(),
+                      "ScaleOrZero only wraps a scal or a lascl call");
+    const bool hasLayout = !isVec && callDag->getArgNameStr(0) == "layout";
+    const size_t base = hasLayout ? 1 : 0;
+    if (callDag->getNumArgs() != (isVec ? 3 : base + 9))
+      PrintFatalError(pattern.getLoc(),
+                      "unexpected number of arguments in a ScaleOrZero call");
+
+    // lascl scales by cto / cfrom: only cfrom == 1 is supported, and a type
+    // known to be 'G' needs no triangle test.
+    bool fullMatrix = isVec;
+    if (!isVec) {
+      const auto cfrom = dyn_cast<DefInit>(callDag->getArg(base + 3));
+      if (!cfrom || !cfrom->getDef()->isSubClassOf("Constant") ||
+          cfrom->getDef()->getValueAsString("value") != "1.0")
+        PrintFatalError(pattern.getLoc(),
+                        "ScaleOrZero needs lascl's cfrom to be Constant 1.0");
+      const auto type = dyn_cast<DefInit>(callDag->getArg(base + 0));
+      fullMatrix = type && type->getDef()->isSubClassOf("Char") &&
+                   type->getDef()->getValueAsString("value") == "G";
+    }
+
+    os << "        if (cublas) {\n";
+    emit_dag(forward, resultVarName, callDag, argPrefix + "_cu", os, argName,
+             actArg, pattern, runtimeChecked, vars);
+    os << "        } else {\n";
+    if (forward)
+      emit_if_rule_condition(pattern, callDag, "", "      ", os);
+    os << "        {\n";
+    if (!forward && !runtimeChecked)
+      emit_runtime_condition(callDag, argName, "        ", "Builder2", false,
+                             os);
+    os << "      // ScaleOrZero\n";
+    const auto item = [&](StringRef var, size_t pos) {
+      os << "        SmallVector<Value *, 2> soz_" << var << ";\n"
+         << "        for (auto item : ";
+      rev_call_arg(forward, callDag, pattern, pos, os, vars);
+      os << ") soz_" << var << ".push_back(item);\n";
+    };
+    // A scale the rule fixes is passed as that constant, not through the
+    // calling convention of the BLAS routine.
+    const size_t scalePos = isVec ? 1 : base + 4;
+    const auto scaleDef = dyn_cast<DefInit>(callDag->getArg(scalePos));
+    const bool constScale =
+        scaleDef && scaleDef->getDef()->isSubClassOf("Constant");
+    if (isVec) {
+      item("n", 0);
+      item("out", 2);
+    } else {
+      if (!fullMatrix)
+        item("uplo", base + 0);
+      item("m", base + 5);
+      item("n", base + 6);
+      item("out", base + 7);
+    }
+    if (constScale)
+      os << "        SmallVector<Value *, 1> soz_scale = {ConstantFP::get("
+            "fpType, "
+         << scaleDef->getDef()->getValueAsString("value") << ")};\n";
+    else
+      item("scale", scalePos);
+    os << "        const auto Defs = gutils->getInvertedBundles(&call, {"
+       << ValueType_helper(pattern, actArg, callDag)
+       << "}, Builder2, /* lookup */ " << (!forward) << ");\n";
+    os << "        callScaleOrZero(Builder2, *gutils->oldFunc->getParent(), "
+          "intType, fpType, "
+       << (hasLayout ? "(cblas ? arg_layout : nullptr)" : "nullptr") << ", "
+       << (fullMatrix ? "nullptr" : "soz_uplo[0]") << ", "
+       << (isVec ? "nullptr" : "soz_m[0]")
+       << ", soz_n[0], soz_scale[0], soz_out[0], soz_out[1], /* absLd */ "
+       << isVec << ", Defs, byRef, /* scale by ref */ "
+       << (constScale ? "false" : "byRefFloat") << ", "
+       << (hasLayout ? "cblas" : "false") << ");\n";
+    if (!forward && !runtimeChecked)
+      emit_runtime_continue(callDag, argName, "        ", "Builder2", false,
+                            os);
+    os << "        }\n";
+    if (forward)
+      os << "        }\n";
     os << "        }\n";
     return;
   }

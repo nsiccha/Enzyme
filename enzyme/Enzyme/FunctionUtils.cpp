@@ -52,6 +52,7 @@
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
@@ -306,7 +307,16 @@ void RecursivelyReplaceAddressSpace(
     if (auto ASC = dyn_cast<AddrSpaceCastInst>(inst)) {
       auto AS = cast<PointerType>(rep->getType())->getAddressSpace();
       if (AS == ASC->getDestAddressSpace()) {
-        ASC->replaceAllUsesWith(rep);
+        // With typed pointers an addrspacecast may also change the pointee
+        // type (instcombine folds a bitcast into it, as Julia's
+        // `addrspacecast T* %slot to i8 addrspace(11)*` for jl_object_id_),
+        // so the moved pointer needs a bitcast to the cast's type.
+        Value *nrep = rep;
+        if (rep->getType() != ASC->getType()) {
+          IRBuilder<> B(ASC);
+          nrep = B.CreatePointerCast(rep, ASC->getType());
+        }
+        ASC->replaceAllUsesWith(nrep);
         assert(ASC);
         toErase.push_back(ASC);
         continue;
@@ -2129,7 +2139,16 @@ public:
         canHandBack(!cannotHandBackPointer(F)) {}
 
   // Returns if newly legal, subject to the pending calls.
-  bool run();
+  bool run(FunctionAnalysisManager *FAM = nullptr, SmallVectorImpl<std::pair<unsigned, int64_t>> *argOwnedWrites = nullptr, ArgumentOwnedWritesCache *ownedCache = nullptr, const SmallPtrSetImpl<Function *> *localCandidates = nullptr);
+  void mark(bool localOnly) {
+    local = localOnly;
+    if (local) F.addFnAttr("enzyme_LocalReadOnlyOrThrow");
+    else {
+      F.removeFnAttr("enzyme_LocalReadOnlyOrThrow");
+      F.addFnAttr("enzyme_ReadOnlyOrThrow");
+    }
+    addReadOnlyOrThrowAttributes();
+  }
 
 private:
   using FreshFieldSet = SmallSet<std::pair<Value *, int64_t>, 4>;
@@ -2861,11 +2880,280 @@ bool ReadOnlyOrThrowDetector::freshFieldMayReachReturn(Value *Base,
   return false;
 }
 
-bool ReadOnlyOrThrowDetector::run() {
+// Whether Obj, the base object a write in F goes through, is the fresh owned
+// storage of an allocation made in F: a load of the header field that the
+// allocator initialized with a pointer to new storage (enzyme_fresh_pointer,
+// see getFreshPointerAllocations), unchanged since the allocation. Julia
+// writes a new array's elements this way, through its loaded data pointer.
+// Like the allocation itself, that storage did not exist before the call to
+// F. Its header may escape, for example as F's result, so such a write makes
+// F local read-only-or-throw at most. Without the analyses nothing qualifies.
+// That the field is unchanged up to the load may also rest on calls in
+// between that writesOnlyNewMemory shows write only memory created during
+// them (see isFreshPointerFieldWrittenBefore), such as a loop filling an array
+// with arrays it computes, as Julia's collect does.
+static bool
+isFreshOwnedStorage(Value *Obj, Function &F, FunctionAnalysisManager *FAM,
+                    TargetLibraryInfo &TLI, DenseMap<LoadInst *, bool> &cache,
+                    llvm::function_ref<bool(CallBase *)> writesOnlyNewMemory) {
+  if (!FAM)
+    return false;
+  auto ld = dyn_cast<LoadInst>(Obj);
+  if (!ld)
+    return false;
+  auto found = cache.find(ld);
+  if (found != cache.end())
+    return found->second;
+  SmallVector<CallInst *, 2> allocs;
+  bool fresh = getFreshPointerAllocations(ld, allocs);
+  if (fresh) {
+    auto &AA = FAM->getResult<AAManager>(F);
+    auto &LI = FAM->getResult<LoopAnalysis>(F);
+    int64_t offset = 0;
+    getPointerFieldOwner(ld->getPointerOperand(), offset,
+                         F.getParent()->getDataLayout());
+    for (auto alloc : allocs)
+      if (isAllocWrittenBeforeLoad(LI, AA, TLI, alloc, ld, nullptr) &&
+          isFreshPointerFieldWrittenBefore(LI, AA, alloc, offset, ld,
+                                           writesOnlyNewMemory)) {
+        fresh = false;
+        break;
+      }
+  }
+  cache[ld] = fresh;
+  return fresh;
+}
+
+// Records that storage owned by argument argno, through the pointer field at
+// offset, may be written.
+static void
+recordArgumentOwnedWrite(SmallVectorImpl<std::pair<unsigned, int64_t>> &writes,
+                         unsigned argno, int64_t offset) {
+  auto write = std::make_pair(argno, offset);
+  if (!llvm::is_contained(writes, write))
+    writes.push_back(write);
+}
+
+// Whether Obj, the base object a write in F goes through, is storage owned by
+// one of F's pointer arguments: a pointer loaded at a constant offset from the
+// argument, as Julia loads an array argument's data pointer to write its
+// elements. The (argument, offset) pair is recorded in writes. Whether that
+// storage existed before the call is for the caller to show (see
+// getArgumentOwnedStorageWrites).
+static bool recordArgumentOwnedStorage(
+    Value *Obj, SmallVectorImpl<std::pair<unsigned, int64_t>> &writes) {
+  auto ld = dyn_cast<LoadInst>(Obj);
+  if (!ld || !ld->isSimple() || !ld->getType()->isPointerTy())
+    return false;
+  const auto &DL = ld->getModule()->getDataLayout();
+  int64_t offset = 0;
+  auto arg = dyn_cast<Argument>(
+      getPointerFieldOwner(ld->getPointerOperand(), offset, DL));
+  if (!arg)
+    return false;
+  recordArgumentOwnedWrite(writes, arg->getArgNo(), offset);
+  return true;
+}
+
+// Whether arg is sret-like: memory the caller provides for the result, such as
+// an sret or Julia's returnRoots, which a function may write without writing
+// anything else that existed before the call.
+static bool isSretLikeArgument(const Argument *arg) {
+  auto F = arg->getParent();
+  unsigned idx = arg->getArgNo() + AttributeList::FirstArgIndex;
+  return arg->hasStructRetAttr() ||
+         F->getAttribute(idx, "enzymejl_returnRoots").isValid() ||
+         F->getAttribute(idx, "enzymejl_sret_union_bytes").isValid();
+}
+
+// Whether operand i of call is passed as an sret-like argument.
+static bool isSretLikeOperand(const CallBase *call, unsigned i) {
+  if (call->paramHasAttr(i, Attribute::StructRet))
+    return true;
+  auto Callee = call->getCalledFunction();
+  return Callee && i < Callee->arg_size() &&
+         isSretLikeArgument(Callee->getArg(i));
+}
+
+// Whether call's operand bundles are all Julia's jl_roots, which only keep GC
+// roots alive. LLVM disregards the callee's memory attributes for a call with
+// a bundle it does not know; these bundles do not change them.
+static bool hasOnlyRootBundles(const CallBase *call) {
+  for (unsigned i = 0; i < call->getNumOperandBundles(); i++)
+    if (call->getOperandBundleAt(i).getTagName() != "jl_roots")
+      return false;
+  return true;
+}
+
+// Whether call accesses memory only through its pointer arguments (argmemonly
+// on the call or, with only jl_roots bundles, on its callee).
+static bool onlyAccessesArgMemory(const CallBase *call) {
+  if (call->onlyAccessesArgMemory())
+    return true;
+  auto Callee = call->getCalledFunction();
+  return Callee && hasOnlyRootBundles(call) && Callee->onlyAccessesArgMemory();
+}
+
+// Whether call only reads through its pointer argument i (readonly or
+// readnone on the call or, with only jl_roots bundles, on its callee).
+static bool onlyReadsArgument(const CallBase *call, unsigned i) {
+  if (call->onlyReadsMemory(i))
+    return true;
+  auto Callee = call->getCalledFunction();
+  return Callee && hasOnlyRootBundles(call) && i < Callee->arg_size() &&
+         (Callee->hasParamAttribute(i, Attribute::ReadOnly) ||
+          Callee->hasParamAttribute(i, Attribute::ReadNone));
+}
+
+bool ReadOnlyOrThrowDetector::run(FunctionAnalysisManager *FAM, SmallVectorImpl<std::pair<unsigned, int64_t>> *argOwnedWrites, ArgumentOwnedWritesCache *ownedCache, const SmallPtrSetImpl<Function *> *localCandidates) {
   if (isReadOnlyOrThrow(&F))
     return false;
   if (F.empty())
     return false;
+
+  // Diagnostics belong to the module pass; a query repeats them per call.
+  const bool printPerf = EnzymePrintPerf && !argOwnedWrites;
+  DenseMap<LoadInst *, bool> freshStorage;
+
+  // Whether call CB writes only memory created during it and stack slots, so
+  // no allocation that existed before it, which is what proving a fresh
+  // allocation's field unchanged needs (isFreshOwnedStorage): a local
+  // read-only-or-throw call or, given ownedCache, a function that
+  // getArgumentOwnedStorageWrites shows writes no storage owned by its
+  // arguments either, in both cases writing through sret-like arguments only
+  // into stack slots (such as the box Julia passes for a union result).
+  auto writesOnlyItsOwnMemory = [&](CallBase *CB) -> bool {
+    for (unsigned i = 0; i < CB->arg_size(); i++)
+      if (CB->getArgOperand(i)->getType()->isPointerTy() &&
+          isSretLikeOperand(CB, i) &&
+          !isa<AllocaInst>(getBaseObject(CB->getArgOperand(i))))
+        return false;
+    if (isLocalReadOnlyOrThrow(CB))
+      return true;
+    auto Callee = CB->getCalledFunction();
+    if (!ownedCache || !Callee || Callee->empty() ||
+        Callee->getCallingConv() != CB->getCallingConv())
+      return false;
+    ArgumentOwnedWrites writes;
+    return getArgumentOwnedStorageWrites(
+               *Callee,
+               FAM ? FAM->getResult<TargetLibraryAnalysis>(*Callee) : TLI,
+               writes, *ownedCache, FAM) &&
+           writes.empty();
+  };
+
+  // Whether a write whose base object is Obj leaves memory that existed
+  // before the call to F unchanged. Sets local when the memory written may
+  // outlive F, and in a query records storage owned by an argument.
+  auto writesNewMemory = [&](Value *Obj) -> bool {
+    // Storing into local memory is fine since it definitionally will not be
+    // seen outside the function. Note, even if one stored into x =
+    // malloc(..), and stored x into a global/arg pointer, that second store
+    // would trigger not readonly.
+    if (isa<AllocaInst>(Obj))
+      return true;
+    if (isAllocationCall(Obj, TLI)) {
+      if (needLocal() && reaches(Obj, /*Deep*/ false))
+        local = true;
+      return true;
+    }
+    if (auto fields = freshFields(Obj)) {
+      if (needLocal() && freshReaches(Obj, *fields))
+        local = true;
+      return true;
+    }
+    if (isFreshOwnedStorage(Obj, F, FAM, TLI, freshStorage,
+                            writesOnlyItsOwnMemory)) {
+      local = true;
+      return true;
+    }
+    if (argOwnedWrites && recordArgumentOwnedStorage(Obj, *argOwnedWrites))
+      return true;
+    if (auto arg = dyn_cast<Argument>(Obj))
+      if (isSretLikeArgument(arg)) {
+        local = true;
+        return true;
+      }
+    return false;
+  };
+
+  // Whether call CI, to a function that is not read-only-or-throw, still
+  // writes no memory that existed before the call to F. An argmemonly call
+  // writes only through its pointer arguments not marked read-only (a BLAS
+  // routine's output matrix, see attributeBLAS; Julia calls it with a jl_roots
+  // bundle), and each of those must be memory writesNewMemory accepts.
+  // Otherwise, given ownedCache, the callee must write only memory new to it
+  // and storage owned by its arguments (getArgumentOwnedStorageWrites). Each
+  // such argument must then be a fresh allocation made in F whose fresh field
+  // is unchanged up to the call, so that the storage is new to F as well (as
+  // for the array Julia's matrix product allocates and fills through
+  // gemm_wrapper!), or, in a query, an argument of F, whose owned storage is
+  // recorded. The callee's writes through sret-like arguments are classified
+  // like F's own. A failed attempt leaves local and the recorded writes as they
+  // were.
+  auto callWritesOnlyNewMemory = [&](CallBase *CI) -> bool {
+    auto Callee = CI->getCalledFunction();
+    if (!Callee || Callee->getCallingConv() != CI->getCallingConv())
+      return false;
+    const bool prevLocal = local;
+    const size_t prevWrites = argOwnedWrites ? argOwnedWrites->size() : 0;
+    auto fail = [&]() {
+      local = prevLocal;
+      if (argOwnedWrites)
+        argOwnedWrites->resize(prevWrites);
+      return false;
+    };
+    if (onlyAccessesArgMemory(CI)) {
+      for (unsigned i = 0; i < CI->arg_size(); i++) {
+        Value *arg = CI->getArgOperand(i);
+        if (!arg->getType()->isPointerTy() || onlyReadsArgument(CI, i))
+          continue;
+        if (!writesNewMemory(getBaseObject(arg)))
+          return fail();
+      }
+      return true;
+    }
+    if (!ownedCache || Callee->empty())
+      return false;
+    ArgumentOwnedWrites writes;
+    if (!getArgumentOwnedStorageWrites(
+            *Callee, FAM ? FAM->getResult<TargetLibraryAnalysis>(*Callee) : TLI,
+            writes, *ownedCache, FAM))
+      return false;
+    for (unsigned i = 0; i < CI->arg_size(); i++) {
+      Value *arg = CI->getArgOperand(i);
+      if (arg->getType()->isPointerTy() && isSretLikeOperand(CI, i) &&
+          !writesNewMemory(getBaseObject(arg)))
+        return fail();
+    }
+    const auto &DL = F.getParent()->getDataLayout();
+    for (auto &write : writes) {
+      if (write.first >= CI->arg_size())
+        return fail();
+      Value *actual = CI->getArgOperand(write.first);
+      SmallVector<CallInst *, 2> allocs;
+      if (FAM &&
+          getFreshPointerHeaderAllocations(actual, write.second, allocs)) {
+        auto &AA = FAM->getResult<AAManager>(F);
+        auto &LI = FAM->getResult<LoopAnalysis>(F);
+        for (auto alloc : allocs)
+          if (isFreshPointerFieldWrittenBefore(LI, AA, alloc, write.second, CI,
+                                               writesOnlyItsOwnMemory))
+            return fail();
+        local = true;
+        continue;
+      }
+      int64_t offset = 0;
+      auto arg = dyn_cast<Argument>(getPointerFieldOwner(actual, offset, DL));
+      if (argOwnedWrites && arg) {
+        recordArgumentOwnedWrite(*argOwnedWrites, arg->getArgNo(),
+                                 offset + write.second);
+        continue;
+      }
+      return fail();
+    }
+    return true;
+  };
 
   const auto unreachable = getGuaranteedUnreachable(&F);
   for (auto &BB : F) {
@@ -2896,79 +3184,17 @@ bool ReadOnlyOrThrowDetector::run() {
       if (localMD && !isa<CallBase>(&I))
         continue;
 
-      if (auto MTI = dyn_cast<MemTransferInst>(&I)) {
-        auto Obj = getBaseObject(MTI->getOperand(0));
-        // Writing the data of a fresh Julia Memory or array writes memory
-        // that did not exist before the call.
-        if (auto fields = freshFields(Obj)) {
-          if (needLocal() && freshReaches(Obj, *fields))
-            local = true;
+      if (auto MTI = dyn_cast<MemTransferInst>(&I))
+        if (writesNewMemory(getBaseObject(MTI->getOperand(0))))
           continue;
-        }
-        // Storing into local memory is fine since it definitionally will not be
-        // seen outside the function. Note, even if one stored into x =
-        // malloc(..), and stored x into a global/arg pointer, that second store
-        // would trigger not readonly.
-        if (isa<AllocaInst>(Obj))
+      if (auto MSI = dyn_cast<MemSetInst>(&I))
+        if (writesNewMemory(getBaseObject(MSI->getOperand(0))))
           continue;
-        if (isAllocationCall(Obj, TLI)) {
-          if (needLocal() && reaches(Obj, /*Deep*/ false))
-            local = true;
-          continue;
-        }
-        if (auto arg = dyn_cast<Argument>(Obj)) {
-          if (arg->hasStructRetAttr() ||
-              arg->getParent()
-                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
-                                 "enzymejl_returnRoots")
-                  .isValid() ||
-              arg->getParent()
-                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
-                                 "enzymejl_sret_union_bytes")
-                  .isValid()) {
-            local = true;
-            continue;
-          }
-        }
-      }
-      if (auto MSI = dyn_cast<MemSetInst>(&I)) {
-        auto Obj = getBaseObject(MSI->getOperand(0));
-        // Writing the data of a fresh Julia Memory or array writes memory
-        // that did not exist before the call.
-        if (auto fields = freshFields(Obj)) {
-          if (needLocal() && freshReaches(Obj, *fields))
-            local = true;
-          continue;
-        }
-        // Storing into local memory is fine since it definitionally will not be
-        // seen outside the function. Note, even if one stored into x =
-        // malloc(..), and stored x into a global/arg pointer, that second store
-        // would trigger not readonly.
-        if (isa<AllocaInst>(Obj))
-          continue;
-        if (isAllocationCall(Obj, TLI)) {
-          if (needLocal() && reaches(Obj, /*Deep*/ false))
-            local = true;
-          continue;
-        }
-        if (auto arg = dyn_cast<Argument>(Obj)) {
-          if (arg->hasStructRetAttr() ||
-              arg->getParent()
-                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
-                                 "enzymejl_returnRoots")
-                  .isValid() ||
-              arg->getParent()
-                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
-                                 "enzymejl_sret_union_bytes")
-                  .isValid()) {
-            local = true;
-            continue;
-          }
-        }
-      }
 
       if (auto CI = dyn_cast<CallBase>(&I)) {
-        if (localMD || isLocalReadOnlyOrThrow(CI)) {
+        if (localMD || isLocalReadOnlyOrThrow(CI) ||
+            (localCandidates && localCandidates->contains(CI->getCalledFunction()) &&
+             CI->getCalledFunction()->getCallingConv() == CI->getCallingConv())) {
           // A local read-only-or-throw callee may still write through its
           // sret-like arguments, and those writes land in memory of ours.
           // Classify them as we would a store of our own: memory local to us
@@ -3017,23 +3243,9 @@ bool ReadOnlyOrThrowDetector::run() {
                   local = true;
                 continue;
               }
-              if (auto A = dyn_cast<Argument>(Obj)) {
-                if (A->hasStructRetAttr() ||
-                    A->getParent()
-                        ->getAttribute(A->getArgNo() +
-                                           AttributeList::FirstArgIndex,
-                                       "enzymejl_returnRoots")
-                        .isValid() ||
-                    A->getParent()
-                        ->getAttribute(A->getArgNo() +
-                                           AttributeList::FirstArgIndex,
-                                       "enzymejl_sret_union_bytes")
-                        .isValid()) {
-                  local = true;
-                  continue;
-                }
-              }
-              if (EnzymePrintPerf) {
+              if (writesNewMemory(Obj))
+                continue;
+              if (printPerf) {
                 EmitWarning("WritingInstruction", I,
                             "Instruction could write forcing ", F.getName(),
                             " to not be marked readonly_or_throw per "
@@ -3048,36 +3260,26 @@ bool ReadOnlyOrThrowDetector::run() {
         if (isAllocationCall(CI, TLI)) {
           continue;
         }
-        if (getFuncNameFromCall(CI) == "enzyme_zerotype") {
-          auto Obj = getBaseObject(CI->getArgOperand(0));
-          // Storing into local memory is fine since it definitionally will not
-          // be seen outside the function. Note, even if one stored into x =
-          // malloc(..), and stored x into a global/arg pointer, that second
-          // store would trigger not readonly.
-          if (isa<AllocaInst>(Obj))
+        if (getFuncNameFromCall(CI) == "enzyme_zerotype")
+          if (writesNewMemory(getBaseObject(CI->getArgOperand(0))))
             continue;
-          if (isAllocationCall(Obj, TLI)) {
-            if (needLocal() && reaches(Obj, /*Deep*/ false))
-              local = true;
-            continue;
-          }
-          if (auto arg = dyn_cast<Argument>(Obj)) {
-            if (arg->hasStructRetAttr() ||
-                arg->getParent()
-                    ->getAttribute(arg->getArgNo() +
-                                       AttributeList::FirstArgIndex,
-                                   "enzymejl_returnRoots")
-                    .isValid() ||
-                arg->getParent()
-                    ->getAttribute(arg->getArgNo() +
-                                       AttributeList::FirstArgIndex,
-                                   "enzymejl_sret_union_bytes")
-                    .isValid()) {
+        // Resizing an array F allocates writes only memory made during F: its
+        // header and the storage its allocator or the resize made, provided
+        // its field still names that storage (see isFreshOwnedStorage).
+        if (FAM && isJuliaArrayResize(getFuncNameFromCall(CI)) &&
+            CI->arg_size() > 0)
+          if (auto alloc =
+                  dyn_cast<CallInst>(getBaseObject(CI->getArgOperand(0)))) {
+            int64_t offset;
+            if (getFreshPointerField(alloc, offset) &&
+                !isFreshPointerFieldWrittenBefore(
+                    FAM->getResult<LoopAnalysis>(F),
+                    FAM->getResult<AAManager>(F), alloc, offset, CI,
+                    writesOnlyItsOwnMemory)) {
               local = true;
               continue;
             }
           }
-        }
         if (auto F2 = CI->getCalledFunction()) {
           if (isDebugFunction(F2))
             continue;
@@ -3087,12 +3289,17 @@ bool ReadOnlyOrThrowDetector::run() {
               isRustNoAllocShimFunction(F2->getName()))
             continue;
           if (F2->getCallingConv() == CI->getCallingConv()) {
-            if (F2 == &F)
+            if (F2 == &F && !argOwnedWrites && !localCandidates)
               continue;
             if (isReadOnlyOrThrow(F2))
               continue;
+            if (callWritesOnlyNewMemory(CI)) {
+              if (needLocal() && !cannotHoldPointer(CI) && reaches(CI, /*Deep*/ true))
+                local = true;
+              continue;
+            }
             if (!F2->empty()) {
-              if (EnzymePrintPerf) {
+              if (printPerf) {
                 EmitWarning(
                     "WritingInstruction", I, "Instruction could write forcing ",
                     F.getName(),
@@ -3105,41 +3312,9 @@ bool ReadOnlyOrThrowDetector::run() {
           }
         }
       }
-      if (auto SI = dyn_cast<StoreInst>(&I)) {
-        auto Obj = getBaseObject(SI->getPointerOperand());
-        // Writing the data of a fresh Julia Memory or array writes memory
-        // that did not exist before the call.
-        if (auto fields = freshFields(Obj)) {
-          if (needLocal() && freshReaches(Obj, *fields))
-            local = true;
+      if (auto SI = dyn_cast<StoreInst>(&I))
+        if (writesNewMemory(getBaseObject(SI->getPointerOperand())))
           continue;
-        }
-        // Storing into local memory is fine since it definitionally will not be
-        // seen outside the function. Note, even if one stored into x =
-        // malloc(..), and stored x into a global/arg pointer, that second store
-        // would trigger not readonly.
-        if (isa<AllocaInst>(Obj))
-          continue;
-        if (isAllocationCall(Obj, TLI)) {
-          if (needLocal() && reaches(Obj, /*Deep*/ false))
-            local = true;
-          continue;
-        }
-        if (auto arg = dyn_cast<Argument>(Obj)) {
-          if (arg->hasStructRetAttr() ||
-              arg->getParent()
-                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
-                                 "enzymejl_returnRoots")
-                  .isValid() ||
-              arg->getParent()
-                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
-                                 "enzymejl_sret_union_bytes")
-                  .isValid()) {
-            local = true;
-            continue;
-          }
-        }
-      }
       // ignore atomic load impacts
       if (isa<LoadInst>(&I))
         continue;
@@ -3156,7 +3331,7 @@ bool ReadOnlyOrThrowDetector::run() {
         }
       }
 
-      if (EnzymePrintPerf) {
+      if (printPerf) {
         EmitWarning("WritingInstruction", I, "Instruction could write forcing ",
                     F.getName(), " to not be marked readonly_or_throw", I);
       }
@@ -3164,7 +3339,7 @@ bool ReadOnlyOrThrowDetector::run() {
     }
   }
 
-  if (calls_todo.size() == 0) {
+  if (calls_todo.empty() && !argOwnedWrites && !localCandidates) {
     if (local) {
       F.addFnAttr("enzyme_LocalReadOnlyOrThrow");
     } else {
@@ -3175,6 +3350,91 @@ bool ReadOnlyOrThrowDetector::run() {
     }
     addReadOnlyOrThrowAttributes();
   }
+  return true;
+}
+
+bool getArgumentOwnedStorageWrites(
+    Function &F, TargetLibraryInfo &TLI,
+    SmallVectorImpl<std::pair<unsigned, int64_t>> &writes,
+    ArgumentOwnedWritesCache &cache, FunctionAnalysisManager *FAM) {
+  writes.clear();
+  auto found = cache.results.find(&F);
+  if (found == cache.results.end()) {
+    // F is reached again while its own query is still running: a recursive
+    // call, whose writes this query does not resolve.
+    if (!cache.active.insert(&F).second)
+      return false;
+    SmallPtrSet<Function *, 1> calls_todo;
+    bool local = false;
+    ArgumentOwnedWrites found_writes;
+    bool ok = ReadOnlyOrThrowDetector(F, calls_todo, TLI, local).run(FAM, &found_writes, &cache) &&
+              calls_todo.empty();
+    cache.active.erase(&F);
+    if (!ok)
+      found_writes.clear();
+    found = cache.results.try_emplace(&F, ok, std::move(found_writes)).first;
+  }
+  writes.append(found->second.second.begin(), found->second.second.end());
+  return found->second.first;
+}
+
+// Whether every return of F, outside paths that throw, is a fresh allocation
+// made in F (getFreshPointerHeaderAllocations) whose fresh field still holds
+// the allocator's pointer, and all declare one field offset: F then makes the
+// same promise as those allocators. Julia functions that build and return a
+// new array, such as similar or a broadcast that is not inlined, have this
+// form. F also returns noalias then, as LLVM's FunctionAttrs would infer for a
+// function returning only noalias calls it does not otherwise capture; that
+// inference does not run on every module Enzyme receives, so it is checked
+// here, with stores counted as captures.
+static bool returnsFreshPointerAllocation(Function &F,
+                                          FunctionAnalysisManager &FAM,
+                                          int64_t &offset) {
+  if (F.empty() || F.hasFnAttribute("enzyme_fresh_pointer") ||
+      !F.getReturnType()->isPointerTy())
+    return false;
+  const auto unreachable = getGuaranteedUnreachable(&F);
+  SmallVector<std::pair<CallInst *, ReturnInst *>, 2> returned;
+  bool haveOffset = false;
+  for (auto &BB : F) {
+    if (unreachable.count(&BB))
+      continue;
+    auto RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI)
+      continue;
+    Value *V = RI->getReturnValue()->stripPointerCasts();
+    Value *first = V;
+    if (auto PN = dyn_cast<PHINode>(V))
+      first = PN->getIncomingValue(0)->stripPointerCasts();
+    else if (auto SI = dyn_cast<SelectInst>(V))
+      first = SI->getTrueValue()->stripPointerCasts();
+    auto firstAlloc = dyn_cast<CallInst>(first);
+    int64_t field;
+    if (!firstAlloc || !getFreshPointerField(firstAlloc, field))
+      return false;
+    if (haveOffset && field != offset)
+      return false;
+    offset = field;
+    haveOffset = true;
+    SmallVector<CallInst *, 2> allocs;
+    if (!getFreshPointerHeaderAllocations(V, offset, allocs))
+      return false;
+    for (auto alloc : allocs) {
+      if (!F.returnDoesNotAlias() &&
+          PointerMayBeCaptured(alloc, /*ReturnCaptures=*/false,
+                               /*StoreCaptures=*/true))
+        return false;
+      returned.emplace_back(alloc, RI);
+    }
+  }
+  if (!haveOffset)
+    return false;
+  auto &AA = FAM.getResult<AAManager>(F);
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+  for (auto &pair : returned)
+    if (isFreshPointerFieldWrittenBefore(LI, AA, pair.first, offset,
+                                         pair.second))
+      return false;
   return true;
 }
 
@@ -3285,6 +3545,21 @@ bool DetectReadonlyOrThrow(Module &M) {
   PB.registerCGSCCAnalyses(CGAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
+  // A function returning a fresh allocation makes its allocator's promise;
+  // a function returning such a function's result does too.
+  for (bool more = true; more;) {
+    more = false;
+    for (Function &F : M) {
+      int64_t offset;
+      if (returnsFreshPointerAllocation(F, FAM, offset)) {
+        F.addFnAttr("enzyme_fresh_pointer", std::to_string(offset));
+        if (!F.returnDoesNotAlias())
+          F.addRetAttr(Attribute::NoAlias);
+        more = changed = true;
+      }
+    }
+  }
+
   // Set of functions newly deduced readonlyorthrow by this pass
   SmallVector<llvm::Function *> todo;
 
@@ -3296,11 +3571,12 @@ bool DetectReadonlyOrThrow(Module &M) {
   // prerequisite for being readonly. Inverse of `todo_map`
   DenseMap<llvm::Function *, SmallPtrSet<Function *, 1>> inverse_todo_map;
 
+  ArgumentOwnedWritesCache ownedWrites;
   for (Function &F : M) {
     SmallPtrSet<Function *, 1> calls_todo;
     auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
     bool local = false;
-    if (ReadOnlyOrThrowDetector(F, calls_todo, TLI, local).run()) {
+    if (ReadOnlyOrThrowDetector(F, calls_todo, TLI, local).run(&FAM, nullptr, &ownedWrites)) {
       if (calls_todo.size() == 0) {
         changed = true;
         todo.push_back(&F);
@@ -3337,7 +3613,7 @@ bool DetectReadonlyOrThrow(Module &M) {
         SmallPtrSet<Function *, 1> calls_todo;
         auto &TLI = FAM.getResult<TargetLibraryAnalysis>(*F2);
         bool local = false;
-        if (ReadOnlyOrThrowDetector(*F2, calls_todo, TLI, local).run() &&
+        if (ReadOnlyOrThrowDetector(*F2, calls_todo, TLI, local).run(&FAM, nullptr, &ownedWrites) &&
             calls_todo.size() == 0) {
           changed = true;
           todo.push_back(F2);
@@ -3346,6 +3622,56 @@ bool DetectReadonlyOrThrow(Module &M) {
     }
 
     inverse_todo_map.erase(found);
+  }
+
+  // The functions still waiting call each other in cycles (mutual
+  // recursion, as SpecialFunctions' logbeta and logabsbeta): each writes no
+  // memory that existed before its call except through calls to the others.
+  // As for a function calling itself, none of them then does, by induction.
+  // Drop each one that waits on a function no longer a candidate, until the
+  // rest wait only on each other, and mark those.
+  for (bool dropped = true; dropped;) {
+    dropped = false;
+    SmallVector<Function *, 4> drop;
+    for (auto &pair : todo_map)
+      for (auto F2 : pair.second)
+        if (!todo_map.count(F2)) {
+          drop.push_back(pair.first);
+          break;
+        }
+    for (auto F2 : drop) {
+      todo_map.erase(F2);
+      dropped = true;
+    }
+  }
+  SmallPtrSet<Function *, 8> cycle;
+  DenseMap<Function *, bool> cycleLocal;
+  for (auto &pair : todo_map)
+    cycle.insert(pair.first);
+  for (bool removed = true; removed;) {
+    removed = false;
+    for (auto &pair : todo_map) {
+      Function *fn = pair.first;
+      if (!cycle.contains(fn))
+        continue;
+      SmallPtrSet<Function *, 1> pending;
+      auto &TLI = FAM.getResult<TargetLibraryAnalysis>(*fn);
+      bool local = false;
+      ReadOnlyOrThrowDetector detector(*fn, pending, TLI, local);
+      if (!detector.run(&FAM, nullptr, &ownedWrites, &cycle) || !pending.empty()) {
+        cycle.erase(fn);
+        removed = true;
+      } else {
+        cycleLocal[fn] = local;
+      }
+    }
+  }
+  for (Function *fn : cycle) {
+    SmallPtrSet<Function *, 1> pending;
+    auto &TLI = FAM.getResult<TargetLibraryAnalysis>(*fn);
+    bool local = cycleLocal[fn];
+    ReadOnlyOrThrowDetector(*fn, pending, TLI, local).mark(local);
+    changed = true;
   }
   return changed;
 }

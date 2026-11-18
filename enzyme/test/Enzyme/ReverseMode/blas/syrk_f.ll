@@ -62,10 +62,6 @@ entry:
 ; CHECK-NEXT:   %byref.constant.int.06 = alloca i64, align 8
 ; CHECK-NEXT:   %byref.constant.int.08 = alloca i64, align 8
 ; CHECK-NEXT:   %byref.constant.int.110 = alloca i64, align 8
-; CHECK-NEXT:   %byref.constant.int.012 = alloca i64, align 8
-; CHECK-NEXT:   %byref.constant.int.013 = alloca i64, align 8
-; CHECK-NEXT:   %byref.constant.fp.1.0 = alloca double, align 8
-; CHECK-NEXT:   %[[v0:.+]] = alloca i64, align 8
 ; CHECK-NEXT:   %uplo = alloca i8, align 1
 ; CHECK-NEXT:   %trans = alloca i8, align 1
 ; CHECK-NEXT:   %n = alloca i64, align 16
@@ -184,10 +180,77 @@ entry:
 ; CHECK-NEXT:   %[[v70:.+]] = icmp eq i64 %[[v10]], %[[v13]]
 ; CHECK-NEXT:   br i1 %[[v70]], label %invertentry_end, label %invertentry_loop
 ; CHECK: invertentry_end:                                  ; preds = %invertentry_loop, %invertentry
-; CHECK-NEXT:   store i64 0, i64* %byref.constant.int.012, align 4
-; CHECK-NEXT:   store i64 0, i64* %byref.constant.int.013, align 4
-; CHECK-NEXT:   store double 1.000000e+00, double* %byref.constant.fp.1.0, align 8
-; CHECK-NEXT:   %fpcast.constant.fp.1.0 = bitcast double* %byref.constant.fp.1.0 to i8*
-; CHECK-NEXT:   call void @dlascl_64_(i8* %uplo, i64* %byref.constant.int.012, i64* %byref.constant.int.013, i8* %fpcast.constant.fp.1.0, i8* %beta_p, i64* %n, i64* %n, i8* %"C'", i64* %ldc, i64* %[[v0]], i64 1)
+; CHECK-NEXT:   %[[soz1:.+]] = load i64, i64* %n, align 4
+; CHECK-NEXT:   %[[soz2:.+]] = load i64, i64* %n, align 4
+; CHECK-NEXT:   %[[soz3:.+]] = load i64, i64* %ldc, align 4
+; CHECK-NEXT:   %[[soz4:.+]] = bitcast i8* %beta_p to double*
+; CHECK-NEXT:   %[[soz5:.+]] = load double, double* %[[soz4]], align 8
+; CHECK-NEXT:   %[[soz6:.+]] = load i8, i8* %uplo, align 1
+; CHECK-NEXT:   %[[soz7:.+]] = icmp eq i8 %[[soz6]], 117
+; CHECK-NEXT:   %[[soz8:.+]] = icmp eq i8 %[[soz6]], 85
+; CHECK-NEXT:   %[[soz9:.+]] = or i1 %[[soz8]], %[[soz7]]
+; CHECK-NEXT:   %[[soz10:.+]] = icmp eq i8 %[[soz6]], 108
+; CHECK-NEXT:   %[[soz11:.+]] = icmp eq i8 %[[soz6]], 76
+; CHECK-NEXT:   %[[soz12:.+]] = or i1 %[[soz11]], %[[soz10]]
+; CHECK-NEXT:   %[[soz13:.+]] = select i1 %[[soz12]], i8 76, i8 71
+; CHECK-NEXT:   %[[soz14:.+]] = select i1 %[[soz9]], i8 85, i8 %[[soz13]]
+; CHECK-NEXT:   %[[soz15:.+]] = bitcast i8* %"C'" to double*
+; CHECK-NEXT:   %identity.i = fcmp oeq double %[[soz5]], 1.000000e+00
+; CHECK-NEXT:   %[[soz16:.+]] = icmp sle i64 %[[soz1]], 0
+; CHECK-NEXT:   %[[soz17:.+]] = icmp sle i64 %[[soz2]], 0
+; CHECK-NEXT:   %[[soz18:.+]] = or i1 %[[soz17]], %[[soz16]]
+; CHECK-NEXT:   %[[soz19:.+]] = or i1 %[[soz18]], %identity.i
+; CHECK-NEXT:   br i1 %[[soz19]], label %__enzyme_scale_or_zero_double_64.exit, label %init.i
+; CHECK: init.i:                                           ; preds = %invertentry_end
+; CHECK-NEXT:   %overwrite.i = fcmp oeq double %[[soz5]], 0.000000e+00
+; CHECK-NEXT:   %lower.i = icmp eq i8 %[[soz14]], 76
+; CHECK-NEXT:   %[[soz30:.+]] = icmp eq i64 %[[soz3]], %[[soz2]]
+; CHECK-NEXT:   %[[soz31:.+]] = or i1 %[[soz9]], %lower.i
+; CHECK-NEXT:   %[[soz32:.+]] = xor i1 %[[soz31]], true
+; CHECK-NEXT:   %contiguous.i = and i1 %[[soz32]], %[[soz30]]
+; CHECK-NEXT:   br i1 %contiguous.i, label %flat.i, label %col.i
+; CHECK: flat.i:                                           ; preds = %init.i
+; CHECK-NEXT:   %total.i = mul nuw nsw i64 %[[soz2]], %[[soz1]]
+; CHECK-NEXT:   br i1 %overwrite.i, label %flat.zero.i, label %flat.scale.i
+; CHECK: flat.zero.i:                                      ; preds = %flat.i
+; CHECK-NEXT:   %[[soz33:.+]] = mul nuw nsw i64 %total.i, 8
+; CHECK-NEXT:   call void @llvm.memset.p0i8.i64(i8* %"C'", i8 0, i64 %[[soz33]], i1 false)
+; CHECK-NEXT:   br label %__enzyme_scale_or_zero_double_64.exit
+; CHECK: flat.scale.i:                                     ; preds = %flat.scale.i, %flat.i
+; CHECK-NEXT:   %k.i = phi i64 [ 0, %flat.i ], [ %k.next.i, %flat.scale.i ]
+; CHECK-NEXT:   %out.k.i = getelementptr inbounds double, double* %[[soz15]], i64 %k.i
+; CHECK-NEXT:   %[[soz34:.+]] = load double, double* %out.k.i, align 8
+; CHECK-NEXT:   %scaled.k.i = fmul double %[[soz5]], %[[soz34]]
+; CHECK-NEXT:   store double %scaled.k.i, double* %out.k.i, align 8
+; CHECK-NEXT:   %k.next.i = add nuw nsw i64 %k.i, 1
+; CHECK-NEXT:   %[[soz35:.+]] = icmp eq i64 %k.next.i, %total.i
+; CHECK-NEXT:   br i1 %[[soz35]], label %__enzyme_scale_or_zero_double_64.exit, label %flat.scale.i
+; CHECK: col.i:                                            ; preds = %col.end.i, %init.i
+; CHECK-NEXT:   %j.i = phi i64 [ 0, %init.i ], [ %j.next.i, %col.end.i ]
+; CHECK-NEXT:   %j.next.i = add nuw nsw i64 %j.i, 1
+; CHECK-NEXT:   %[[soz20:.+]] = icmp slt i64 %j.next.i, %[[soz2]]
+; CHECK-NEXT:   %[[soz21:.+]] = select i1 %[[soz20]], i64 %j.next.i, i64 %[[soz2]]
+; CHECK-NEXT:   %last.i = select i1 %[[soz9]], i64 %[[soz21]], i64 %[[soz2]]
+; CHECK-NEXT:   %[[soz22:.+]] = icmp slt i64 %j.i, %[[soz2]]
+; CHECK-NEXT:   %[[soz23:.+]] = select i1 %[[soz22]], i64 %j.i, i64 %[[soz2]]
+; CHECK-NEXT:   %first.i = select i1 %lower.i, i64 %[[soz23]], i64 0
+; CHECK-NEXT:   %col.offset.i = mul nuw nsw i64 %j.i, %[[soz3]]
+; CHECK-NEXT:   %[[soz24:.+]] = icmp slt i64 %first.i, %last.i
+; CHECK-NEXT:   br i1 %[[soz24]], label %row.i, label %col.end.i
+; CHECK: row.i:                                            ; preds = %row.i, %col.i
+; CHECK-NEXT:   %i.i = phi i64 [ %first.i, %col.i ], [ %i.next.i, %row.i ]
+; CHECK-NEXT:   %[[soz25:.+]] = add nuw nsw i64 %i.i, %col.offset.i
+; CHECK-NEXT:   %out.i.i = getelementptr inbounds double, double* %[[soz15]], i64 %[[soz25]]
+; CHECK-NEXT:   %[[soz26:.+]] = load double, double* %out.i.i, align 8
+; CHECK-NEXT:   %scaled.i = fmul double %[[soz5]], %[[soz26]]
+; CHECK-NEXT:   %[[soz27:.+]] = select i1 %overwrite.i, double 0.000000e+00, double %scaled.i
+; CHECK-NEXT:   store double %[[soz27]], double* %out.i.i, align 8
+; CHECK-NEXT:   %i.next.i = add nuw nsw i64 %i.i, 1
+; CHECK-NEXT:   %[[soz28:.+]] = icmp eq i64 %i.next.i, %last.i
+; CHECK-NEXT:   br i1 %[[soz28]], label %col.end.i, label %row.i
+; CHECK: col.end.i:                                        ; preds = %row.i, %col.i
+; CHECK-NEXT:   %[[soz29:.+]] = icmp eq i64 %j.next.i, %[[soz1]]
+; CHECK-NEXT:   br i1 %[[soz29]], label %__enzyme_scale_or_zero_double_64.exit, label %col.i
+; CHECK: __enzyme_scale_or_zero_double_64.exit:            ; preds = %invertentry_end, %flat.zero.i, %flat.scale.i, %col.end.i
 ; CHECK-NEXT:   ret void
 ; CHECK-NEXT: }

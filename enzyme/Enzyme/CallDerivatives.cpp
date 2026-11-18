@@ -2356,8 +2356,8 @@ classifyAtomicModifyOp(llvm::Function *op, unsigned &opArgNo, llvm::Type *&FT) {
 
 bool AdjointGenerator::handleKnownCallDerivatives(
     CallInst &call, Function *called, StringRef funcName,
-    bool subsequent_calls_may_write, const std::vector<bool> &overwritten_args,
-    CallInst *const newCall) {
+    uint8_t subsequent_calls_may_write,
+    const std::vector<bool> &overwritten_args, CallInst *const newCall) {
   bool subretused = false;
   bool shadowReturnUsed = false;
   DIFFE_TYPE subretType =
@@ -3687,13 +3687,29 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             uint64_t idx = 0;
             Value *prev = nullptr;
             ;
-            auto Defs = gutils->getAllocationZeroingBundles(&call, bb,
-                                                            /*lookup*/ false);
+            bool zeroShadow =
+                !inLoop &&
+                (Mode == DerivativeMode::ReverseModeCombined ||
+                 (Mode == DerivativeMode::ReverseModePrimal &&
+                  forwardsShadow) ||
+                 (Mode == DerivativeMode::ReverseModeGradient &&
+                  backwardsShadow) ||
+                 (Mode == DerivativeMode::ForwardModeSplit && backwardsShadow));
+            // On a Julia that zeroes allocations in late-gc-lowering, let it
+            // zero the whole shadow instead of emitting a memset.
+            bool zeroWithBundle =
+                zeroShadow && !hasMetadata(&call, "enzyme_fromstack") &&
+                GradientUtils::canZeroAllocationWithBundle(&call);
+            auto Defs = gutils->getAllocationZeroingBundles(
+                &call, bb, /*lookup*/ false,
+                zeroWithBundle ? args[1] : nullptr);
             auto rule = [&]() {
               Value *anti =
                   bb.CreateCall(call.getFunctionType(), call.getCalledOperand(),
                                 args, Defs, call.getName() + "'mi");
               cast<CallInst>(anti)->setAttributes(call.getAttributes());
+              if (zeroWithBundle)
+                GradientUtils::markAllocationZeroed(cast<CallInst>(anti));
               cast<CallInst>(anti)->setCallingConv(call.getCallingConv());
               cast<CallInst>(anti)->setTailCallKind(call.getTailCallKind());
               cast<CallInst>(anti)->setDebugLoc(dbgLoc);
@@ -3741,18 +3757,11 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                   }
                 }
               }
-              if (Mode == DerivativeMode::ReverseModeCombined ||
-                  (Mode == DerivativeMode::ReverseModePrimal &&
-                   forwardsShadow) ||
-                  (Mode == DerivativeMode::ReverseModeGradient &&
-                   backwardsShadow) ||
-                  (Mode == DerivativeMode::ForwardModeSplit &&
-                   backwardsShadow)) {
-                if (!inLoop) {
+              if (zeroShadow) {
+                if (!zeroWithBundle)
                   zeroKnownAllocation(bb, anti, args, funcName, gutils->TLI,
                                       &call);
-                  zeroed = true;
-                }
+                zeroed = true;
               }
               idx++;
               prev = anti;
@@ -4862,6 +4871,10 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         return true;
       }
       eraseIfUnused(call);
+      // Freeing a constant pointer is still a primal side effect. Forward mode
+      // must not fall through to the reverse-only deallocation handling,
+      // which can remove this free (including frees of integer loop caches).
+      return true;
     }
     auto callval = call.getCalledOperand();
 

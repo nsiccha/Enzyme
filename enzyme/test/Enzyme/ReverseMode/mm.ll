@@ -193,9 +193,7 @@ attributes #3 = { argmemonly nounwind }
 ; CHECK: invertfor.body23:                                 ; preds = %invertfor.inc44, %incinvertfor.body23
 ; CHECK-NEXT:   %"add'de.0" = phi float [ 0.000000e+00, %invertfor.inc44 ], [ %[[a18]], %incinvertfor.body23 ]
 ; CHECK-NEXT:   %"iv3'ac.0" = phi i64 [ %[[smaxm2]], %invertfor.inc44 ], [ %[[a24:.+]], %incinvertfor.body23 ]
-; CHECK-NEXT:   %[[unwrap7]] = mul nsw i64 %"iv1'ac.0", %rows
-; CHECK-NEXT:   %[[unwrap8:.+]] = add nsw i64 %[[unwrap7]], %"iv'ac.0"
-; CHECK-NEXT:   %[[dout_iji8]] = getelementptr inbounds double, double* %[[dout_data]], i64 %[[unwrap8]]
+; CHECK-NEXT:   %[[dout_iji8]] = getelementptr inbounds double, double* %[[dout_data]], i64 %[[unwrap8:.+]]
 ; CHECK-NEXT:   %[[a16:.+]] = load double, double* %[[dout_iji8]], align 8
 ; CHECK-NEXT:   store double 0.000000e+00, double* %[[dout_iji8]], align 8
 ; CHECK-NEXT:   %[[a17:.+]] = fptrunc double %[[a16]] to float
@@ -228,6 +226,8 @@ attributes #3 = { argmemonly nounwind }
 ; CHECK: invertfor.inc44:                                  ; preds = %invertfor.inc47, %incinvertfor.body5
 ; CHECK-NEXT:   %"iv1'ac.0.in" = phi i64 [ %cols, %invertfor.inc47 ], [ %"iv1'ac.0", %incinvertfor.body5 ]
 ; CHECK-NEXT:   %"iv1'ac.0" = add i64 %"iv1'ac.0.in", -1
+; CHECK-NEXT:   %[[unwrap7]] = mul nsw i64 %"iv1'ac.0", %rows
+; CHECK-NEXT:   %[[unwrap8]] = add nsw i64 %[[unwrap7]], %"iv'ac.0"
 ; CHECK-NEXT:   br label %invertfor.body23
 
 ; CHECK: invertfor.inc47:

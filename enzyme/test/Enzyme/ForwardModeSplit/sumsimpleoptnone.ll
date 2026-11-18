@@ -39,8 +39,8 @@ attributes #0 = { noinline nounwind uwtable optnone }
 
 ; CHECK: define internal void @fwddiffef(double* nocapture readonly %x, double* nocapture %"x'", double** nocapture readonly %y, double** nocapture %"y'", i64 %n, i8* %tapeArg)
 ; CHECK-NEXT: entry:
-; CHECK-NEXT:   %0 = bitcast i8* %tapeArg to double***
-; CHECK-NEXT:   %truetape = load double**, double*** %0
+; CHECK-NEXT:   %0 = bitcast i8* %tapeArg to double**
+; CHECK-NEXT:   %[[il_phi:.+]] = load double*, double** %0
 ; CHECK-NEXT:   %1 = add {{(nuw )?}}i64 %n, 1
 ; CHECK-NEXT:   br label %for.cond
 
@@ -52,8 +52,6 @@ attributes #0 = { noinline nounwind uwtable optnone }
 
 ; CHECK: for.body:                                         ; preds = %for.cond
 ; CHECK-NEXT:   %[[i2:.+]] = load double, double* %"x'"
-; CHECK-NEXT:   %[[i3:.+]] = getelementptr inbounds double*, double** %truetape, i64 %iv
-; CHECK-NEXT:   %[[il_phi:.+]] = load double*, double** %[[i3]], align 8, !invariant.group !{{[0-9]+}}
 ; CHECK-NEXT:   %[[i4:.+]] = load double, double* %[[il_phi]]
 ; CHECK-NEXT:   %[[i5:.+]] = fadd fast double %[[i4]], %[[i2]]
 ; CHECK-NEXT:   store double %[[i5]], double* %[[il_phi]]

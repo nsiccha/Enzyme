@@ -62,7 +62,7 @@ private:
   TypeResults &TR = gutils->TR;
   std::function<unsigned(llvm::Instruction *, CacheType, llvm::IRBuilder<> &)>
       getIndex;
-  const std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+  const std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
       overwritten_args_map;
   const AugmentedReturn *augmentedReturn;
   const std::map<llvm::ReturnInst *, llvm::StoreInst *> *replacedReturns;
@@ -80,7 +80,8 @@ public:
       std::function<unsigned(llvm::Instruction *, CacheType,
                              llvm::IRBuilder<> &)>
           getIndex,
-      const std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
+      const std::map<llvm::CallInst *,
+                     std::pair<uint8_t, const std::vector<bool>>>
           overwritten_args_map,
       const AugmentedReturn *augmentedReturn,
       const std::map<llvm::ReturnInst *, llvm::StoreInst *> *replacedReturns,
@@ -652,7 +653,8 @@ public:
           if (vd[{-1}].isPossiblePointer()) {
             Value *newip = gutils->cacheForReverse(
                 BuilderZ, placeholder,
-                getIndex(&I, CacheType::Shadow, BuilderZ));
+                getIndex(&I, CacheType::Shadow, BuilderZ), /*replace*/ true,
+                /*orig*/ &I);
             assert(newip->getType() == type);
             gutils->invertedPointers.insert(std::make_pair(
                 (const Value *)&I, InvertedPointerVH(gutils, newip)));
@@ -719,7 +721,8 @@ public:
                                          DerivativeMode::ReverseModeGradient,
                                          oldUnreachable)) {
                 gutils->cacheForReverse(
-                    BuilderZ, newip, getIndex(&I, CacheType::Shadow, BuilderZ));
+                    BuilderZ, newip, getIndex(&I, CacheType::Shadow, BuilderZ),
+                    /*replace*/ true, /*orig*/ &I);
               }
               placeholder->replaceAllUsesWith(newip);
               gutils->erase(placeholder);
@@ -742,7 +745,8 @@ public:
               if (can_modref) {
                 newip = gutils->cacheForReverse(
                     BuilderZ, placeholder,
-                    getIndex(&I, CacheType::Shadow, BuilderZ));
+                    getIndex(&I, CacheType::Shadow, BuilderZ),
+                    /*replace*/ true, /*orig*/ &I);
                 assert(newip->getType() == type);
                 gutils->invertedPointers.insert(std::make_pair(
                     (const Value *)&I, InvertedPointerVH(gutils, newip)));
@@ -1950,6 +1954,9 @@ public:
     //  3) phi == B0 whenever not coming from preheader [implies 2]
     //  4) [optional but done for ease] one exit to make it easier to
     //  calculation the product at that point
+    //  5) BO has no active use in the loop besides phi: only its value after
+    //  the loop is differentiated, so its adjoint is not that of an
+    //  intermediate iteration
     for (int i = 0; i < 2; i++)
       if (auto P0 = dyn_cast<PHINode>(SI.getOperand(i + 1))) {
         LoopContext lc;
@@ -2735,6 +2742,9 @@ public:
       //  3) phi == B0 whenever not coming from preheader [implies 2]
       //  4) [optional but done for ease] one exit to make it easier to
       //  calculation the product at that point
+      //  5) BO has no active use in the loop besides phi: only its value after
+      //  the loop is differentiated, so its adjoint is not that of an
+      //  intermediate iteration
       Value *orig_op0 = BO.getOperand(0);
       if (auto P0 = dyn_cast<PHINode>(orig_op0)) {
         LoopContext lc;
@@ -2796,7 +2806,7 @@ public:
                   auto res = Builder2.CreateFDiv(
                       Builder2.CreateFNeg(Builder2.CreateFMul(idiff, lop0)),
                       lop1);
-                  if (gutils->strongZero) {
+                  if (gutils->strongZeroFor(&BO)) {
                     res = CreateSelect(
                         Builder2,
                         Builder2.CreateFCmpOEQ(
@@ -2821,7 +2831,7 @@ public:
                       Builder2.CreateFNeg(Builder2.CreateFMul(
                           s, Builder2.CreateFDiv(idiff, lop0))),
                       lop1);
-                  if (gutils->strongZero) {
+                  if (gutils->strongZeroFor(&BO)) {
                     res = CreateSelect(
                         Builder2,
                         Builder2.CreateFCmpOEQ(
@@ -3105,7 +3115,8 @@ public:
                 auto prevFP = Builder2.CreateBitCast(prev, FT);
                 auto idiffFP = Builder2.CreateBitCast(idiff, FT);
                 prev = Builder2.CreateBitCast(
-                    checkedMul(gutils->strongZero, Builder2, idiffFP, prevFP),
+                    checkedMul(gutils->strongZeroFor(&BO), Builder2, idiffFP,
+                               prevFP),
                     prev->getType());
                 return prev;
               };
@@ -3265,25 +3276,27 @@ public:
       Value *dif[2] = {constantval0 ? nullptr : diffe(orig_op0, Builder2),
                        constantval1 ? nullptr : diffe(orig_op1, Builder2)};
 
-      for (int i = 0; i < 2; ++i) {
-        if (containsOnlyAtMostTopBit(BO.getOperand(i), eFT, dl, &FT) &&
-            dif[1 - i] && !dif[i]) {
-          auto isZero = Builder2.CreateICmpEQ(
-              gutils->getNewFromOriginal(BO.getOperand(i)),
-              Constant::getNullValue(BO.getType()));
-          auto rule = [&](Value *idiff) {
-            auto ext = Builder2.CreateBitCast(idiff, FT);
-            auto neg = Builder2.CreateFNeg(ext);
-            neg = CreateSelect(Builder2, isZero, ext, neg);
-            neg = Builder2.CreateBitCast(neg, BO.getType());
-            return neg;
-          };
-          auto bc = applyChainRule(BO.getOperand(1 - i)->getType(), Builder2,
-                                   rule, dif[1 - i]);
-          setDiffe(&BO, bc, Builder2);
-          return;
+      // If ^ against 0b10000000000 and a float the result is a float
+      if (FT)
+        for (int i = 0; i < 2; ++i) {
+          if (containsOnlyAtMostTopBit(BO.getOperand(i), eFT, dl, &FT) &&
+              dif[1 - i] && !dif[i]) {
+            auto isZero = Builder2.CreateICmpEQ(
+                gutils->getNewFromOriginal(BO.getOperand(i)),
+                Constant::getNullValue(BO.getType()));
+            auto rule = [&](Value *idiff) {
+              auto ext = Builder2.CreateBitCast(idiff, FT);
+              auto neg = Builder2.CreateFNeg(ext);
+              neg = CreateSelect(Builder2, isZero, ext, neg);
+              neg = Builder2.CreateBitCast(neg, BO.getType());
+              return neg;
+            };
+            auto bc = applyChainRule(BO.getOperand(1 - i)->getType(), Builder2,
+                                     rule, dif[1 - i]);
+            setDiffe(&BO, bc, Builder2);
+            return;
+          }
         }
-      }
       if (looseTypeAnalysis) {
         forwardModeInvertedPointerFallback(BO);
         llvm::errs() << "warning: binary operator is integer and constant: "
@@ -3383,7 +3396,8 @@ public:
                 auto prevFP = Builder2.CreateBitCast(prev, FT);
                 auto difiFP = Builder2.CreateBitCast(difi, FT);
                 prev = Builder2.CreateBitCast(
-                    checkedMul(gutils->strongZero, Builder2, difiFP, prevFP),
+                    checkedMul(gutils->strongZeroFor(&BO), Builder2, difiFP,
+                               prevFP),
                     prev->getType());
 
                 return prev;
@@ -4908,7 +4922,7 @@ public:
 
     auto found_ow = overwritten_args_map.find(&call);
     assert(found_ow != overwritten_args_map.end());
-    const bool subsequent_calls_may_write = found_ow->second.first;
+    const uint8_t subsequent_calls_may_write = found_ow->second.first;
     const std::vector<bool> &overwritten_args = found_ow->second.second;
 
     IRBuilder<> BuilderZ(gutils->getNewFromOriginal(&call));
@@ -5669,7 +5683,7 @@ public:
 
   void recursivelyHandleSubfunction(llvm::CallInst &call,
                                     llvm::Function *called,
-                                    bool subsequent_calls_may_write,
+                                    uint8_t subsequent_calls_may_write,
                                     const std::vector<bool> &overwritten_args,
                                     bool shadowReturnUsed,
                                     DIFFE_TYPE subretType, bool subretused) {
@@ -5682,6 +5696,43 @@ public:
     Module &M = *call.getParent()->getParent()->getParent();
 
     bool foreignFunction = called == nullptr;
+
+    // An indirect derivative call uses a shadow function and its fixed ABI.
+    // A constant native pointer has no such shadow. Diagnose it before argument
+    // classification tries to duplicate inactive allocations (or interpret the
+    // native address as a derivative-function structure).
+    if (foreignFunction && gutils->isConstantValue(call.getCalledOperand())) {
+      // The augmented primal must follow the original control flow. An error
+      // about a missing reverse derivative belongs in the reverse pass: raising
+      // it here can activate a primal exception handler and silently return the
+      // derivative of that handler instead of diagnosing the original call.
+      if (Mode != DerivativeMode::ReverseModePrimal) {
+        IRBuilder<> Builder2(&call);
+        if (Mode == DerivativeMode::ReverseModeGradient ||
+            Mode == DerivativeMode::ReverseModeCombined)
+          getReverseBuilder(Builder2);
+        else
+          getForwardBuilder(Builder2);
+        std::string str;
+        raw_string_ostream ss(str);
+        ss << "No derivative available for indirect call through an inactive "
+              "function pointer: "
+           << call;
+        EmitNoDerivativeError(ss.str(), call, gutils, Builder2);
+      }
+      auto found = gutils->invertedPointers.find(&call);
+      if (found != gutils->invertedPointers.end()) {
+        auto placeholder = cast<PHINode>(&*found->second);
+        gutils->invertedPointers.erase(found);
+        gutils->replaceAWithB(placeholder,
+                              UndefValue::get(placeholder->getType()));
+        gutils->erase(placeholder);
+      }
+      if (Mode == DerivativeMode::ReverseModeGradient ||
+          Mode == DerivativeMode::ForwardModeSplit)
+        eraseIfUnused(call, /*erase*/ true, /*check*/ false);
+      return;
+    }
 
     FnTypeInfo nextTypeInfo(called);
 
@@ -7028,7 +7079,7 @@ public:
 
   bool handleKnownCallDerivatives(llvm::CallInst &call, llvm::Function *called,
                                   llvm::StringRef funcName,
-                                  bool subsequent_calls_may_write,
+                                  uint8_t subsequent_calls_may_write,
                                   const std::vector<bool> &overwritten_args,
                                   llvm::CallInst *const newCall);
 
@@ -7079,7 +7130,7 @@ public:
     assert(overwritten_args_map.find(&call) != overwritten_args_map.end() ||
            Mode == DerivativeMode::ForwardMode ||
            Mode == DerivativeMode::ForwardModeError);
-    const bool subsequent_calls_may_write =
+    const uint8_t subsequent_calls_may_write =
         (Mode == DerivativeMode::ForwardMode ||
          Mode == DerivativeMode::ForwardModeError)
             ? false

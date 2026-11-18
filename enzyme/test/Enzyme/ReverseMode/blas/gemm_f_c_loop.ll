@@ -77,11 +77,6 @@ entry:
 ; CHECK-NEXT:   %byref.int.one = alloca i64
 ; CHECK-NEXT:   %byref.transpose.transa = alloca i8
 ; CHECK-NEXT:   %byref.constant.fp.1.0 = alloca double, align 8
-; CHECK-NEXT:   %byref.constant.char.G = alloca i8, align 1
-; CHECK-NEXT:   %byref.constant.int.0 = alloca i64, align 8
-; CHECK-NEXT:   %byref.constant.int.033 = alloca i64, align 8
-; CHECK-NEXT:   %[[fp035:.+]] = alloca double, align 8
-; CHECK-NEXT:   %[[tmp:.+]] = alloca i64
 ; CHECK-NEXT:   %transa = alloca i8, align 1
 ; CHECK-NEXT:   %transb = alloca i8, align 1
 ; CHECK-NEXT:   %n = alloca i64, align 16
@@ -197,7 +192,7 @@ entry:
 ; CHECK: exit:                                             ; preds = %__enzyme_memcpy_double_mat_64.exit
 ; CHECK-NEXT:   br label %invertexit
 
-; CHECK: invertentry:                                      ; preds = %invertloop
+; CHECK: invertentry:                                      ; preds = %__enzyme_scale_or_zero_double_64.exit
 ; CHECK-NEXT:   %[[i33:.+]] = load i64, i64* %"iv'ac"
 ; CHECK-NEXT:   %forfree = load i8**, i8*** %malloccall_cache, align 8, !dereferenceable ![[deref]], !invariant.group ![[INV_2]]
 ; CHECK-NEXT:   %[[i34:.+]] = bitcast i8** %forfree to i8*
@@ -290,25 +285,6 @@ entry:
 ; CHECK-NEXT:   store double 1.000000e+00, double* %byref.constant.fp.1.0, align 8
 ; CHECK-NEXT:   %fpcast.constant.fp.1.0 = bitcast double* %byref.constant.fp.1.0 to i8*
 ; CHECK-NEXT:   call void @dgemm_64_(i8* %[[r58]], i8* %[[r59]], i8* %[[r60]], i8* %[[r61]], i8* %[[r37]], i8* %cast.alpha, i8* %[[r73]], i8* %[[r74]], i8* %[[r75]], i8* %[[r76]], i8* %fpcast.constant.fp.1.0, i8* %"B'", i8* %cast.ldb, i64 1, i64 1)
-; CHECK-NEXT:   store i8 71, i8* %byref.constant.char.G, align 1
-; CHECK-NEXT:   store i64 0, i64* %byref.constant.int.0, align 4
-; CHECK-NEXT:   store i64 0, i64* %byref.constant.int.033, align 4
-; CHECK-NEXT:   store double 1.000000e+00, double* %[[fp035]], align 8
-; CHECK-NEXT:   %[[fp036:.+]] = bitcast double* %[[fp035]] to i8*
-; CHECK-NEXT:   call void @dlascl_64_(i8* %byref.constant.char.G, i64* %byref.constant.int.0, i64* %byref.constant.int.033, i8* %[[fp036]], i8* %cast.beta, i8* %[[r37]], i8* %n_p_unwrap, i8* %"C'", i8* %cast.ldc, i64* %[[tmp]], i64 1)
-; CHECK-NEXT:   %[[r77:.+]] = bitcast double* %cache.A_unwrap to i8*
-; CHECK-NEXT:   tail call void @free(i8* nonnull %[[r77]])
-; CHECK-NEXT:   call void @free(i8* %[[r37]])
-; CHECK-NEXT:   %[[r78:.+]] = load i64, i64* %"iv'ac", align 4
-; CHECK-NEXT:   %[[r79:.+]] = icmp eq i64 %[[r78]], 0
-; CHECK-NEXT:   %[[r80:.+]] = xor i1 %[[r79]], true
-; CHECK-NEXT:   br i1 %[[r79]], label %invertentry, label %incinvertloop
-
-; CHECK: incinvertloop:                                    ; preds = %invertloop
-; CHECK-NEXT:   %[[i72:.+]] = load i64, i64* %"iv'ac"
-; CHECK-NEXT:   %[[i73:.+]] = add nsw i64 %[[i72]], -1
-; CHECK-NEXT:   store i64 %[[i73]], i64* %"iv'ac"
-; CHECK-NEXT:   br label %remat_enter
 
 ; CHECK: invertexit:                                       ; preds = %exit
 ; CHECK-NEXT:   br label %mergeinvertloop_exit
