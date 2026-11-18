@@ -27,8 +27,7 @@ define { double*, i64 } @aggregate(double* %x) {
 }
 
 define double @consume_locally(double* %x) {
-  ; A used result conservatively retains the local classification. A capture
-  ; proof of the result alone cannot distinguish this from return_pointee.
+  ; Only the loaded scalar escapes. The new storage stays inside this call.
   %p = call double* @fill(double* %x)
   %v = load double, double* %p
   ret double %v
@@ -56,9 +55,9 @@ define double* @fill(double* %x) {
 ; CHECK: define double* @outer(double* {{.*}}%x) #[[LOCAL:[0-9]+]]
 ; CHECK: define double* @wrapper(double* {{.*}}%x) #[[LOCAL]]
 ; CHECK: define { double*, i64 } @aggregate(double* {{.*}}%x) #[[LOCAL]]
-; CHECK: define double @consume_locally(double* {{.*}}%x) #[[LOCAL]]
+; CHECK: define double @consume_locally(double* {{.*}}%x) #[[READONLY:[0-9]+]]
 ; CHECK: define double* @return_pointee(double* {{.*}}%x) #[[LOCAL]]
-; CHECK: define void @discard_result(double* {{.*}}%x) #[[READONLY:[0-9]+]]
+; CHECK: define void @discard_result(double* {{.*}}%x) #[[READONLY]]
 ; CHECK: define double* @fill(double* {{.*}}%x) #[[LOCAL]]
 ; CHECK: attributes #[[LOCAL]] = { {{.*}}"enzyme_LocalReadOnlyOrThrow" }
 ; CHECK: attributes #[[READONLY]] = { {{.*}}"enzyme_ReadOnlyOrThrow" }

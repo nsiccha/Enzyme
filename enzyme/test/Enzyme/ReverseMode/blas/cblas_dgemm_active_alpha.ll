@@ -22,18 +22,14 @@ entry:
 }
 
 ; CHECK-NOT: @cblas_dlascl
-; CHECK-LABEL: define internal { double } @diffef(double %alpha, ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture %C, ptr nocapture %"C'")
+; CHECK-LABEL: define internal { double } @diffef(double %alpha, ptr {{[^,]*}}%A, ptr {{[^,]*}}%B, ptr {{[^,]*}}%C, ptr {{[^,]*}}%"C'")
 ; CHECK: %[[ALPHA_DIFFE:.+]] = alloca double
 ; CHECK: store double 0.000000e+00, ptr %[[ALPHA_DIFFE]]
 ; CHECK: invert{{.*}}:
-; CHECK: %[[DOT:.+]] = call fast double @cblas_ddot(i32 9, ptr nocapture readonly %"C'", i32 1, ptr nocapture readonly %[[PRODUCT:.+]], i32 1)
+; CHECK: %[[DOT:.+]] = call fast double @cblas_ddot(i32 9, ptr {{[^,]*}}%"C'", i32 1, ptr {{[^,]*}}%[[PRODUCT:.+]], i32 1)
 ; CHECK: %[[OLD:.+]] = load double, ptr %[[ALPHA_DIFFE]]
 ; CHECK-NEXT: %[[NEW:.+]] = fadd fast double %[[OLD]], %[[DOT]]
 ; CHECK-NEXT: store double %[[NEW]], ptr %[[ALPHA_DIFFE]]
-; CHECK: Gfor.body.i:
-; CHECK: %[[GEP:.+]] = getelementptr double, ptr %"C'", i32
-; CHECK-NEXT: store double 0.000000e+00, ptr %[[GEP]]
-; CHECK: __enzyme_cblas_lascl_double_32.exit:
+; CHECK: call void @llvm.memset.{{.*}}(ptr %"C'", i8 0, i32 72, i1 false)
 ; CHECK: %[[RESULT:.+]] = load double, ptr %[[ALPHA_DIFFE]]
 ; CHECK: insertvalue { double } {{(undef|poison)}}, double %[[RESULT]], 0
-; CHECK-LABEL: define internal void @__enzyme_cblas_lascl_double_32(i32 %layout, i32 %type, double %cfrom, double %cto, i32 %M, i32 %N, ptr noalias nocapture %A, i32 %lda)
