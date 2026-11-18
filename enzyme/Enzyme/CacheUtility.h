@@ -57,6 +57,9 @@ extern "C" {
 extern llvm::cl::opt<bool> EfficientBoolCache;
 
 extern llvm::cl::opt<bool> EnzymeZeroCache;
+
+/// Let packed ragged caches of one element type and loop nest share storage
+extern llvm::cl::opt<bool> EnzymeGroupPackedCaches;
 }
 
 /// Container for all loop information to synthesize gradients
@@ -330,6 +333,41 @@ protected:
   std::map<llvm::AllocaInst *,
            llvm::SmallVector<llvm::AssertingVH<llvm::CallInst>, 4>>
       scopeAllocs;
+
+  /// Packed ragged caches of one element type and loop nest can share one
+  /// offset table and one growing buffer of records, one slot per cache. The
+  /// group owns the table, its bookkeeping and its frees; no single cache
+  /// owns them, so erasing one cache leaves the others intact.
+  struct PackedCacheGroup {
+    /// Holds the shared offset table: entry zero is the buffer, entry
+    /// 1 + i the record offset of outer iteration i.
+    llvm::AllocaInst *table = nullptr;
+    llvm::AllocaInst *used = nullptr;
+    llvm::AllocaInst *capacity = nullptr;
+    /// Holds the number of caches per record. Its one store is updated as
+    /// caches join, before any of this code runs.
+    llvm::AllocaInst *width = nullptr;
+    llvm::StoreInst *widthStore = nullptr;
+    llvm::CallInst *tableAllocation = nullptr;
+    llvm::CallInst *growth = nullptr;
+    unsigned fields = 0;
+  };
+  /// Groups by element type, inner chunk size and preheader, outer chunk size
+  /// and preheader, and whether the cache is freed.
+  std::map<std::tuple<llvm::Type *, llvm::Value *, llvm::BasicBlock *,
+                      llvm::Value *, llvm::BasicBlock *, bool>,
+           PackedCacheGroup>
+      packedCacheGroups;
+  /// A cache that is slot `index` of the records of a packed cache group.
+  struct PackedCacheField {
+    llvm::AllocaInst *width;
+    unsigned index;
+  };
+  std::map<llvm::AllocaInst *, PackedCacheField> packedCacheFields;
+
+  /// Whether this function's packed ragged caches may be grouped: only when
+  /// they never reach a tape, whose readers index each cache on its own.
+  virtual bool groupPackedCaches() const { return false; }
 
   /// Perform the final load from the cache, applying requisite invariant
   /// group and alignment

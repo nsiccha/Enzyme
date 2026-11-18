@@ -142,6 +142,12 @@ public:
   DerivativeMode mode;
   llvm::Function *oldFunc;
   llvm::ValueMap<const llvm::Value *, InvertedPointerVH> invertedPointers;
+
+  /// A combined forward and reverse function keeps its caches to itself, so
+  /// their layout needs no agreement with a separate reverse function.
+  bool groupPackedCaches() const override {
+    return mode == DerivativeMode::ReverseModeCombined;
+  }
   llvm::DominatorTree *OrigDT;
   llvm::PostDominatorTree *OrigPDT;
   llvm::LoopInfo *OrigLI;

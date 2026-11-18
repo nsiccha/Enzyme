@@ -57,6 +57,12 @@ llvm::cl::opt<bool> EnzymeRewriteAccumulators(
     "enzyme-rewrite-accumulators", cl::init(true), cl::Hidden,
     cl::desc("Rewrite a loop-carried counter whose step is an inner loop's "
              "trip count into a closed form of the induction variable"));
+
+llvm::cl::opt<bool> EnzymeGroupPackedCaches(
+    "enzyme-group-packed-caches", cl::init(true), cl::Hidden,
+    cl::desc("Store the packed ragged caches of one element type and loop "
+             "nest of a combined derivative as records of one buffer, with "
+             "one offset table, instead of one table and buffer per cache"));
 }
 
 CacheUtility::~CacheUtility() {}
@@ -170,6 +176,7 @@ void CacheUtility::erase(Instruction *I) {
     scopeFrees.erase(AI);
     scopeAllocs.erase(AI);
     scopeInstructions.erase(AI);
+    packedCacheFields.erase(AI);
   }
   scopeMap.erase(I);
   SE.eraseValueFromMap(I);
@@ -1297,6 +1304,164 @@ AllocaInst *CacheUtility::createCacheForScope(LimitContext ctx, Type *T,
     scopeInstructions[alloc].push_back(
         entryBuilder.CreateStore(undef_v, alloc));
 
+  // In a combined derivative, the packed caches of one element type and loop
+  // nest share one offset table and one growing buffer of records, one slot
+  // per cache: element i of the cache in slot k of a group of width caches is
+  // buffer[(offset + i) * width + k]. Offsets and growth depend only on the
+  // loop nest, so the group allocates and grows once for all its caches, and
+  // a cache adds no allocation of its own.
+  if (packed && allocateInternal && !extraSize && EnzymeGroupPackedCaches &&
+      groupPackedCaches()) {
+    auto &DL = newFunc->getParent()->getDataLayout();
+    BasicBlock *outerPreheader = sublimits[1].second.back().first.preheader;
+    BasicBlock *innerPreheader = sublimits[0].second.back().first.preheader;
+    ConstantInt *slotBytes =
+        ConstantInt::get(i64, DL.getTypeAllocSizeInBits(types[1]) / 8);
+    unsigned slotAlign = getCacheAlignment(slotBytes->getZExtValue());
+    auto key = std::make_tuple(T, sublimits[0].first, innerPreheader,
+                               sublimits[1].first, outerPreheader, shouldFree);
+    auto found = packedCacheGroups.find(key);
+    if (found == packedCacheGroups.end()) {
+      PackedCacheGroup G;
+      G.table = entryBuilder.CreateAlloca(types[2], nullptr, name + "_group");
+      G.table->setAlignment(alloc->getAlign());
+      if (!isa<UndefValue>(undef_v))
+        entryBuilder.CreateStore(undef_v, G.table);
+      G.used = entryBuilder.CreateAlloca(i64, nullptr, name + "_groupused");
+      G.capacity =
+          entryBuilder.CreateAlloca(i64, nullptr, name + "_groupcapacity");
+      G.width = entryBuilder.CreateAlloca(i64, nullptr, name + "_groupwidth");
+      G.widthStore =
+          entryBuilder.CreateStore(ConstantInt::get(i64, 0), G.width);
+
+      // The offset table, one slot per outer iteration after the buffer.
+      MDNode *tableGroup = MDNode::getDistinct(alloc->getContext(), {});
+      CachePointerInvariantGroups[std::make_pair((Value *)G.table, 1)] =
+          tableGroup;
+      {
+        IRBuilder<> B(&outerPreheader->back());
+        Value *size =
+            B.CreateAdd(sublimits[1].first, ConstantInt::get(i64, 1));
+        CallInst *malloccall = nullptr;
+        Instruction *ZeroInst = nullptr;
+        Value *table = CreateAllocation(
+            B, types[1], size, name + "_groupmalloccache", &malloccall,
+            /*ZeroMem*/ EnzymeZeroCache ? &ZeroInst : nullptr);
+        auto ident = MDNode::getDistinct(
+            malloccall->getContext(),
+            {ConstantAsMetadata::get(
+                ConstantInt::getFalse(malloccall->getContext()))});
+        malloccall->setMetadata("enzyme_cache_alloc",
+                                MDNode::get(malloccall->getContext(), {ident}));
+        G.tableAllocation = malloccall;
+        auto stored = B.CreateStore(table, G.table);
+        stored->setMetadata(LLVMContext::MD_invariant_group, tableGroup);
+        stored->setAlignment(Align(slotAlign));
+        PostCacheStore(stored, B);
+        B.CreateStore(Constant::getNullValue(types[1]), table);
+        B.CreateStore(ConstantInt::get(i64, 0), G.used);
+        B.CreateStore(ConstantInt::get(i64, 0), G.capacity);
+      }
+
+      // Each outer iteration records where its rows start, growing the buffer
+      // geometrically when they do not fit.
+      MDNode *slotGroup = MDNode::getDistinct(alloc->getContext(), {});
+      CachePointerInvariantGroups[std::make_pair((Value *)G.table, 0)] =
+          slotGroup;
+      {
+        IRBuilder<> B(&innerPreheader->back());
+        Value *outer = computeIndexOfChunk(
+            /*inForwardPass*/ true, B, sublimits[1].second,
+            /*available*/ ValueToValueMapTy());
+        outer = B.CreateAdd(outer, ConstantInt::get(i64, 1));
+        auto slotTable = B.CreateLoad(types[2], G.table);
+        slotTable->setAlignment(Align(slotAlign));
+        auto slot = B.CreateInBoundsGEP(types[1], slotTable, outer);
+
+        ConstantInt *elementBytes =
+            ConstantInt::get(i64, DL.getTypeAllocSizeInBits(T) / 8);
+        auto table = B.CreateLoad(types[2], G.table);
+        auto buffer = B.CreateLoad(types[1], table);
+        auto offset = B.CreateLoad(i64, G.used);
+        auto oldCapacity = B.CreateLoad(i64, G.capacity);
+        auto width = B.CreateLoad(i64, G.width);
+        auto recordBytes = B.CreateNUWMul(width, elementBytes);
+        auto required = B.CreateNUWAdd(offset, sublimits[0].first);
+        auto doubled = B.CreateShl(oldCapacity, 1);
+        // If doubling would overflow the byte size, grow only as far as
+        // needed. A valid requested tape must still fit in size_t.
+        auto canDouble = B.CreateICmpULE(
+            oldCapacity,
+            B.CreateUDiv(ConstantInt::get(i64, UINT64_MAX / 2), recordBytes));
+        doubled = B.CreateSelect(canDouble, doubled, required);
+        auto candidate = B.CreateSelect(B.CreateICmpUGT(required, doubled),
+                                        required, doubled);
+        auto nextCapacity = B.CreateSelect(
+            B.CreateICmpUGT(required, oldCapacity), candidate, oldCapacity);
+        auto raw = B.CreatePointerCast(buffer, malloctypes[0]);
+        G.growth = B.CreateCall(
+            getRaggedCacheGrower(*newFunc->getParent(), malloctypes[0], T,
+                                 EnzymeZeroCache),
+            {raw, B.CreateNUWMul(oldCapacity, recordBytes),
+             B.CreateNUWMul(nextCapacity, recordBytes)},
+            name + "_groupgrowcache");
+        B.CreateStore(B.CreatePointerCast(G.growth, types[1]), table);
+        B.CreateStore(nextCapacity, G.capacity);
+        B.CreateStore(required, G.used);
+        auto stored =
+            B.CreateStore(B.CreateIntToPtr(offset, types[1]), slot);
+        stored->setMetadata(LLVMContext::MD_invariant_group, slotGroup);
+        stored->setAlignment(Align(slotAlign));
+        PostCacheStore(stored, B);
+      }
+
+      // Release the buffer and the table once the reverse pass leaves the
+      // nest, for the whole group.
+      if (shouldFree) {
+        auto freecall =
+            freeCache(outerPreheader, sublimits, 1, G.table, types[2],
+                      slotBytes, G.table, tableGroup, types[1]);
+        if (freecall) {
+          auto ident = MDNode::getDistinct(
+              freecall->getContext(),
+              {ConstantAsMetadata::get(
+                  ConstantInt::getTrue(freecall->getContext()))});
+          G.tableAllocation->setMetadata(
+              "enzyme_cache_alloc",
+              MDNode::get(freecall->getContext(), {ident}));
+          freecall->setMetadata("enzyme_cache_free",
+                                MDNode::get(freecall->getContext(), {ident}));
+        }
+      }
+      found = packedCacheGroups.emplace(key, G).first;
+    }
+
+    auto &G = found->second;
+    unsigned index = G.fields++;
+    G.widthStore->setOperand(0, ConstantInt::get(i64, G.fields));
+
+    // The cache's own root holds the shared table, as an ungrouped packed
+    // cache's root holds its own.
+    IRBuilder<> B(&outerPreheader->back());
+    auto table = B.CreateLoad(types[2], G.table);
+    table->setAlignment(Align(slotAlign));
+    auto stored = B.CreateStore(table, alloc);
+    if (CachePointerInvariantGroups.find(std::make_pair((Value *)alloc, 1)) ==
+        CachePointerInvariantGroups.end())
+      CachePointerInvariantGroups[std::make_pair((Value *)alloc, 1)] =
+          MDNode::getDistinct(alloc->getContext(), {});
+    stored->setMetadata(
+        LLVMContext::MD_invariant_group,
+        CachePointerInvariantGroups[std::make_pair((Value *)alloc, 1)]);
+    stored->setAlignment(Align(slotAlign));
+    scopeInstructions[alloc].push_back(table);
+    scopeInstructions[alloc].push_back(stored);
+    scopeAllocs[alloc].push_back(G.tableAllocation);
+    scopeAllocs[alloc].push_back(G.growth);
+    packedCacheFields[alloc] = PackedCacheField{G.width, index};
+    return alloc;
+  }
+
   Value *storeInto = alloc;
   AllocaInst *used = nullptr;
   AllocaInst *capacity = nullptr;
@@ -2129,13 +2294,30 @@ Value *CacheUtility::getCachePointer(llvm::Type *T, bool inForwardPass,
       inner = BuilderM.CreateMul(inner, lookupM(extraSize, BuilderM), "", true,
                                  true);
     auto buffer = BuilderM.CreateLoad(types[1], table);
-    auto index = BuilderM.CreateNUWAdd(offset, inner);
+    Value *row = BuilderM.CreateNUWAdd(offset, inner);
+    Value *index = row;
+    Value *width = nullptr;
+    Value *record = nullptr;
+    // A cache of a packed cache group is one slot of each record.
+    if (auto AI = dyn_cast<AllocaInst>(cache)) {
+      auto field = packedCacheFields.find(AI);
+      if (field != packedCacheFields.end()) {
+        width = BuilderM.CreateLoad(i64, field->second.width);
+        record = BuilderM.CreateNUWMul(row, width);
+        index = BuilderM.CreateNUWAdd(
+            record, ConstantInt::get(i64, field->second.index));
+      }
+    }
     auto result = BuilderM.CreateInBoundsGEP(T, buffer, index);
     if (storeInInstructionsMap && isa<AllocaInst>(cache)) {
       // Index recomputation may itself look up other caches. Only own the
       // instructions specific to this cache, as in the unpacked path below.
-      SmallVector<Value *, 8> owned = {table,  slot,  savedOffset, offset,
-                                       buffer, index, result};
+      // Each instruction once: erasing the cache erases every entry.
+      SmallVector<Value *, 10> owned = {table, slot, savedOffset, offset,
+                                        buffer, row};
+      if (width)
+        owned.append({width, record, index});
+      owned.push_back(result);
       for (auto value : owned)
         if (auto I = dyn_cast<Instruction>(value))
           scopeInstructions[cast<AllocaInst>(cache)].push_back(I);
