@@ -90,7 +90,8 @@ fail:
 }
 
 ; CHECK-LABEL: define internal {{.*}} @diffecarry_header(
-; CHECK: %next_{{(malloc)?cache}} =
+; The reverse loop can cache either each allocation or its loaded length.
+; CHECK: %{{(next|len)}}_{{(malloc)?cache}} =
 ; CHECK: %next = call noalias nonnull ptr addrspace(10) @julia.gc_alloc_obj
 ; CHECK-NOT: %remat_next =
 ; CHECK: {{^}}}

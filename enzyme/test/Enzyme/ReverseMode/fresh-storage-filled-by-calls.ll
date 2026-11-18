@@ -1,4 +1,4 @@
-; RUN: if [ %llvmver -ge 15 ]; then %opt < %s %OPnewLoadEnzyme -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg)" -enzyme-preopt=false -S | FileCheck %s; fi
+; RUN: if [ %llvmver -ge 15 ]; then %opt < %s %OPnewLoadEnzyme -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg)" -enzyme-preopt=false -S | FileCheck %s --implicit-check-not='call {{.*}}@malloc('; fi
 
 ; A later call that fills an array it allocates with arrays it computes one by
 ; one, as Julia's collect does, cannot overwrite what the call read: the calls
@@ -76,8 +76,5 @@ entry:
 attributes #0 = { inaccessiblememonly "enzyme_allocator"="0" "enzyme_fresh_pointer"="0" "enzyme_inactive" }
 attributes #1 = { nofree "enzyme_inactive" }
 
-; CHECK: define internal void @augmented_sqdist(
-; CHECK-NOT: malloc
-; CHECK: }
-; CHECK: define internal { double } @diffesqdist(
+; CHECK: define internal { double } @diffesqdist(ptr {{[^,]+}} %arr, double %m, double %differeturn)
 ; CHECK: %y_unwrap = load double

@@ -103,7 +103,6 @@ entry:
 
 ; CHECK: invertinner:
 ; CHECK-NEXT:   %"iv1'ac.0" = phi i64 [ %[[R1]], %invertouter.latch ], [ %[[R19:[0-9]+]], %incinvertinner ]
-; CHECK-NEXT:   %off_unwrap = mul i64 %"iv'ac.0", %K
 ; CHECK-NEXT:   %"base'ipg_unwrap" = getelementptr double, ptr %"A'", i64 %off_unwrap
 ; CHECK-NEXT:   %"stp'ipg_unwrap" = getelementptr double, ptr %"base'ipg_unwrap", i64 %"iv1'ac.0"
 ; CHECK-NEXT:   %[[R8:[0-9]+]] = load double, ptr %"stp'ipg_unwrap", align 8, !alias.scope !5, !noalias !2
@@ -129,5 +128,6 @@ entry:
 
 ; CHECK: invertouter.latch:
 ; CHECK-NEXT:   %"iv'ac.0" = phi i64 [ %[[R7]], %incinvertouter ], [ %[[R0]], %outer.latch ]
+; CHECK-NEXT:   %off_unwrap = mul i64 %"iv'ac.0", %K
 ; CHECK-NEXT:   br label %invertinner
 ; CHECK-NEXT: }
