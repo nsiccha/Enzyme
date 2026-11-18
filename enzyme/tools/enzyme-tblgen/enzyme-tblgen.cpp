@@ -254,6 +254,49 @@ bool handle(const Twine &curIndent, const Twine &argPattern, raw_ostream &os,
             ArrayRef<unsigned> retidx, StringRef origName, bool newFromOriginal,
             ActionType intrinsic);
 
+// Whether a pattern operand is the incoming derivative (`DiffeRet`, the
+// adjoint in reverse mode and the tangent in forward mode), or its negation.
+static bool isIncomingDerivative(const Init *arg) {
+  auto dag = dyn_cast<DagInit>(arg);
+  if (!dag)
+    return false;
+  auto opDef = dyn_cast<DefInit>(dag->getOperator());
+  if (!opDef)
+    return false;
+  auto Def = opDef->getDef();
+  if (Def->isSubClassOf("DiffeRetIndex"))
+    return true;
+  if (Def->isSubClassOf("Inst") && Def->getValueAsString("name") == "FNeg" &&
+      dag->getNumArgs() == 1)
+    return isIncomingDerivative(dag->getArg(0));
+  return false;
+}
+
+// Under strong zero a derivative that is zero contributes zero, whatever it is
+// multiplied by or divided into: `0 * inf` and `0 / 0` stay 0 rather than NaN.
+// A rule that scales the incoming derivative by a partial derivative, such as
+// `log`'s `dx / x`, gives NaN at a point where that partial is infinite (here
+// x = 0) even when no derivative reaches the call. So every real `FMul` with
+// the incoming derivative as an operand, and every `FDiv` with it as the
+// numerator, is emitted as the `CheckedMul` / `CheckedDiv` a rule could also
+// write explicitly (`checkedMulRHS` when the derivative is the second factor,
+// so the operand order stays as written). Without strong zero the checked
+// forms are the plain instruction, so nothing changes outside strong zero.
+static StringRef strongZeroOp(StringRef opName, const DagInit *resultRoot,
+                              ActionType intrinsic) {
+  if (intrinsic == MLIRDerivatives || resultRoot->getNumArgs() != 2)
+    return "";
+  bool diffeLHS = isIncomingDerivative(resultRoot->getArg(0));
+  bool diffeRHS = isIncomingDerivative(resultRoot->getArg(1));
+  if (opName == "FMul" && diffeLHS)
+    return "checkedMul";
+  if (opName == "FMul" && diffeRHS)
+    return "checkedMulRHS";
+  if (opName == "FDiv" && diffeLHS)
+    return "checkedDiv";
+  return "";
+}
+
 SmallVector<bool, 1> prepareArgs(const Twine &curIndent, raw_ostream &os,
                                  const Twine &argName, const Record *pattern,
                                  const DagInit *resultRoot, StringRef builder,
@@ -1090,6 +1133,7 @@ bool handle(const Twine &curIndent, const Twine &argPattern, raw_ostream &os,
 
       bool isCall = opName == "Call" || Def->isSubClassOf("Call");
       bool isIntr = opName == "Intrinsic" || Def->isSubClassOf("Intrinsic");
+      StringRef implicitChecked = strongZeroOp(opName, resultRoot, intrinsic);
 
       if (isCall) {
         getFunction(curIndent + INDENT, os, "callval", "FT", "cconv",
@@ -1149,6 +1193,12 @@ bool handle(const Twine &curIndent, const Twine &argPattern, raw_ostream &os,
         else
           os << "checkedDiv(gutils->strongZeroFor(&" << origName << "), "
              << builder << ", ";
+      } else if (!implicitChecked.empty()) {
+        if (origName == "<ILLEGAL>")
+          os << implicitChecked << "(gutils->strongZero, " << builder << ", ";
+        else
+          os << implicitChecked << "(gutils->strongZeroFor(&" << origName
+             << "), " << builder << ", ";
       } else if (intrinsic == MLIRDerivatives) {
         // Derivative expressions are built with fast-math, as they are on the
         // LLVM side; ops that carry no such flags are unaffected.
