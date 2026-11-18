@@ -1993,7 +1993,30 @@ void TypeAnalyzer::visitAllocaInst(AllocaInst &I) {
   updateAnalysis(&I, ptr.Only(-1, &I), &I);
 }
 
+// A pointer in Julia's boxed array storage identifies an object. Elements
+// in this buffer can have different concrete Julia types.
+static bool boxedJuliaElement(Value *address, Value *value) {
+  auto *ty = dyn_cast<PointerType>(value->getType());
+  return ty && ty->getAddressSpace() == 10 &&
+         address->getType()->getPointerAddressSpace() == 13;
+}
+
+static TypeTree boxedJuliaSlot(Instruction &I) {
+  auto address = TypeTree(BaseType::Pointer);
+  address |= TypeTree(BaseType::Pointer).Only(0, &I);
+  return address.Only(-1, &I);
+}
+
 void TypeAnalyzer::visitLoadInst(LoadInst &I) {
+  if (I.getMetadata("enzyme_opaque_element") &&
+      boxedJuliaElement(I.getPointerOperand(), &I)) {
+    if (direction & UP)
+      updateAnalysis(I.getPointerOperand(), boxedJuliaSlot(I), &I);
+    if (direction & DOWN)
+      updateAnalysis(&I, TypeTree(BaseType::Pointer).Only(-1, &I), &I);
+    return;
+  }
+
   auto &DL = I.getParent()->getParent()->getParent()->getDataLayout();
   auto LoadSize = (DL.getTypeSizeInBits(I.getType()) + 7) / 8;
 
@@ -2009,6 +2032,16 @@ void TypeAnalyzer::visitLoadInst(LoadInst &I) {
 }
 
 void TypeAnalyzer::visitStoreInst(StoreInst &I) {
+  if (I.getMetadata("enzyme_opaque_element") &&
+      boxedJuliaElement(I.getPointerOperand(), I.getValueOperand())) {
+    if (direction & UP) {
+      updateAnalysis(I.getPointerOperand(), boxedJuliaSlot(I), &I);
+      updateAnalysis(I.getValueOperand(),
+                     TypeTree(BaseType::Pointer).Only(-1, &I), &I);
+    }
+    return;
+  }
+
   auto &DL = I.getParent()->getParent()->getParent()->getDataLayout();
   auto StoreSize =
       (DL.getTypeSizeInBits(I.getValueOperand()->getType()) + 7) / 8;
@@ -2340,6 +2373,36 @@ void TypeAnalyzer::visitGEPOperator(GEPOperator &gep) {
     updateAnalysis(gep.getPointerOperand(), upTree.Only(-1, inst), &gep);
 }
 
+// Two freshly boxed Julia objects can meet at a control-flow join even when
+// the fields reached through their pointers have different layouts.
+static const Value *juliaAllocationType(Value *value) {
+  auto *call = dyn_cast<CallInst>(value);
+  if (!call || call->arg_size() != 3 || !call->getCalledFunction() ||
+      call->getCalledFunction()->getName() != "julia.gc_alloc_obj")
+    return nullptr;
+  return dyn_cast<GlobalVariable>(call->getArgOperand(2)->stripPointerCasts());
+}
+
+static bool mayJoinDistinctJuliaBoxes(PHINode &phi) {
+  auto *ty = dyn_cast<PointerType>(phi.getType());
+  if (!ty || ty->getAddressSpace() != 10)
+    return false;
+  const Value *first = nullptr;
+  bool unknown = false;
+  for (Value *incoming : phi.incoming_values()) {
+    auto *tag = juliaAllocationType(incoming);
+    if (!tag) {
+      // A recursive constructor can return one of several concrete boxes.
+      unknown |= isa<CallBase>(incoming);
+      continue;
+    }
+    if (first && tag != first)
+      return true;
+    first = tag;
+  }
+  return first && unknown;
+}
+
 void TypeAnalyzer::visitPHINode(PHINode &phi) {
   if (direction & UP) {
     TypeTree upVal = getAnalysis(&phi);
@@ -2357,7 +2420,7 @@ void TypeAnalyzer::visitPHINode(PHINode &phi) {
       upVal = upVal.PurgeAnything();
     }
 
-    if (EnzymeStrictAliasing || seen) {
+    if ((EnzymeStrictAliasing && !mayJoinDistinctJuliaBoxes(phi)) || seen) {
       auto L = LI.getLoopFor(phi.getParent());
       bool isHeader = L && L->getHeader() == phi.getParent();
       for (size_t i = 0, end = phi.getNumIncomingValues(); i < end; ++i) {
@@ -2634,7 +2697,42 @@ void TypeAnalyzer::visitSExtInst(SExtInst &I) {
   updateAnalysis(I.getOperand(0), TypeTree(BaseType::Integer).Only(-1, &I), &I);
 }
 
+// Julia can compare either a tagged pointer or the raw address of its type.
+static const Value *juliaTypeTestOperand(const Value *V) {
+  V = V->stripPointerCasts();
+  auto *call = dyn_cast<CallInst>(V);
+  if (call && call->getCalledFunction() && call->arg_size() == 1 &&
+      call->getCalledFunction()->getName() == "julia.pointer_from_objref")
+    return call->getArgOperand(0)->stripPointerCasts();
+  return V;
+}
+
 void TypeAnalyzer::visitAddrSpaceCastInst(AddrSpaceCastInst &I) {
+  // Layout reached in a type-dispatch arm describes that arm's concrete box.
+  if (I.getSrcAddressSpace() == 10 && I.getDestAddressSpace() == 11) {
+    auto *src = I.getOperand(0);
+    for (const User *U : src->users()) {
+      auto *CI = dyn_cast<CallInst>(U);
+      if (CI && CI->getCalledFunction() &&
+          CI->getCalledFunction()->getName() == "julia.typeof") {
+        auto *br = dyn_cast<BranchInst>(CI->getParent()->getTerminator());
+        auto *cmp = br && br->isConditional()
+                        ? dyn_cast<ICmpInst>(br->getCondition())
+                        : nullptr;
+        if (cmp && cmp->isEquality() &&
+            (juliaTypeTestOperand(cmp->getOperand(0)) == CI ||
+             juliaTypeTestOperand(cmp->getOperand(1)) == CI) &&
+            (DT.dominates(BasicBlockEdge(br->getParent(), br->getSuccessor(0)),
+                          I.getParent()) ||
+             DT.dominates(BasicBlockEdge(br->getParent(), br->getSuccessor(1)),
+                          I.getParent()))) {
+          updateAnalysis(&I, TypeTree(BaseType::Pointer).Only(-1, &I), &I);
+          return;
+        }
+      }
+    }
+  }
+
   if (direction & DOWN)
     updateAnalysis(&I, getAnalysis(I.getOperand(0)), &I);
   if (direction & UP)
