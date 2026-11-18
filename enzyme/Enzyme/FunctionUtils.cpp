@@ -2139,11 +2139,15 @@ public:
         canHandBack(!cannotHandBackPointer(F)) {}
 
   // Returns if newly legal, subject to the pending calls.
-  bool run(FunctionAnalysisManager *FAM = nullptr, SmallVectorImpl<std::pair<unsigned, int64_t>> *argOwnedWrites = nullptr, ArgumentOwnedWritesCache *ownedCache = nullptr, const SmallPtrSetImpl<Function *> *localCandidates = nullptr);
-  void mark(bool localOnly) {
-    local = localOnly;
-    if (local) F.addFnAttr("enzyme_LocalReadOnlyOrThrow");
-    else {
+  bool run(FunctionAnalysisManager *FAM = nullptr,
+           SmallVectorImpl<std::pair<unsigned, int64_t>> *argOwnedWrites = nullptr,
+           ArgumentOwnedWritesCache *ownedCache = nullptr,
+           const SmallPtrSetImpl<Function *> *localCandidates = nullptr);
+  void mark() {
+    if (local) {
+      F.addFnAttr("enzyme_LocalReadOnlyOrThrow");
+    } else {
+      // A previous run on less optimized IR may have marked this function local.
       F.removeFnAttr("enzyme_LocalReadOnlyOrThrow");
       F.addFnAttr("enzyme_ReadOnlyOrThrow");
     }
@@ -3005,7 +3009,11 @@ static bool onlyReadsArgument(const CallBase *call, unsigned i) {
           Callee->hasParamAttribute(i, Attribute::ReadNone));
 }
 
-bool ReadOnlyOrThrowDetector::run(FunctionAnalysisManager *FAM, SmallVectorImpl<std::pair<unsigned, int64_t>> *argOwnedWrites, ArgumentOwnedWritesCache *ownedCache, const SmallPtrSetImpl<Function *> *localCandidates) {
+bool ReadOnlyOrThrowDetector::run(
+    FunctionAnalysisManager *FAM,
+    SmallVectorImpl<std::pair<unsigned, int64_t>> *argOwnedWrites,
+    ArgumentOwnedWritesCache *ownedCache,
+    const SmallPtrSetImpl<Function *> *localCandidates) {
   if (isReadOnlyOrThrow(&F))
     return false;
   if (F.empty())
@@ -3294,7 +3302,8 @@ bool ReadOnlyOrThrowDetector::run(FunctionAnalysisManager *FAM, SmallVectorImpl<
             if (isReadOnlyOrThrow(F2))
               continue;
             if (callWritesOnlyNewMemory(CI)) {
-              if (needLocal() && !cannotHoldPointer(CI) && reaches(CI, /*Deep*/ true))
+              if (needLocal() && !cannotHoldPointer(CI) &&
+                  reaches(CI, /*Deep*/ true))
                 local = true;
               continue;
             }
@@ -3339,17 +3348,8 @@ bool ReadOnlyOrThrowDetector::run(FunctionAnalysisManager *FAM, SmallVectorImpl<
     }
   }
 
-  if (calls_todo.empty() && !argOwnedWrites && !localCandidates) {
-    if (local) {
-      F.addFnAttr("enzyme_LocalReadOnlyOrThrow");
-    } else {
-      // A function is either local or fully read-only-or-throw, never both:
-      // an earlier run, e.g. on less optimized IR, may have marked it local.
-      F.removeFnAttr("enzyme_LocalReadOnlyOrThrow");
-      F.addFnAttr("enzyme_ReadOnlyOrThrow");
-    }
-    addReadOnlyOrThrowAttributes();
-  }
+  if (calls_todo.empty() && !argOwnedWrites && !localCandidates)
+    mark();
   return true;
 }
 
@@ -3658,7 +3658,8 @@ bool DetectReadonlyOrThrow(Module &M) {
       auto &TLI = FAM.getResult<TargetLibraryAnalysis>(*fn);
       bool local = false;
       ReadOnlyOrThrowDetector detector(*fn, pending, TLI, local);
-      if (!detector.run(&FAM, nullptr, &ownedWrites, &cycle) || !pending.empty()) {
+      if (!detector.run(&FAM, nullptr, &ownedWrites, &cycle) ||
+          !pending.empty()) {
         cycle.erase(fn);
         removed = true;
       } else {
@@ -3670,7 +3671,7 @@ bool DetectReadonlyOrThrow(Module &M) {
     SmallPtrSet<Function *, 1> pending;
     auto &TLI = FAM.getResult<TargetLibraryAnalysis>(*fn);
     bool local = cycleLocal[fn];
-    ReadOnlyOrThrowDetector(*fn, pending, TLI, local).mark(local);
+    ReadOnlyOrThrowDetector(*fn, pending, TLI, local).mark();
     changed = true;
   }
   return changed;

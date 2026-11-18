@@ -1060,10 +1060,10 @@ struct CacheAnalysis {
           continue;
 
         if (!callsite_op->getArgOperand(i)->getType()->isPointerTy() ||
-            (!writesCreatedObject || !isReceivedPointer(objs[i])) &&
-            writesToMemoryReadBy(
-                AA, TLI, MemoryLocation::getForArgument(callsite_op, i, TLI),
-                inst2)) {
+            ((!writesCreatedObject || !isReceivedPointer(objs[i])) &&
+             writesToMemoryReadBy(
+                 AA, TLI, MemoryLocation::getForArgument(callsite_op, i, TLI),
+                 inst2))) {
           if (!isa<ConstantInt>(callsite_op->getArgOperand(i)) &&
               !isa<UndefValue>(callsite_op->getArgOperand(i)))
             EmitWarning("UncacheableArg", *callsite_op, "Callsite ",
