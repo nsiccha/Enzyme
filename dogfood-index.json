@@ -1,0 +1,111 @@
+{
+  "schema": 1,
+  "line": {
+    "repo": "nsiccha/Enzyme",
+    "ref": "dogfood",
+    "sha": "97121ac5edc086a090bdefd104b79f66b805197a"
+  },
+  "upstream": {
+    "repo": "EnzymeAD/Enzyme",
+    "ref": "main",
+    "sha": "6fbd5c11e308abe9ff5e1dea45b91a388ccf0288"
+  },
+  "prepared_at": "2026-11-18T12:05:38Z",
+  "problems": [
+    {
+      "id": "mlir-custom-reverse-rules",
+      "role": "fix",
+      "title": "MLIR calls need activity-specific reverse rules with typed caches",
+      "summary": "A frontend can supply different reverse rules for a callee and pass typed saved values across calls, loops, branches and batching. The retained interface supports width one. Upstream drafts #2516 and #3324 describe the split-mode implementation and its extensions.",
+      "repairs": [
+        {
+          "id": "pr/custom-rules",
+          "covers": [
+            "implementation",
+            "regression"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/EnzymeAD/Enzyme/pull/2516",
+          "relation": "related"
+        },
+        {
+          "url": "https://github.com/EnzymeAD/Enzyme/pull/3324",
+          "relation": "related"
+        },
+        {
+          "url": "https://github.com/EnzymeAD/Enzyme/pull/3411",
+          "relation": "related"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "7fdeca58bb28e05fed57ba202435ec541fc6af69",
+            "title": "Merge upstream main 6fbd5c11 into dogfood",
+            "original": [
+              "7fdeca58bb28e05fed57ba202435ec541fc6af69"
+            ]
+          },
+          {
+            "sha": "97121ac5edc086a090bdefd104b79f66b805197a",
+            "title": "[MLIR] Custom rules: print properties with prop-dict",
+            "original": [
+              "97121ac5edc086a090bdefd104b79f66b805197a"
+            ]
+          }
+        ],
+        "why_together": "On upstream 6fbd5c11, take the merge delta against its second parent (git cherry-pick -m 2 7fdeca58), then the property syntax update. This recovers the full integrated rule implementation and its fixtures without replaying intermediate work-in-progress revisions."
+      },
+      "depends_on": [],
+      "requires": [
+        {
+          "name": "Enzyme-JAX stack pin",
+          "repo": "nsiccha/Enzyme-JAX",
+          "sha": "6143e7305d84cffd815dba3b11a696ba3a4998fd",
+          "why": "Revision selected together with this component for the October 13 compiler stack."
+        },
+        {
+          "name": "Reactant.jl stack pin",
+          "repo": "nsiccha/Reactant.jl",
+          "sha": "24383df755ab7b1641048dfcb8d67e29fbef7097",
+          "why": "Revision selected together with this component for the October 13 compiler stack."
+        },
+        {
+          "name": "Enzyme.jl stack pin",
+          "repo": "nsiccha/Enzyme.jl",
+          "sha": "e02eb37420fcbd91508151b3a782b0c5b2853162",
+          "why": "Revision selected together with this component for the October 13 compiler stack."
+        }
+      ],
+      "validation": [
+        {
+          "base": "3385960d55741929f15ef3ab5e5b7c4f149c8bcc",
+          "tests": [
+            "Enzyme MLIR suite",
+            "StableHLO pipeline cases",
+            "Enzyme-JAX suite",
+            "Julia frontend checks"
+          ],
+          "result": "passed",
+          "detail": "PR #3324 records 218 MLIR tests, 24 pipeline cases, 1,394 Enzyme-JAX tests and 15 frontend checks on its earlier source combination.",
+          "evidence": "https://github.com/EnzymeAD/Enzyme/pull/3324"
+        },
+        {
+          "base": "6fbd5c11e308abe9ff5e1dea45b91a388ccf0288",
+          "tests": [],
+          "result": "not-run",
+          "detail": "No fresh compiler or runtime test on this pinned stack during the source audit."
+        }
+      ],
+      "draft": {
+        "title": "MLIR calls need activity-specific reverse rules with typed caches",
+        "prepared_at": "2026-11-18T12:05:38Z",
+        "body": "## Reproducer\n\nRun this example\n\n```sh\ncurl -fsSL https://raw.githubusercontent.com/nsiccha/Enzyme/97121ac5edc086a090bdefd104b79f66b805197a/enzyme/test/MLIR/ReverseMode/custom_rule_sets.mlir -o rule-sets.mlir\nenzymemlir-opt rule-sets.mlir --split-input-file --enzyme --canonicalize --lower-enzyme-custom-rules-to-func --remove-unnecessary-enzyme-ops --enzyme-simplify-math --verify-diagnostics | FileCheck rule-sets.mlir\n```\n\n## Observed\n\nOn the pinned upstream base a callee cannot register the two activity-specific MLIR reverse rules used by the fixture. Its first caller invokes mul(a,x) and mul(3,x) in the same derivative.\n\n## Expected\n\nThe first call should differentiate both operands. The second should select the rule for x alone. Each reverse invocation should receive the cached primal values from its own call.\n\n## Proposed fix\n\nRegister a set of reverse rules on the callee, select the compatible rule with the fewest active arguments, and lower its saved values to typed call results and operands. See the existing proposals [#2516](https://github.com/EnzymeAD/Enzyme/pull/2516) and [#3324](https://github.com/EnzymeAD/Enzyme/pull/3324)."
+      }
+    }
+  ]
+}
