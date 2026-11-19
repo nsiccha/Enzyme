@@ -19,6 +19,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/MapVector.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Pass/PassManager.h"
 
 #define DEBUG_TYPE "enzyme"
 
@@ -45,7 +46,8 @@ struct LowerEnzymeCustomRulesToFuncPass
 } // end anonymous namespace
 
 static LogicalResult
-lowerCustomReverseRuleToFunc(enzyme::CustomReverseRuleOp revRule) {
+lowerCustomReverseRuleToFunc(enzyme::CustomReverseRuleOp revRule,
+                             bool prepareForAD = false) {
   SymbolTable symbolTable(SymbolTable::getNearestSymbolTable(revRule));
 
   if (!revRule.getBody().hasOneBlock())
@@ -281,6 +283,15 @@ lowerCustomReverseRuleToFunc(enzyme::CustomReverseRuleOp revRule) {
   SymbolTable::setSymbolVisibility(reverseFunc,
                                    SymbolTable::Visibility::Private);
 
+  // The split reverse body can still contain temporary gradient slots. Make
+  // the lifted functions differentiable before exposing them to another AD.
+  if (prepareForAD) {
+    PassManager cleanup(revRule.getContext(), func::FuncOp::getOperationName());
+    cleanup.addPass(createRemoveUnusedEnzymeOpsPass());
+    if (failed(cleanup.run(primalFunc)) || failed(cleanup.run(reverseFunc)))
+      return failure();
+  }
+
   auto uses = SymbolTable::getSymbolUses(
       StringAttr::get(revRule->getContext(), revRuleName), symbolTable.getOp());
   if (!uses) {
@@ -366,7 +377,7 @@ LogicalResult mlir::enzyme::lowerSplitCallsForAD(Operation *function) {
       else
         cast<CallCustomReverseOp>(call).setFnAttr(name);
     }
-    if (failed(lowerCustomReverseRuleToFunc(rule)))
+    if (failed(lowerCustomReverseRuleToFunc(rule, /*prepareForAD=*/true)))
       return failure();
   }
   return success();
