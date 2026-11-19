@@ -435,7 +435,6 @@ FlatSymbolRefAttr MEnzymeLogic::CreateSplitModeDiff(
   }
 
   IRMapping originalToNew;
-  std::map<Operation *, Operation *> originalToNewOps;
 
   SmallPtrSet<mlir::Value, 1> returnvals;
   SmallPtrSet<mlir::Value, 1> constant_values;
@@ -525,8 +524,7 @@ FlatSymbolRefAttr MEnzymeLogic::CreateSplitModeDiff(
   ruleBuilder.setInsertionPoint(reverse);
 
   auto newFunc = cast<FunctionOpInterface>(fn->cloneWithoutRegions());
-  cloneInto(&fn.getFunctionBody(), &newFunc.getFunctionBody(), originalToNew,
-            originalToNewOps);
+  cloneInto(&fn.getFunctionBody(), &newFunc.getFunctionBody(), originalToNew);
 
   Block *fnEntry = &newFunc.getFunctionBody().front();
   IRMapping invertedPointers;
@@ -556,8 +554,7 @@ FlatSymbolRefAttr MEnzymeLogic::CreateSplitModeDiff(
   MGradientUtilsReverse *gutils = new MGradientUtilsReverse(
       *this, newFunc, fn, TA, invertedPointers, returnPrimalsP, returnShadowsP,
       constant_values, nonconstant_values, retType, constants, originalToNew,
-      originalToNewOps, mode, width, omp, postpasses, verifyPostPasses,
-      strongZero);
+      mode, width, omp, postpasses, verifyPostPasses, strongZero);
 
   gutils->createReverseModeBlocks(fn.getFunctionBody(), reverse.getBody());
   std::function<std::pair<Value, Value>(Type)> cacheCreatorHook =

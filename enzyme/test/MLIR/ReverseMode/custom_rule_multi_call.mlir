@@ -150,3 +150,37 @@ module {
 // CHECK-NEXT:    %1 = arith.mulf %arg0, %0 : f64
 // CHECK-NEXT:    return %1 : f64
 // CHECK-NEXT:  }
+
+// -----
+
+// Replacing a split-mode call must remap each original result. Both results
+// feed a later multiplication, whose reverse needs their primal values.
+module {
+  func.func private @pair(%x: f64) -> (f64, f64) {
+    %twice = arith.addf %x, %x : f64
+    %square = arith.mulf %x, %x : f64
+    return %twice, %square : f64, f64
+  }
+
+  func.func @pipeline(%x: f64) -> f64 {
+    %a, %b = func.call @pair(%x) : (f64) -> (f64, f64)
+    %product = arith.mulf %a, %b : f64
+    return %product : f64
+  }
+
+  func.func @split(%x: f64, %seed: f64) -> (f64, f64) {
+    %value, %tape = enzyme.autodiff_split_mode.primal @pipeline(%x) <{
+      activity = [#enzyme.activity<enzyme_active>],
+      ret_activity = [#enzyme.activity<enzyme_active>]
+    }> : (f64) -> (f64, !enzyme.Tape)
+    %dx = enzyme.autodiff_split_mode.reverse @pipeline(%seed, %tape) <{
+      activity = [#enzyme.activity<enzyme_active>],
+      ret_activity = [#enzyme.activity<enzyme_active>]
+    }> : (f64, !enzyme.Tape) -> f64
+    return %value, %dx : f64, f64
+  }
+}
+
+// CHECK-LABEL: func.func private @pipeline_reverse_rule_primal(
+// CHECK: %[[PAIR:[0-9]+]]:{{[0-9]+}} = call @pair_reverse_rule_primal(
+// CHECK: arith.mulf %[[PAIR]]#0, %[[PAIR]]#1

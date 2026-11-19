@@ -983,16 +983,14 @@ static SmallVector<Value> callCacheValuesSplit(Operation *orig,
                                               newOp->getResultTypes(),
                                               cacheTypes, fnAttr, operands);
 
-  for (auto [oldRes, newRes] :
-       llvm::zip_equal(newOp->getResults(), primal.getOutputs()))
-    oldRes.replaceAllUsesWith(newRes);
+  gutils->replaceOrigOpWith(orig, primal.getOutputs());
+  gutils->originalToNewFn.map(orig, primal.getOperation());
 
   SmallVector<Value> cachedArguments;
   for (Value cache : primal.getCaches())
     cachedArguments.push_back(gutils->initAndPushCache(cache, cacheBuilder));
 
   gutils->erase(newOp);
-  gutils->originalToNewFnOps[orig] = primal;
 
   return cachedArguments;
 }
