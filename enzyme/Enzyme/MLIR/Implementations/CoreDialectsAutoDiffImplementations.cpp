@@ -778,8 +778,12 @@ static CustomReverseRuleOp selectCustomRule(FunctionOpInterface fn,
 // CreateSplitModeDiff). An llvm.func spells its signature as an
 // LLVMFunctionType, so a call to one still takes the combined-mode path
 // below.
-static bool splitModeSupported(FunctionOpInterface fn) {
-  return isa<FunctionType>(fn.getFunctionType());
+static bool splitModeSupported(FunctionOpInterface fn, size_t width) {
+  // Derived split tapes currently have scalar cotangents. The combined path
+  // already handles batched cotangents for callees it can safely recompute.
+  // An authored rule must still be respected or report its width limit.
+  return isa<FunctionType>(fn.getFunctionType()) &&
+         (width == 1 || fn->hasAttr("enzyme.custom_rule"));
 }
 
 // A call to a func-like callee is differentiated in split mode: the primal
@@ -1250,7 +1254,7 @@ SmallVector<Value> edetail::callCacheValues(Operation *orig,
   if (!fn || fn.getFunctionBody().empty())
     return SmallVector<Value>();
 
-  if (splitModeSupported(fn) && !splitRuleInProgress(orig, gutils, fn))
+  if (splitModeSupported(fn, gutils->width) && !splitRuleInProgress(orig, gutils, fn))
     return callCacheValuesSplit(orig, gutils, fn);
   return callCacheValuesCombined(orig, gutils, fn);
 }
