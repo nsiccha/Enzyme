@@ -936,13 +936,13 @@ llvm::Function *getOrInsertAtomicFloatMinMax(
     bool IsVolatile = false);
 
 /// Create function for type that performs memcpy with a stride using blas copy
-void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
+void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Function *called, BlasInfo blas,
                            llvm::ArrayRef<llvm::Value *> args,
                            llvm::Type *cublas_retty,
                            llvm::ArrayRef<llvm::OperandBundleDef> bundles);
 
 /// Create function for type that performs memcpy using lapack copy
-void callMemcpyStridedLapack(llvm::IRBuilder<> &B, llvm::Module &M,
+void callMemcpyStridedLapack(llvm::IRBuilder<> &B, llvm::Function *called,
                              BlasInfo blas, llvm::ArrayRef<llvm::Value *> args,
                              llvm::ArrayRef<llvm::OperandBundleDef> bundles);
 
@@ -960,7 +960,7 @@ void callSPMVDiagUpdate(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
                         bool byRef, bool julia_decl);
 
 llvm::CallInst *
-getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
+getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Function *called, BlasInfo blas,
                      llvm::IntegerType *IT, llvm::Type *BlasPT,
                      llvm::Type *BlasIT, llvm::Type *fpTy,
                      llvm::ArrayRef<llvm::Value *> args,
@@ -2715,7 +2715,7 @@ void addValueToCache(llvm::Value *arg, bool cache_arg, llvm::Type *ty,
 llvm::Value *load_if_ref(llvm::IRBuilder<> &B, llvm::Type *intType,
                          llvm::Value *V, bool byRef);
 
-void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Type *fpType,
+void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Function *called, llvm::Type *fpType,
                          BlasInfo blas, bool byRef, llvm::Value *layout,
                          llvm::Value *uplo, llvm::Value *A, llvm::Value *lda,
                          llvm::Value *N);

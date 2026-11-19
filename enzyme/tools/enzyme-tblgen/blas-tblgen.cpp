@@ -1925,7 +1925,7 @@ void emit_dag(bool forward, Twine resultVarName, const DagInit *ruleDag,
 
     os << "    auto derivcall_inner_prod = \n"
           "      getorInsertInnerProd(Builder2, "
-          "*gutils->oldFunc->getParent(), blas, intType, type_vec_like, "
+          "called, blas, intType, type_vec_like, "
           "type_n, fpType, "
        << "ArrayRef<Value *>(" << argPrefix
        << "), Defs, byRef, cublas, julia_decl);\n"
@@ -1996,7 +1996,7 @@ void emit_dag(bool forward, Twine resultVarName, const DagInit *ruleDag,
       os << ";\n";
     }
 
-    os << " copy_lower_to_upper(Builder2, fpType, blas, byRef, \n";
+    os << " copy_lower_to_upper(Builder2, called, fpType, blas, byRef, \n";
     os << "                     arg_0[0] ? load_if_ref(Builder2, charType, "
           "arg_0[0], byRef) : nullptr,\n";
     os << "                     is_lower(Builder2, arg_1[0], byRef, cublas),\n";

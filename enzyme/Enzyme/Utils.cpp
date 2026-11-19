@@ -1651,7 +1651,7 @@ Value *lookup_with_layout(IRBuilder<> &B, Type *fpType, Value *layout,
   return ptr;
 }
 
-void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Type *fpType,
+void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Function *called, llvm::Type *fpType,
                          BlasInfo blas, bool byRef, llvm::Value *layout,
                          llvm::Value *islower, llvm::Value *A, llvm::Value *lda,
                          llvm::Value *N) {
@@ -1673,6 +1673,8 @@ void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Type *fpType,
     tys.insert(tys.begin(), layout->getType());
   auto ltuFT = FunctionType::get(B.getVoidTy(), tys, false);
 
+  // This helper calls BLAS internally. Give each provider its own body.
+  fnc_name = getRenamedPerCallingConv(called->getName(), fnc_name);
   auto F0 = M.getOrInsertFunction(fnc_name, ltuFT);
 
   SmallVector<Value *, 1> args = {islower, A, lda, N};
@@ -1777,7 +1779,7 @@ void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Type *fpType,
   auto copy_name = std::string(blas.prefix) + blas.floatType + "copy" +
                    (cublasv2 ? "" : blas.suffix);
 
-  auto copyfn = M.getOrInsertFunction(copy_name, FT);
+  auto copyfn = getOrInsertPerCallingConv(M, called, copy_name, FT);
   LB.CreateCall(copyfn, copyArgs);
   if (auto F = GetFunctionFromValue(copyfn.getCallee()))
     attributeKnownFunctions(*F);
@@ -1795,10 +1797,11 @@ void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Type *fpType,
   }
 }
 
-void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
+void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Function *called, BlasInfo blas,
                            llvm::ArrayRef<llvm::Value *> args,
                            llvm::Type *copy_retty,
                            llvm::ArrayRef<llvm::OperandBundleDef> bundles) {
+  auto &M = *called->getParent();
   const bool cublasv2 =
       blas.prefix == "cublas" && StringRef(blas.suffix).contains("v2");
   auto copy_name = std::string(blas.prefix) + blas.floatType + "copy" +
@@ -1809,15 +1812,16 @@ void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
     tys.push_back(arg->getType());
 
   FunctionType *FT = FunctionType::get(copy_retty, tys, false);
-  auto fn = M.getOrInsertFunction(copy_name, FT);
+  auto fn = getOrInsertPerCallingConv(M, called, copy_name, FT);
   B.CreateCall(fn, args, bundles);
   if (auto F = GetFunctionFromValue(fn.getCallee()))
     attributeKnownFunctions(*F);
 }
 
-void callMemcpyStridedLapack(llvm::IRBuilder<> &B, llvm::Module &M,
+void callMemcpyStridedLapack(llvm::IRBuilder<> &B, llvm::Function *called,
                              BlasInfo blas, llvm::ArrayRef<llvm::Value *> args,
                              llvm::ArrayRef<llvm::OperandBundleDef> bundles) {
+  auto &M = *called->getParent();
   auto copy_name =
       std::string(blas.prefix) + blas.floatType + "lacpy" + blas.suffix;
 
@@ -1826,7 +1830,7 @@ void callMemcpyStridedLapack(llvm::IRBuilder<> &B, llvm::Module &M,
     tys.push_back(arg->getType());
 
   auto FT = FunctionType::get(Type::getVoidTy(M.getContext()), tys, false);
-  auto fn = M.getOrInsertFunction(copy_name, FT);
+  auto fn = getOrInsertPerCallingConv(M, called, copy_name, FT);
   B.CreateCall(fn, args, bundles);
 
   if (auto F = GetFunctionFromValue(fn.getCallee()))
@@ -2220,15 +2224,18 @@ void callSPMVDiagUpdate(IRBuilder<> &B, Module &M, BlasInfo blas,
 }
 
 llvm::CallInst *
-getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
+getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Function *called, BlasInfo blas,
                      IntegerType *IT, Type *BlasPT, Type *BlasIT, Type *fpTy,
                      llvm::ArrayRef<llvm::Value *> args,
                      const llvm::ArrayRef<llvm::OperandBundleDef> bundles,
                      bool byRef, bool cublas, bool julia_decl) {
+  auto &M = *called->getParent();
   assert(fpTy->isFloatingPointTy());
 
   // add inner_prod call if not already present
   std::string prod_name = "__enzyme_inner_prod" + blas.floatType + blas.suffix;
+  // This helper calls BLAS internally. Give each provider its own body.
+  prod_name = getRenamedPerCallingConv(called->getName(), prod_name);
   auto FInnerProdT =
       FunctionType::get(fpTy, {BlasIT, BlasIT, BlasPT, BlasIT, BlasPT}, false);
   Function *F =
@@ -2241,7 +2248,7 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
   std::string dot_name = blas.prefix + blas.floatType + "dot" + blas.suffix;
   auto FDotT =
       FunctionType::get(fpTy, {BlasIT, BlasPT, BlasIT, BlasPT, BlasIT}, false);
-  auto FDot = M.getOrInsertFunction(dot_name, FDotT);
+  auto FDot = getOrInsertPerCallingConv(M, called, dot_name, FDotT);
 
   // now add the implementation for the inner_prod call
   F->setLinkage(Function::LinkageTypes::InternalLinkage);

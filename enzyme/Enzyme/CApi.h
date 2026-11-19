@@ -101,6 +101,10 @@ void EnzymeTypeTreeInsertEq(CTypeTreeRef dst, const int64_t *indices,
 const char *EnzymeTypeTreeToString(CTypeTreeRef src);
 void EnzymeTypeTreeToStringFree(const char *cstr);
 
+/// Whether the BLAS rules recognize this native symbol and preserve its library
+/// when generating calls to companion routines.
+uint8_t EnzymeSupportsBLASLibraryCall(const char *name);
+
 void EnzymeSetCLBool(void *, uint8_t);
 void EnzymeSetCLInteger(void *, int64_t);
 void EnzymeSetCLString(void *, const char *);

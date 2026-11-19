@@ -185,6 +185,10 @@ FnTypeInfo eunwrap(CFnTypeInfo CTI, llvm::Function *F) {
 
 extern "C" {
 
+uint8_t EnzymeSupportsBLASLibraryCall(const char *name) {
+  return static_cast<bool>(extractBLAS(name));
+}
+
 void EnzymeSetCLBool(void *ptr, uint8_t val) {
   auto cl = (llvm::cl::opt<bool> *)ptr;
   cl->setValue((bool)val);
