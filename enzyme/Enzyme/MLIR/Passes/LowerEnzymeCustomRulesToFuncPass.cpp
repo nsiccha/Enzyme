@@ -20,6 +20,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 
 #define DEBUG_TYPE "enzyme"
 
@@ -47,6 +48,9 @@ struct LowerEnzymeCustomRulesToFuncPass
 
 static LogicalResult removeADTemporaries(Operation *function) {
   PassManager cleanup(function->getContext(), function->getName().getStringRef());
+  // Straight-line reverse code may still have an unconditional branch
+  // between a push and its pop. Fold it before pairing the cache operations.
+  cleanup.addPass(createCanonicalizerPass());
   cleanup.addPass(createRemoveUnusedEnzymeOpsPass());
   return cleanup.run(function);
 }
