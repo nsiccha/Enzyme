@@ -17,6 +17,7 @@
 #include "mlir/Pass/PassRegistry.h"
 
 #include "EnzymeLogic.h"
+#include "Passes/RemovalUtils.h"
 #include "Interfaces/GradientUtils.h"
 #include "Interfaces/GradientUtilsReverse.h"
 #include "Interfaces/Utils.h"
@@ -639,6 +640,18 @@ FlatSymbolRefAttr MEnzymeLogic::CreateSplitModeDiff(
   delete gutils;
 
   newFunc->erase();
+
+  // A split caller receives the tape as explicit SSA results. Lift values
+  // saved inside branches and loops to the augmented primal and reverse
+  // boundaries before the caller asks for their types.
+  if (valid && llvm::any_of(getCustomReverseRuleCacheInits(customRule),
+                            [&](enzyme::InitOp init) {
+                              return llvm::any_of(init->getUsers(), [&](Operation *user) {
+                                return user->getParentOp() != augmentedPrimal &&
+                                       user->getParentOp() != reverse;
+                              });
+                            }))
+    valid = succeeded(removeNestedEnzymeOps(customRule));
 
   // An op without an adjoint has already been diagnosed; drop the partial rule
   // so no caller can use it, and let the caller report the callee (the

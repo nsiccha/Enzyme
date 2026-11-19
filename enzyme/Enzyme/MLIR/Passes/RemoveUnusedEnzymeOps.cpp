@@ -670,6 +670,15 @@ LogicalResult PostOrderWalkDriver::processWorklist() {
   return LogicalResult::success(result);
 }
 
+} // end anonymous namespace
+
+LogicalResult mlir::enzyme::removeNestedEnzymeOps(Operation *root) {
+  PostOrderWalkDriver driver(root);
+  driver.initializeWorklist();
+  return driver.processWorklist();
+}
+
+namespace {
 struct RemoveUnusedEnzymeOpsPass
     : public enzyme::impl::RemoveUnusedEnzymeOpsPassBase<
           RemoveUnusedEnzymeOpsPass> {
@@ -681,9 +690,7 @@ struct RemoveUnusedEnzymeOpsPass
     annotateRegionOpsInLoops(op);
     bool failed = false;
     op->walk([&](FunctionOpInterface func) {
-      PostOrderWalkDriver driver(func);
-      driver.initializeWorklist();
-      failed |= driver.processWorklist().failed();
+      failed |= removeNestedEnzymeOps(func).failed();
     });
 
     if (failed) {

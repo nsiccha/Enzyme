@@ -64,6 +64,9 @@ struct CacheInfo {
   CacheInfo merge(CacheInfo other, PatternRewriter &rewriter);
 };
 
+// Lift cache traffic through region operations before exposing a split tape.
+LogicalResult removeNestedEnzymeOps(Operation *root);
+
 // Finalize the rule's top-level caches before calls capture their types.
 // Apply min-cut unless disabled, then mark enzyme.caches_final so subsequent
 // calls reuse the same cache layout. Recursive derivations cannot be finalized.
