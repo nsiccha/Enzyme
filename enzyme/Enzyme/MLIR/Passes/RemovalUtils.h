@@ -72,6 +72,9 @@ LogicalResult removeNestedEnzymeOps(Operation *root);
 // calls reuse the same cache layout. Recursive derivations cannot be finalized.
 LogicalResult finalizeCustomReverseRule(CustomReverseRuleOp rule);
 
+// Materialize split calls in a function that is itself about to undergo AD.
+LogicalResult lowerSplitCallsForAD(Operation *function);
+
 // Lower custom reverse rules and their calls to func.func and func.call.
 LogicalResult lowerCustomReverseRulesToFunc(Operation *root);
 

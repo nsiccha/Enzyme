@@ -283,6 +283,8 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
       return cachedFn->second;
   }
 
+  if (failed(lowerSplitCallsForAD(fn)))
+    return nullptr;
   SmallVector<bool> returnPrimalsP(returnPrimals.begin(), returnPrimals.end());
   SmallVector<bool> returnShadowsP(returnShadows.begin(), returnShadows.end());
 
@@ -434,6 +436,9 @@ FlatSymbolRefAttr MEnzymeLogic::CreateSplitModeDiff(
           return FlatSymbolRefAttr::get(CR.getSymNameAttr());
     }
   }
+
+  if (failed(lowerSplitCallsForAD(fn)))
+    return {};
 
   IRMapping originalToNew;
 

@@ -3,6 +3,7 @@
 #include "Interfaces/AutoDiffOpInterface.h"
 #include "Interfaces/AutoDiffTypeInterface.h"
 #include "Interfaces/GradientUtils.h"
+#include "Passes/RemovalUtils.h"
 #include "Interfaces/GradientUtilsReverse.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -112,6 +113,8 @@ FunctionOpInterface mlir::enzyme::MEnzymeLogic::CreateForwardDiff(
   if (ForwardCachedFunctions.find(tup) != ForwardCachedFunctions.end()) {
     return ForwardCachedFunctions.find(tup)->second;
   }
+  if (failed(lowerSplitCallsForAD(fn)))
+    return nullptr;
   std::vector<bool> returnShadows;
   for (auto act : RetActivity) {
     returnShadows.push_back(act != DIFFE_TYPE::CONSTANT);

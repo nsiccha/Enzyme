@@ -17,6 +17,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/MapVector.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
 #define DEBUG_TYPE "enzyme"
@@ -326,6 +327,48 @@ lowerCustomReverseRuleToFunc(enzyme::CustomReverseRuleOp revRule) {
     worklist.pop_back();
   }
 
+  return success();
+}
+
+// AD of a function produced by an earlier differentiation can encounter a
+// call to either half of a split rule. Outline those calls as ordinary
+// functions before differentiating them. A later request may still need the
+// original rule, including its activity signature and cache layout.
+LogicalResult mlir::enzyme::lowerSplitCallsForAD(Operation *function) {
+  llvm::MapVector<Operation *, SmallVector<Operation *>> callsByRule;
+  auto result = function->walk([&](Operation *op) -> WalkResult {
+    FlatSymbolRefAttr callee;
+    if (auto primal = dyn_cast<CallAugmentedPrimalOp>(op))
+      callee = primal.getFnAttr();
+    else if (auto reverse = dyn_cast<CallCustomReverseOp>(op))
+      callee = reverse.getFnAttr();
+    else
+      return WalkResult::advance();
+    auto rule = SymbolTable::lookupNearestSymbolFrom<CustomReverseRuleOp>(
+        op, callee);
+    if (!rule) {
+      op->emitError() << "cannot find custom reverse rule " << callee;
+      return WalkResult::interrupt();
+    }
+    callsByRule[rule].push_back(op);
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+
+  for (auto &[original, calls] : callsByRule) {
+    auto rule = cast<CustomReverseRuleOp>(original->clone());
+    SymbolTable symbols(SymbolTable::getNearestSymbolTable(original));
+    auto name = FlatSymbolRefAttr::get(symbols.insert(rule));
+    for (Operation *call : calls) {
+      if (auto primal = dyn_cast<CallAugmentedPrimalOp>(call))
+        primal.setFnAttr(name);
+      else
+        cast<CallCustomReverseOp>(call).setFnAttr(name);
+    }
+    if (failed(lowerCustomReverseRuleToFunc(rule)))
+      return failure();
+  }
   return success();
 }
 
