@@ -668,6 +668,12 @@ FlatSymbolRefAttr MEnzymeLogic::CreateSplitModeDiff(
     return FlatSymbolRefAttr();
   }
 
+  // Lifting loop caches can replace a scalar slot with a tensor of saved
+  // values. Drop abandoned slots before callers compute the tape signature.
+  for (enzyme::InitOp init : getCustomReverseRuleCacheInits(customRule))
+    if (init.getResult().use_empty())
+      init.erase();
+
   customRule->removeAttr("enzyme.in_progress");
   return FlatSymbolRefAttr::get(ruleNameAttr);
 }
