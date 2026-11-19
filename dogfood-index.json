@@ -8039,7 +8039,12 @@
           ]
         }
       ],
-      "upstream_refs": [],
+      "upstream_refs": [
+        {
+          "relation": "reports",
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/2285"
+        }
+      ],
       "fix": {
         "branch": "dogfood",
         "commits": [
@@ -8051,9 +8056,29 @@
             ]
           }
         ],
-        "why_together": "Native source changes for the consumer repair. The Julia repair record supplies its downstream coverage and historical build identifier."
+        "why_together": "Apply the guarded-division select analysis (0a3566d8) first, then the masked-product extension (cad5bf29). The extension removes the restriction to operations at or downstream of a pole. Both original patches apply in order to upstream 0fa6f840 with one line of context for the first patch."
       },
       "validation": [
+        {
+          "base": "0231d1a774492d524955c6b952f5a92edeced679",
+          "native_build": "0231d1a774492d524955c6b952f5a92edeced679",
+          "tests": [
+            "Explicit infinite-multiplier branch from Enzyme.jl issue 2285",
+            "Bounded square and unguarded square controls"
+          ],
+          "result": "failed",
+          "detail": "LLVM 21.1.8 on Linux x86_64. The explicit multiplier guard gave a NaN derivative in x for either infinite multiplier, where it should be 1. The bounded square gave NaN for all three rejected nonfinite inputs, where it should be 0. The finite controls passed."
+        },
+        {
+          "base": "0231d1a774492d524955c6b952f5a92edeced679",
+          "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
+          "tests": [
+            "Explicit infinite-multiplier branch from Enzyme.jl issue 2285",
+            "Bounded square and unguarded square controls"
+          ],
+          "result": "passed",
+          "detail": "LLVM 21.1.8 on Linux x86_64. The integrated repair gave 1 in the multiplier example and 0 in the rejected square cases. Finite controls and the unguarded NaN square retained their derivatives. Turning off select protection in the same build restored all five failures."
+        },
         {
           "base": "0fa6f8401af6b8211a783213643692be20508842",
           "tests": [
@@ -8187,7 +8212,14 @@
           "why": "deps/dogfood_repairs/select_nonfinite_products.toml, recorded libenzyme_build cad5bf297b84d58639e2fbdaa0e4724936343bb1."
         }
       ],
-      "depends_on": []
+      "depends_on": [
+        "native-select-strong-zero"
+      ],
+      "draft": {
+        "title": "Reverse differentiation through an explicit branch can propagate a discarded product’s infinite partial",
+        "body": "The original explicit branch in [#2285](https://github.com/EnzymeAD/Enzyme.jl/issues/2285) also reproduces in the LLVM backend without Julia. Clang 21.1.8 at `-O1 -ffp-contract=off` lowers the conditional to a multiply followed by a select. In reverse mode the discarded product receives a zero adjoint. Multiplying that zero by an infinite operand makes the derivative NaN.\n\n```c\n#include <math.h>\n#include <stdio.h>\n\nextern double __enzyme_autodiff(void *, ...);\nextern int enzyme_const;\n\ndouble f(double a, double x) {\n    if (!isinf(a))\n        x += a * x;\n    return x;\n}\n\nint main(void) {\n    double dx = __enzyme_autodiff((void *)f, enzyme_const, (double)INFINITY, 1.0);\n    printf(\"value=%g dx=%g\\n\", f(INFINITY, 1.0), dx);\n}\n```\n\nWith the LLVM 21 Enzyme plugin in `$PLUGIN`, run\n\n```sh\nclang-21 -O1 -fno-inline -ffp-contract=off -S -emit-llvm example.c -o example.ll\nopt-21 -load-pass-plugin=\"$PLUGIN\" -passes=enzyme -S example.ll -o derivative.ll\nlli-21 derivative.ll\n```\n\nAt either infinity, the function returns its input `x`, so its derivative in `x` should be 1. Upstream `0231d1a7` gives NaN. The repaired build `0eb02b67` gives 1. Both give 3 when `a=2`. For the related branch `if (x >= 0 && x <= 1) return x*x; return -INFINITY;`, the repair gives a zero derivative at NaN and either infinity and retains a derivative of 1 at 0.5. Disabling select protection in the same repaired build reproduces both failures. The unguarded square still gives a NaN derivative at NaN.\n\nThe first change identifies floating-point instructions whose differential contributions are masked by a select. The second protects masked products, whose partials can be nonfinite even without division. This approach also affects eager selects that produce the same LLVM IR. The two original patches apply in order to upstream `0fa6f840`, using `git apply -C1` for the first patch. The numerical comparison used the integrated repaired build. [Select analysis](https://github.com/nsiccha/Enzyme/commit/0a3566d873e9f4054e5dfc4e47fd48c22391a65d) · [Masked products](https://github.com/nsiccha/Enzyme/commit/cad5bf297b84d58639e2fbdaa0e4724936343bb1)",
+        "prepared_at": "2026-11-19T12:11:29Z"
+      }
     },
     {
       "id": "native-select-strong-zero",
