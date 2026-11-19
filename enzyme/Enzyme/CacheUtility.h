@@ -370,25 +370,22 @@ protected:
   /// group owns the table, its bookkeeping and its frees; no single cache
   /// owns them, so erasing one cache leaves the others intact.
   struct PackedCacheGroup {
-    /// Holds the shared offset table: entry zero is the buffer, entry
-    /// 1 + i the record offset of outer iteration i.
     llvm::AllocaInst *table = nullptr;
-    llvm::AllocaInst *used = nullptr;
-    llvm::AllocaInst *capacity = nullptr;
-    /// Holds the number of caches per record. Its one store is updated as
-    /// caches join, before any of this code runs.
     llvm::AllocaInst *width = nullptr;
     llvm::StoreInst *widthStore = nullptr;
-    llvm::CallInst *tableAllocation = nullptr;
-    llvm::CallInst *growth = nullptr;
+    llvm::SmallVector<llvm::CallInst *, 3> allocations;
     unsigned fields = 0;
   };
-  /// Groups by element type, inner chunk size and preheader, outer chunk size
-  /// and preheader, and whether the cache is freed.
-  std::map<std::tuple<llvm::Type *, llvm::Value *, llvm::BasicBlock *,
-                      llvm::Value *, llvm::BasicBlock *, bool>,
-           PackedCacheGroup>
+  using PackedNest = std::vector<std::pair<llvm::Value *, llvm::BasicBlock *>>;
+  std::map<std::tuple<llvm::Type *, PackedNest, bool>, PackedCacheGroup>
       packedCacheGroups;
+
+  void createPackedCache(llvm::AllocaInst *alloc, const SubLimitType &sublimits,
+                         llvm::ArrayRef<llvm::Type *> types, llvm::Type *rawPtr,
+                         llvm::StringRef name, bool shouldFree,
+                         bool allocateInternal, llvm::Value *extraSize);
+  void recordCacheInstructions(llvm::AllocaInst *owner, llvm::IRBuilder<> &B,
+                               llvm::Instruction *before);
   /// A cache that is slot `index` of the records of a packed cache group.
   struct PackedCacheField {
     llvm::AllocaInst *width;
@@ -475,7 +472,9 @@ public:
                                llvm::IRBuilder<> &BuilderM, LimitContext ctx,
                                llvm::Value *cache, bool storeInInstructionsMap,
                                const llvm::ValueToValueMapTy &available,
-                               llvm::Value *extraSize);
+                               llvm::Value *extraSize,
+                               llvm::Type **storageType = nullptr,
+                               llvm::Value **bitIndex = nullptr);
 
   /// Given an allocation specified by the LimitContext ctx and cache, lookup
   /// the underlying cached value.

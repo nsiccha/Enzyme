@@ -129,7 +129,7 @@ attributes #4 = { "enzyme_inactive" }
 ; SHARED-NEXT:   br label %invertfor.inc30
 
 ; SHARED: invertfor.body15:
-; SHARED-NEXT:   %"iv1'ac.0" = phi i64 [ %_unwrap19, %invertfor.inc30 ], [ %[[V21:.+]], %incinvertfor.body15 ]
+; SHARED-NEXT:   %"iv1'ac.0" = phi i64 [ %[[LAST:_unwrap[0-9]+]], %invertfor.inc30 ], [ %[[V21:.+]], %incinvertfor.body15 ]
 ; SHARED-NEXT:   %"arrayidx'ipg_unwrap" = getelementptr inbounds double, double* %"tmp10'", i64 %"iv1'ac.0"
 ; SHARED-NEXT:   %[[V9:.+]] = load double, double* %"arrayidx'ipg_unwrap", align 8
 ; SHARED-NEXT:   store double 0.000000e+00, double* %"arrayidx'ipg_unwrap", align 8
@@ -155,6 +155,6 @@ attributes #4 = { "enzyme_inactive" }
 ; SHARED-NEXT:   %"iv'ac.0" = phi i64 [ %[[V8]], %incinvertfor.cond8.preheader ], [ 12, %for.inc30 ]
 ; SHARED-NEXT:   %[[V22:.+]] = getelementptr inbounds i64, i64* %[[V0]], i64 %"iv'ac.0"
 ; SHARED-NEXT:   %[[V23:.+]] = load i64, i64* %[[V22]], align 8{{.*}}, !invariant.group ![[G2:[0-9]+]]
-; SHARED-NEXT:   %_unwrap19 = add i64 %[[V23]], -1
+; SHARED-NEXT:   %[[LAST]] = add i64 %[[V23]], -1
 ; SHARED-NEXT:   br label %invertfor.body15
 ; SHARED-NEXT: }

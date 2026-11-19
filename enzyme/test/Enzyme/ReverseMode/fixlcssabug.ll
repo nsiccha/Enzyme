@@ -62,7 +62,7 @@ attributes #4 = { nounwind readnone }
 ; CHECK-NEXT:   %[[i80:.+]] = getelementptr inbounds i64, i64* %[[i79]], i64 %[[i78]]
 ; CHECK-NEXT:   %[[i81:.+]] = load i64, i64* %[[i80]], align 8
 ; CHECK-NEXT:   %[[i82:.+]] = icmp ne i64 %[[i81]], 0
-; CHECK-NEXT:   br i1 %[[i82]], label %invertbb91_phirc, label %invertbb91_phirc6
+; CHECK-NEXT:   br i1 %[[i82]], label %invertbb91_phirc, label %[[EMPTY:invertbb91_phirc[0-9]+]]
 
 ; CHECK: invertbb91_phirc:
 ; CHECK-NEXT:   %[[i83:.+]] = sub nuw i64 %[[i81]], 1
@@ -73,9 +73,9 @@ attributes #4 = { nounwind readnone }
 ; CHECK-NEXT:   %[[i88:.+]] = load {} addrspace(10)*, {} addrspace(10)** %[[i87]], align 8
 ; CHECK-NEXT:   br label %invertbb91_phimerge
 
-; CHECK: invertbb91_phirc6:  
+; CHECK: [[EMPTY]]:
 ; CHECK-NEXT:   br label %invertbb91_phimerge
 
 ; CHECK: invertbb91_phimerge: 
-; CHECK-NEXT:   %[[i89:.+]] = phi {} addrspace(10)* [ %[[i88]], %invertbb91_phirc ], [ null, %invertbb91_phirc6 ]
+; CHECK-NEXT:   %[[i89:.+]] = phi {} addrspace(10)* [ %[[i88]], %invertbb91_phirc ], [ null, %[[EMPTY]] ]
 ; CHECK-NEXT:   %i71_unwrap = icmp eq {} addrspace(10)* %[[i89]], %arg

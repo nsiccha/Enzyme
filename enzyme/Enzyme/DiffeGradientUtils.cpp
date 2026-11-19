@@ -963,8 +963,10 @@ CallInst *DiffeGradientUtils::freeCache(BasicBlock *forwardPreheader,
       (unsigned)newFunc->getParent()->getDataLayout().getPointerSize());
   forfree->setAlignment(Align(align));
 
-  if (packedType) {
-    auto buffer = tbuild.CreateLoad(packedType, forfree);
+  for (int level = 0; packedType && level < i; ++level) {
+    auto header =
+        tbuild.CreateInBoundsGEP(packedType, forfree, tbuild.getInt64(level));
+    auto buffer = tbuild.CreateLoad(packedType, header);
     if (auto ci = CreateDealloc(tbuild, buffer)) {
       // A nest containing no rows never grows its initially null buffer.
       ci->removeParamAttr(0, Attribute::NonNull);

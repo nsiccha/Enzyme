@@ -3570,7 +3570,7 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
       LimitContext lctx(/*ReverseLimit*/ reverseBlocks.size() > 0,
                         hoisted ? hoisted : BuilderQ.GetInsertBlock());
       AllocaInst *cache =
-          createCacheForScope(lctx, innerType, "mdyncache_fromtape",
+          createCacheForScope(lctx, malloc->getType(), "mdyncache_fromtape",
                               ((DiffeGradientUtils *)this)->FreeMemory, false);
       assert(malloc);
       bool isi1 = malloc->getType()->isIntegerTy() &&
@@ -3587,9 +3587,9 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
 #endif
       entryBuilder.CreateStore(ret, cache);
 
-      auto v =
-          lookupValueFromCache(innerType, /*forwardPass*/ true, BuilderQ, lctx,
-                               cache, isi1, /*available*/ ValueToValueMapTy());
+      auto v = lookupValueFromCache(malloc->getType(), /*forwardPass*/ true,
+                                    BuilderQ, lctx, cache, isi1,
+                                    /*available*/ ValueToValueMapTy());
       if (malloc) {
         assert(v->getType() == malloc->getType());
       }
