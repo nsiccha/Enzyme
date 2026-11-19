@@ -98,7 +98,7 @@ static inline void resetClonedGUID(llvm::Function *F) {
 }
 
 /// The condition of a branch isConditionalBranch says yes to.
-static inline llvm::Value *getBranchCondition(llvm::Value *V) {
+static inline llvm::Value *getBranchCondition(const llvm::Value *V) {
 #if LLVM_VERSION_MAJOR >= 24
   return llvm::cast<llvm::CondBrInst>(V)->getCondition();
 #else

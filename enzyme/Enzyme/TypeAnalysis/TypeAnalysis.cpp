@@ -2849,9 +2849,9 @@ void TypeAnalyzer::visitAddrSpaceCastInst(AddrSpaceCastInst &I) {
       auto *CI = dyn_cast<CallInst>(U);
       if (CI && CI->getCalledFunction() &&
           CI->getCalledFunction()->getName() == "julia.typeof") {
-        auto *br = dyn_cast<BranchInst>(CI->getParent()->getTerminator());
-        auto *cmp = br && br->isConditional()
-                        ? dyn_cast<ICmpInst>(br->getCondition())
+        auto *br = CI->getParent()->getTerminator();
+        auto *cmp = br && isConditionalBranch(br)
+                        ? dyn_cast<ICmpInst>(getBranchCondition(br))
                         : nullptr;
         if (cmp && cmp->isEquality() &&
             (juliaTypeTestOperand(cmp->getOperand(0)) == CI ||

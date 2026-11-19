@@ -327,7 +327,7 @@ struct CacheAnalysis {
           return unexposedAllocations[key] = false;
         if (!isPotentiallyReachable(I, callsite, nullptr, &OrigDT, &OrigLI))
           continue;
-        if (isa<CmpInst>(I) || isa<BranchInst>(I) || isa<SwitchInst>(I))
+        if (isa<CmpInst>(I) || isAnyBranch(I) || isa<SwitchInst>(I))
           continue;
         if (auto SI = dyn_cast<StoreInst>(I)) {
           if (SI->getValueOperand() != V)

@@ -861,10 +861,9 @@ bool GradientUtils::isReplayedOnceLatch(const Instruction *term,
   if (mode != DerivativeMode::ReverseModePrimal &&
       mode != DerivativeMode::ReverseModeGradient)
     return false;
-  auto BI = dyn_cast<BranchInst>(term);
-  if (!BI || !BI->isConditional())
+  if (!isConditionalBranch(term))
     return false;
-  const BasicBlock *BB = BI->getParent();
+  const BasicBlock *BB = term->getParent();
   assert(BB->getParent() == oldFunc);
   auto found = replayedOnceLatches.find(BB);
   if (found != replayedOnceLatches.end())
@@ -875,10 +874,10 @@ bool GradientUtils::isReplayedOnceLatch(const Instruction *term,
     if (!L || L->getLoopLatch() != BB || L->getExitingBlock() != BB)
       return false;
     BasicBlock *exit = nullptr;
-    if (BI->getSuccessor(0) == L->getHeader())
-      exit = BI->getSuccessor(1);
-    else if (BI->getSuccessor(1) == L->getHeader())
-      exit = BI->getSuccessor(0);
+    if (term->getSuccessor(0) == L->getHeader())
+      exit = term->getSuccessor(1);
+    else if (term->getSuccessor(1) == L->getHeader())
+      exit = term->getSuccessor(0);
     if (!exit || L->contains(exit))
       return false;
     // A dedicated exit: the reverse of the exit block never needs to know
@@ -948,15 +947,15 @@ void GradientUtils::replayLatchesOnce() {
     auto term = OBB.getTerminator();
     if (!isReplayedOnceLatch(term, mode))
       continue;
-    auto OBI = cast<BranchInst>(term);
     BasicBlock *OHeader = OrigLI->getLoopFor(&OBB)->getHeader();
-    BasicBlock *OExit = OBI->getSuccessor(0) == OHeader ? OBI->getSuccessor(1)
-                                                        : OBI->getSuccessor(0);
+    BasicBlock *OExit =
+        term->getSuccessor(0) == OHeader ? term->getSuccessor(1)
+                                         : term->getSuccessor(0);
     BasicBlock *NBB = getNewFromOriginal(&OBB);
     BasicBlock *NHeader = getNewFromOriginal(OHeader);
     BasicBlock *NExit = getNewFromOriginal(OExit);
-    auto NBI = dyn_cast<BranchInst>(NBB->getTerminator());
-    if (!NBI || !NBI->isConditional() ||
+    auto NBI = NBB->getTerminator();
+    if (!NBI || !isConditionalBranch(NBI) ||
         !((NBI->getSuccessor(0) == NHeader && NBI->getSuccessor(1) == NExit) ||
           (NBI->getSuccessor(0) == NExit && NBI->getSuccessor(1) == NHeader))) {
       std::string str;
@@ -968,8 +967,8 @@ void GradientUtils::replayLatchesOnce() {
     // The condition was not needed in the reverse, so it was not cached and
     // its replay was erased. A constant condition keeps every phi of the
     // header valid; the back edge folds away after differentiation.
-    NBI->setCondition(
-        ConstantInt::getBool(NBI->getContext(), NBI->getSuccessor(0) == NExit));
+    setBranchCondition(NBI, ConstantInt::getBool(NBI->getContext(),
+                                                 NBI->getSuccessor(0) == NExit));
   }
 }
 
