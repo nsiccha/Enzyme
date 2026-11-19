@@ -58,6 +58,10 @@ llvm::cl::opt<bool> EnzymeRewriteAccumulators(
     cl::desc("Rewrite a loop-carried counter whose step is an inner loop's "
              "trip count into a closed form of the induction variable"));
 
+llvm::cl::opt<bool> EnzymeCallerOwnedTapes(
+    "enzyme-caller-owned-tapes", cl::init(true), cl::Hidden,
+    cl::desc("Store non-inlined callees' integer loop caches in the caller"));
+
 llvm::cl::opt<bool> EnzymeGroupPackedCaches(
     "enzyme-group-packed-caches", cl::init(true), cl::Hidden,
     cl::desc("Store the packed ragged caches of one element type and loop "
@@ -81,6 +85,137 @@ static bool isPackedElement(Type *T) {
   return false;
 }
 
+bool canUseCallerTapeArena(const Module &M) {
+  auto arch = Triple(M.getTargetTriple()).getArch();
+  return EnzymeCallerOwnedTapes &&
+         (arch == Triple::x86_64 || arch == Triple::aarch64) &&
+         M.getDataLayout().getPointerSizeInBits() == 64 &&
+         M.getDataLayout().getAllocaAddrSpace() == 0;
+}
+
+// Each augmented call returns its slice pointer in its usual tape field. A
+// new chunk links to the previous one so growing never invalidates a tape.
+StructType *getCallerTapeArenaType(LLVMContext &C) {
+  auto i64 = Type::getInt64Ty(C);
+  return StructType::get(C, {getInt8PtrTy(C), i64, i64});
+}
+
+Function *getCallerTapeReserve(Module &M) {
+  auto &C = M.getContext();
+  auto arenaTy = getCallerTapeArenaType(C);
+  auto ptrTy = getInt8PtrTy(C);
+  auto i64 = Type::getInt64Ty(C);
+  auto reserve =
+      cast<Function>(M.getOrInsertFunction("__enzyme_caller_tape_reserve",
+                                           ptrTy, getUnqual(arenaTy), i64)
+                         .getCallee());
+  if (!reserve->empty())
+    return reserve;
+  reserve->setLinkage(Function::InternalLinkage);
+  reserve->addFnAttr(Attribute::NoUnwind);
+  auto entry = BasicBlock::Create(C, "entry", reserve);
+  auto fit = BasicBlock::Create(C, "check.capacity", reserve);
+  auto grow = BasicBlock::Create(C, "grow", reserve);
+  auto link = BasicBlock::Create(C, "link", reserve);
+  auto done = BasicBlock::Create(C, "slice", reserve);
+  auto fail = BasicBlock::Create(C, "failed", reserve);
+  IRBuilder<> B(entry);
+  auto arena = reserve->getArg(0);
+  auto bytes = reserve->getArg(1);
+  // Space for the link and alignment of the next payload. Keep zero-length
+  // requests distinct, as the original allocation may be marked nonnull.
+  constexpr uint64_t alignment = 16;
+  constexpr uint64_t maxCapacity = UINT64_MAX - (2 * alignment - 1);
+  B.CreateCondBr(B.CreateICmpULE(bytes, B.getInt64(maxCapacity)), fit, fail);
+  B.SetInsertPoint(fit);
+  auto rounded = B.CreateAnd(B.CreateAdd(bytes, B.getInt64(alignment - 1)),
+                             B.getInt64(~(alignment - 1)));
+  auto need =
+      B.CreateSelect(B.CreateIsNull(bytes), B.getInt64(alignment), rounded);
+  auto headAddr = B.CreateStructGEP(arenaTy, arena, 0);
+  auto usedAddr = B.CreateStructGEP(arenaTy, arena, 1);
+  auto capacityAddr = B.CreateStructGEP(arenaTy, arena, 2);
+  auto head = B.CreateLoad(ptrTy, headAddr);
+  auto used = B.CreateLoad(i64, usedAddr);
+  auto capacity = B.CreateLoad(i64, capacityAddr);
+  B.CreateCondBr(B.CreateICmpULE(need, B.CreateSub(capacity, used)), done,
+                 grow);
+
+  B.SetInsertPoint(grow);
+  auto doubled =
+      B.CreateSelect(B.CreateICmpULE(capacity, B.getInt64(maxCapacity / 2)),
+                     B.CreateShl(capacity, 1), need);
+  auto candidate =
+      B.CreateSelect(B.CreateICmpUGT(doubled, need), doubled, need);
+  auto newCapacity = B.CreateSelect(B.CreateICmpULT(candidate, B.getInt64(256)),
+                                    B.getInt64(256), candidate);
+  auto alloc = M.getOrInsertFunction("malloc", ptrTy, i64);
+  auto newHead =
+      B.CreateCall(alloc, {B.CreateAdd(newCapacity, B.getInt64(alignment))});
+  newHead->addRetAttr(Attribute::NoAlias);
+  B.CreateCondBr(B.CreateIsNull(newHead), fail, link);
+
+  B.SetInsertPoint(link);
+  B.CreateStore(head, B.CreatePointerCast(newHead, getUnqual(ptrTy)));
+  B.CreateStore(newHead, headAddr);
+  B.CreateStore(newCapacity, capacityAddr);
+  B.CreateBr(done);
+
+  B.SetInsertPoint(done);
+  auto chunk = B.CreatePHI(ptrTy, 2);
+  chunk->addIncoming(head, fit);
+  chunk->addIncoming(newHead, link);
+  auto offset = B.CreatePHI(i64, 2);
+  offset->addIncoming(used, fit);
+  offset->addIncoming(B.getInt64(0), link);
+  B.CreateStore(B.CreateAdd(offset, need), usedAddr);
+  B.CreateRet(B.CreateInBoundsGEP(B.getInt8Ty(), chunk,
+                                  B.CreateAdd(B.getInt64(alignment), offset)));
+  B.SetInsertPoint(fail);
+  B.CreateCall(getIntrinsicDeclaration(&M, Intrinsic::trap));
+  B.CreateUnreachable();
+  return reserve;
+}
+
+Function *getCallerTapeRelease(Module &M) {
+  auto &C = M.getContext();
+  auto arenaTy = getCallerTapeArenaType(C);
+  auto ptrTy = getInt8PtrTy(C);
+  auto release = cast<Function>(
+      M.getOrInsertFunction("__enzyme_caller_tape_release", Type::getVoidTy(C),
+                            getUnqual(arenaTy))
+          .getCallee());
+  if (!release->empty())
+    return release;
+  release->setLinkage(Function::InternalLinkage);
+  release->addFnAttr(Attribute::NoUnwind);
+  auto entry = BasicBlock::Create(C, "entry", release);
+  auto check = BasicBlock::Create(C, "check", release);
+  auto loop = BasicBlock::Create(C, "release", release);
+  auto done = BasicBlock::Create(C, "done", release);
+  IRBuilder<> B(entry);
+  auto head =
+      B.CreateLoad(ptrTy, B.CreateStructGEP(arenaTy, release->getArg(0), 0));
+  B.CreateBr(check);
+  B.SetInsertPoint(check);
+  auto chunk = B.CreatePHI(ptrTy, 2);
+  chunk->addIncoming(head, entry);
+  B.CreateCondBr(B.CreateIsNull(chunk), done, loop);
+  B.SetInsertPoint(loop);
+  auto prev = B.CreateLoad(ptrTy, B.CreatePointerCast(chunk, getUnqual(ptrTy)));
+  auto free = M.getOrInsertFunction("free", B.getVoidTy(), ptrTy);
+  B.CreateCall(free, {chunk});
+  chunk->addIncoming(prev, loop);
+  B.CreateBr(check);
+  B.SetInsertPoint(done);
+  B.CreateRetVoid();
+  return release;
+}
+
+// A rectangular chunk inside a varying outer loop can use an offset table and
+// one growing value buffer. Keep the table's pointer type so split reverse can
+// pass it through the existing tape protocol: entry zero owns the value buffer,
+// and subsequent entries encode element offsets rather than movable pointers.
 static bool canPackRaggedCache(Type *T,
                                const CacheUtility::SubLimitType &sublimits,
                                const Module &M) {

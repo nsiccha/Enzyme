@@ -6385,13 +6385,19 @@ public:
       } else {
         if (Mode == DerivativeMode::ReverseModePrimal ||
             Mode == DerivativeMode::ReverseModeCombined) {
+          const bool callerProvidesStorage =
+              Mode == DerivativeMode::ReverseModeCombined && shouldFree() &&
+              !gutils->omp && !called->isVarArg() &&
+              gutils->OrigLI->getLoopFor(call.getParent()) &&
+              canUseCallerTapeArena(*called->getParent());
           subdata = &gutils->Logic.CreateAugmentedPrimal(
               RequestContext(&call, &BuilderZ), cast<Function>(called),
               subretType, argsInverted, TR.analyzer->interprocedural,
               /*return is used*/ subretused, shadowReturnUsed, nextTypeInfo,
               subsequent_calls_may_write, overwritten_args, nowrite_shadows,
               false, gutils->runtimeActivity, gutils->strongZero,
-              gutils->getWidth(), gutils->AtomicAdd);
+              gutils->getWidth(), gutils->AtomicAdd, /*omp*/ false,
+              callerProvidesStorage);
           if (Mode == DerivativeMode::ReverseModePrimal) {
             assert(augmentedReturn);
             auto subaugmentations =
@@ -6417,6 +6423,8 @@ public:
           fnandtapetype = subdata;
           newcalled = subdata->fn;
           FT = cast<Function>(newcalled)->getFunctionType();
+          if (!subdata->callerOwnedSlots.empty())
+            pre_args.push_back(gutils->getOrCreateCallerTapeArena());
 
           auto found =
               subdata->returns.find(AugmentedStruct::DifferentialReturn);

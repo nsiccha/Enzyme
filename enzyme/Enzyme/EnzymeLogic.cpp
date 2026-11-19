@@ -2538,7 +2538,7 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
     const std::vector<bool> _overwritten_args,
     const std::vector<bool> &nowrite_shadows, bool forceAnonymousTape,
     bool runtimeActivity, bool strongZero, unsigned width, bool AtomicAdd,
-    bool omp) {
+    bool omp, bool callerProvidesStorage) {
 
   TimeTraceScope timeScope("CreateAugmentedPrimal", todiff->getName());
 
@@ -2566,7 +2566,8 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
                            omp,
                            width,
                            runtimeActivity,
-                           strongZero};
+                           strongZero,
+                           callerProvidesStorage};
 
   if (_overwritten_args.size() != todiff->arg_size()) {
     std::string s;
@@ -2960,6 +2961,8 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
       /*returnUsed*/ returnUsed, /*shadowReturnUsed*/ shadowReturnUsed,
       returnMapping, omp);
   gutils->nowrite_shadows = nowrite_shadows;
+  gutils->collectCallerBuffers =
+      callerProvidesStorage && !omp && !hasMetadata(todiff, "enzyme_gradient");
 
   if (todiff->empty()) {
     std::string s;
@@ -3381,6 +3384,22 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
     // ArgTypes.push_back(tapeType);
   }
 
+  auto &ownedSlots =
+      AugmentedCachedFunctions.find(tup)->second.callerOwnedSlots;
+  SmallPtrSet<CallInst *, 4> borrowedAllocations;
+  if (!recursive && !noTape) {
+    for (auto &candidate : gutils->callerBufferAllocations) {
+      auto *alloc = dyn_cast_or_null<CallInst>((Value *)candidate.second);
+      Value *field = gutils->getTapeValues()[candidate.first];
+      if (alloc && field->stripPointerCasts() == alloc) {
+        ownedSlots.insert(candidate.first);
+        borrowedAllocations.insert(alloc);
+      }
+    }
+  }
+  if (!ownedSlots.empty())
+    ArgTypes.push_back(getUnqual(getCallerTapeArenaType(nf->getContext())));
+
   // Create a new function type...
   FunctionType *FTy =
       FunctionType::get(RetType, ArgTypes, nf->getFunctionType()->isVarArg());
@@ -3621,6 +3640,15 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
     cast<Instruction>(VMap[ri])->eraseFromParent();
   }
 
+  for (auto *original : borrowedAllocations) {
+    auto *alloc = cast<CallInst>(VMap[original]);
+    IRBuilder<> B(alloc);
+    Value *slice = B.CreateCall(
+        getCallerTapeReserve(*NewF->getParent()),
+        {NewF->getArg(NewF->arg_size() - 1), alloc->getArgOperand(0)});
+    alloc->replaceAllUsesWith(slice);
+    alloc->eraseFromParent();
+  }
   clearFunctionAttributes(NewF);
   PPC.LowerAllocAddr(NewF);
 
@@ -4270,6 +4298,8 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
   FnTypeInfo oldTypeInfo =
       preventTypeAnalysisLoops(prevkey.typeInfo, prevkey.todiff);
   auto key = prevkey.replaceTypeInfo(oldTypeInfo);
+  if (augmenteddata && !augmenteddata->callerOwnedSlots.empty())
+    key.callerStorageLayout = augmenteddata;
 
   if (key.retType != DIFFE_TYPE::CONSTANT)
     assert(!key.todiff->getReturnType()->isVoidTy());
@@ -4809,6 +4839,8 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
 
   gutils->AtomicAdd = key.AtomicAdd;
   gutils->FreeMemory = key.freeMemory;
+  if (key.callerStorageLayout)
+    gutils->callerOwnedSlots = &key.callerStorageLayout->callerOwnedSlots;
   insert_or_assign2<ReverseCacheKey, Function *>(ReverseCachedFunctions, key,
                                                  gutils->newFunc);
 
@@ -5206,6 +5238,15 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
     }
   }
 
+  if (gutils->callerTapeArena) {
+    for (auto &BB : *gutils->newFunc) {
+      if (auto *ret = dyn_cast_or_null<ReturnInst>(BB.getTerminator())) {
+        IRBuilder<> B(ret);
+        B.CreateCall(getCallerTapeRelease(*gutils->newFunc->getParent()),
+                     {gutils->callerTapeArena});
+      }
+    }
+  }
   cleanupInversionAllocs(gutils, entry);
   clearFunctionAttributes(gutils->newFunc);
 

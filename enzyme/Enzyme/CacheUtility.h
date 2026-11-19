@@ -62,6 +62,11 @@ extern llvm::cl::opt<bool> EnzymeZeroCache;
 extern llvm::cl::opt<bool> EnzymeGroupPackedCaches;
 }
 
+bool canUseCallerTapeArena(const llvm::Module &M);
+llvm::StructType *getCallerTapeArenaType(llvm::LLVMContext &C);
+llvm::Function *getCallerTapeReserve(llvm::Module &M);
+llvm::Function *getCallerTapeRelease(llvm::Module &M);
+
 /// Container for all loop information to synthesize gradients
 struct LoopContext {
   /// Canonical induction variable of the loop

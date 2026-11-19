@@ -535,6 +535,11 @@ private:
       iterationInvariantScopes;
 
 public:
+  bool collectCallerBuffers = false;
+  std::map<unsigned, llvm::WeakTrackingVH> callerBufferAllocations;
+  const std::set<unsigned> *callerOwnedSlots = nullptr;
+  llvm::AllocaInst *callerTapeArena = nullptr;
+  llvm::AllocaInst *getOrCreateCallerTapeArena();
 
   llvm::ArrayRef<llvm::WeakTrackingVH> getTapeValues() const {
     return addedTapeVals;

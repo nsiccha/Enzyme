@@ -119,6 +119,9 @@ public:
 
   std::set<ssize_t> tapeIndiciesToFree;
 
+  // Physical tape fields whose loop-cache storage lives in the caller.
+  std::set<unsigned> callerOwnedSlots;
+
   const std::vector<DIFFE_TYPE> constant_args;
 
   bool shadowReturnUsed;
@@ -182,6 +185,8 @@ struct ReverseCacheKey {
   bool runtimeActivity;
   bool strongZero;
 
+  const AugmentedReturn *callerStorageLayout = nullptr;
+
   ReverseCacheKey replaceTypeInfo(const FnTypeInfo &newTypeInfo) const {
     return {todiff,
             retType,
@@ -198,7 +203,8 @@ struct ReverseCacheKey {
             forceAnonymousTape,
             newTypeInfo,
             runtimeActivity,
-            strongZero};
+            strongZero,
+            callerStorageLayout};
   }
   /*
   inline bool operator==(const ReverseCacheKey& rhs) const {
@@ -217,6 +223,9 @@ struct ReverseCacheKey {
   */
 
   inline bool operator<(const ReverseCacheKey &rhs) const {
+    if (callerStorageLayout != rhs.callerStorageLayout)
+      return std::less<const AugmentedReturn *>()(callerStorageLayout,
+                                                  rhs.callerStorageLayout);
     if (todiff < rhs.todiff)
       return true;
     if (rhs.todiff < todiff)
@@ -483,7 +492,11 @@ public:
     bool runtimeActivity;
     bool strongZero;
 
+    bool callerProvidesStorage;
+
     inline bool operator<(const AugmentedCacheKey &rhs) const {
+      if (callerProvidesStorage != rhs.callerProvidesStorage)
+        return callerProvidesStorage < rhs.callerProvidesStorage;
       if (fn < rhs.fn)
         return true;
       if (rhs.fn < fn)
@@ -606,7 +619,7 @@ public:
       const std::vector<bool> _overwritten_args,
       const std::vector<bool> &nowrite_shadows, bool forceAnonymousTape,
       bool runtimeActivity, bool strongZero, unsigned width, bool AtomicAdd,
-      bool omp = false);
+      bool omp = false, bool callerProvidesStorage = false);
 
   std::map<ReverseCacheKey, llvm::Function *> ReverseCachedFunctions;
 

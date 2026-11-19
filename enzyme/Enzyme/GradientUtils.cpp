@@ -3310,6 +3310,16 @@ static Value *rebuildUncachedTapeArg(GradientUtils &gutils,
   return &*foundShadow->second;
 }
 
+AllocaInst *GradientUtils::getOrCreateCallerTapeArena() {
+  if (!callerTapeArena) {
+    IRBuilder<> B(inversionAllocs);
+    auto Ty = getCallerTapeArenaType(newFunc->getContext());
+    callerTapeArena = B.CreateAlloca(Ty, nullptr, "caller.tape");
+    B.CreateStore(Constant::getNullValue(Ty), callerTapeArena);
+  }
+  return callerTapeArena;
+}
+
 Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                                       int idx, bool replace,
                                       const Instruction *orig) {
@@ -3569,9 +3579,11 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
 
       LimitContext lctx(/*ReverseLimit*/ reverseBlocks.size() > 0,
                         hoisted ? hoisted : BuilderQ.GetInsertBlock());
-      AllocaInst *cache =
-          createCacheForScope(lctx, malloc->getType(), "mdyncache_fromtape",
-                              ((DiffeGradientUtils *)this)->FreeMemory, false);
+      bool borrowed = callerOwnedSlots &&
+                      callerOwnedSlots->count(idx < 0 ? 0 : (unsigned)idx);
+      AllocaInst *cache = createCacheForScope(
+          lctx, malloc->getType(), "mdyncache_fromtape",
+          ((DiffeGradientUtils *)this)->FreeMemory && !borrowed, false);
       assert(malloc);
       bool isi1 = malloc->getType()->isIntegerTy() &&
                   cast<IntegerType>(malloc->getType())->getBitWidth() == 1;
@@ -3856,8 +3868,23 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
     assert(found2 != scopeMap.end());
     assert(found2->second.first);
 
-    Value *toadd;
-    toadd = scopeAllocs[found2->second.first][0];
+    const auto &allocations = scopeAllocs[found2->second.first];
+    CallInst *allocation = allocations.front();
+    // A single bounded integer cache has exactly one allocation and one
+    // matching reverse free. Leave ragged, pointer and custom caches alone.
+    if (collectCallerBuffers && allocations.size() == 1 &&
+        malloc->getType()->isIntegerTy() &&
+        malloc->getType()->getIntegerBitWidth() <= 64 &&
+        allocation->getCalledFunction() &&
+        allocation->getCalledFunction()->getName() == "malloc" &&
+        allocation->arg_size() == 1 &&
+        allocation->getArgOperand(0)->getType()->isIntegerTy(64) &&
+        allocation->getType() == getInt8PtrTy(newFunc->getContext()) &&
+        allocation->getMetadata("enzyme_cache_alloc") &&
+        !allocation->getMetadata("enzyme_ompfor") &&
+        getSubLimits(true, nullptr, ctx).size() == 1)
+      callerBufferAllocations[idx] = allocation;
+    Value *toadd = allocation;
     for (auto u : toadd->users()) {
       if (auto ci = dyn_cast<CastInst>(u)) {
         toadd = ci;
