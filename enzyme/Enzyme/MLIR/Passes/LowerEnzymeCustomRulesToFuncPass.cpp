@@ -45,6 +45,12 @@ struct LowerEnzymeCustomRulesToFuncPass
 };
 } // end anonymous namespace
 
+static LogicalResult removeADTemporaries(Operation *function) {
+  PassManager cleanup(function->getContext(), function->getName().getStringRef());
+  cleanup.addPass(createRemoveUnusedEnzymeOpsPass());
+  return cleanup.run(function);
+}
+
 static LogicalResult
 lowerCustomReverseRuleToFunc(enzyme::CustomReverseRuleOp revRule,
                              bool prepareForAD = false) {
@@ -285,12 +291,9 @@ lowerCustomReverseRuleToFunc(enzyme::CustomReverseRuleOp revRule,
 
   // The split reverse body can still contain temporary gradient slots. Make
   // the lifted functions differentiable before exposing them to another AD.
-  if (prepareForAD) {
-    PassManager cleanup(revRule.getContext(), func::FuncOp::getOperationName());
-    cleanup.addPass(createRemoveUnusedEnzymeOpsPass());
-    if (failed(cleanup.run(primalFunc)) || failed(cleanup.run(reverseFunc)))
-      return failure();
-  }
+  if (prepareForAD && (failed(removeADTemporaries(primalFunc)) ||
+                       failed(removeADTemporaries(reverseFunc))))
+    return failure();
 
   auto uses = SymbolTable::getSymbolUses(
       StringAttr::get(revRule->getContext(), revRuleName), symbolTable.getOp());
@@ -380,7 +383,8 @@ LogicalResult mlir::enzyme::lowerSplitCallsForAD(Operation *function) {
     if (failed(lowerCustomReverseRuleToFunc(rule, /*prepareForAD=*/true)))
       return failure();
   }
-  return success();
+  // A previous AD can have left pushes and pops around these same calls.
+  return callsByRule.empty() ? success() : removeADTemporaries(function);
 }
 
 LogicalResult mlir::enzyme::lowerCustomReverseRulesToFunc(Operation *root) {
