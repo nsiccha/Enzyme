@@ -636,6 +636,39 @@ uint8_t EnzymeGradientUtilsGetUncacheableArgs(GradientUtils *gutils,
   return 1;
 }
 
+/// The writes that follow the call orig and that its callee cannot see: those
+/// later in orig's function, and those after any call of that function. Such a
+/// write may overwrite memory the callee reads through a pointer it loads, for
+/// example through a reference held in a by-reference argument, which the
+/// per-argument result of EnzymeGradientUtilsGetUncacheableArgs does not
+/// describe: that result covers only the memory each argument points to.
+///
+/// Sets *writes to 0 when no such write exists, and otherwise to the nonzero
+/// kinds of write (subsequent_calls_may_write of the call site). Returns 1 on
+/// success. Returns 0 and leaves *writes alone when there is no record for the
+/// call, as in forward mode; a caller then has to assume such writes exist.
+uint8_t EnzymeGradientUtilsGetSubsequentWrites(GradientUtils *gutils,
+                                               LLVMValueRef orig,
+                                               uint8_t *writes) {
+  if (gutils->mode == DerivativeMode::ForwardMode ||
+      gutils->mode == DerivativeMode::ForwardModeError)
+    return 0;
+
+  if (!gutils->overwritten_args_map_ptr)
+    return 0;
+
+  auto call = dyn_cast<CallInst>(unwrap(orig));
+  if (!call)
+    return 0;
+
+  auto found = gutils->overwritten_args_map_ptr->find(call);
+  if (found == gutils->overwritten_args_map_ptr->end())
+    return 0;
+
+  *writes = found->second.first;
+  return 1;
+}
+
 CTypeTreeRef EnzymeGradientUtilsAllocAndGetTypeTree(GradientUtils *gutils,
                                                     LLVMValueRef val) {
   auto v = unwrap(val);
