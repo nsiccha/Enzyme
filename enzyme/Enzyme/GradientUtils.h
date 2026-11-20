@@ -552,7 +552,8 @@ public:
 
   // Whether the reverse rules of `orig`, an instruction of oldFunc, treat a
   // zero adjoint as a strong zero. A speculated operand may be nonfinite
-  // where a select discards it or control flow skips all its consumers.
+  // where a select discards it or control flow skips all its consumers, and a
+  // value that only comparisons read has a zero adjoint on every execution.
   bool strongZeroFor(const llvm::Value *orig);
 
 private:

@@ -12231,16 +12231,22 @@ bool GradientUtils::strongZeroFor(const llvm::Value *orig) {
 // select. For example, LICM hoists a square out of a loop while its only user
 // stays in one arm inside the loop. If execution skips that arm, the adjoint
 // of the hoisted square is zero even when the speculated operand is infinite.
-static bool hasConditionalUses(const Instruction &I, DominatorTree &DT,
-                               PostDominatorTree &PDT,
-                               const SmallPtrSetImpl<const Value *> &masked) {
+// A use by a protected instruction, in any block, passes on that protection:
+// its adjoint is zero whenever the protected user's is. A use by an
+// instruction that carries no derivative (`noDerivative`) is ignored, like a
+// comparison.
+static bool
+hasConditionalUses(const Instruction &I, DominatorTree &DT,
+                   PostDominatorTree &PDT,
+                   const SmallPtrSetImpl<const Value *> &masked,
+                   const SmallPtrSetImpl<const Value *> &noDerivative) {
   BasicBlock *common = nullptr;
   bool feedsMasked = false;
   for (const Use &U : I.uses()) {
     auto *user = dyn_cast<Instruction>(U.getUser());
     if (!user)
       return false;
-    if (isa<FCmpInst>(user))
+    if (isa<FCmpInst>(user) || noDerivative.count(user))
       continue;
     auto *block = user->getParent();
     if (auto *phi = dyn_cast<PHINode>(user)) {
@@ -12249,7 +12255,7 @@ static bool hasConditionalUses(const Instruction &I, DominatorTree &DT,
       block = phi->getIncomingBlock(U.getOperandNo());
       if (DT.dominates(phi->getParent(), block))
         return false;
-    } else if (block == I.getParent() && masked.count(user)) {
+    } else if (masked.count(user)) {
       feedsMasked = true;
       continue;
     }
@@ -12330,11 +12336,59 @@ void GradientUtils::computeSelectMasked() {
           reach.push_back(OI);
   }
 
-  // Visit users first to propagate protection along a hoisted expression in
-  // the same block. A phi merges paths and cannot itself be hoisted.
+  // A floating-point value that reaches nothing but comparisons, directly or
+  // through other such values, carries no derivative: its adjoint is zero on
+  // every execution, so a zero adjoint can only ever give a zero product.
+  // LLVM hoists such values with the rest of a guarded expression, as in a
+  // width `b - a` that only a comparison reads, and they must not keep their
+  // operands from being protected. An instruction that may write memory can
+  // pass a derivative on through memory, so it never qualifies.
+  SmallPtrSet<const Value *, 16> noDerivative;
   for (auto &BB : *oldFunc)
-    for (auto &I : llvm::reverse(BB))
-      if (I.getType()->isFPOrFPVectorTy() && !isa<PHINode>(I) &&
-          hasConditionalUses(I, *OrigDT, *OrigPDT, selectMasked))
-        selectMasked.insert(&I);
+    for (auto &I : BB)
+      if (I.getType()->isFPOrFPVectorTy() && !I.mayWriteToMemory())
+        noDerivative.insert(&I);
+  SmallVector<const Instruction *, 16> dead;
+  for (const Value *V : noDerivative)
+    dead.push_back(cast<Instruction>(V));
+  while (!dead.empty()) {
+    auto *I = dead.pop_back_val();
+    if (!noDerivative.count(I))
+      continue;
+    bool none = true;
+    for (const User *U : I->users())
+      if (!isa<FCmpInst>(U) && !noDerivative.count(U)) {
+        none = false;
+        break;
+      }
+    if (none)
+      continue;
+    noDerivative.erase(I);
+    for (const Value *op : I->operands())
+      if (noDerivative.count(op))
+        dead.push_back(cast<Instruction>(op));
+  }
+  for (const Value *V : noDerivative)
+    selectMasked.insert(V);
+
+  // Visit users first, so that protection propagates along a hoisted
+  // expression, and revisit the operands of every newly protected
+  // instruction. A phi merges paths and cannot itself be hoisted.
+  SmallVector<const Instruction *, 32> pending;
+  for (auto &BB : *oldFunc)
+    for (auto &I : BB)
+      if (I.getType()->isFPOrFPVectorTy() && !isa<PHINode>(I))
+        pending.push_back(&I);
+  while (!pending.empty()) {
+    auto *I = pending.pop_back_val();
+    if (selectMasked.count(I) ||
+        !hasConditionalUses(*I, *OrigDT, *OrigPDT, selectMasked, noDerivative))
+      continue;
+    selectMasked.insert(I);
+    for (const Value *op : I->operands())
+      if (auto *OI = dyn_cast<Instruction>(op))
+        if (OI->getType()->isFPOrFPVectorTy() && !isa<PHINode>(OI) &&
+            !selectMasked.count(OI))
+          pending.push_back(OI);
+  }
 }
