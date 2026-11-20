@@ -117,7 +117,7 @@ llvm::cl::opt<bool> EnzymeReverseLoopEntryMerges(
 llvm::cl::opt<bool> EnzymeSelectStrongZero(
     "enzyme-select-strong-zero", cl::init(true), cl::Hidden,
     cl::desc("Treat a zero adjoint as a strong zero in the reverse rules of "
-             "values that reach the result only through select arms"));
+             "values used only conditionally or through select arms"));
 
 llvm::cl::opt<bool> EnzymeInactiveDynamic(
     "enzyme-inactive-dynamic", cl::init(true), cl::Hidden,
@@ -12227,6 +12227,44 @@ bool GradientUtils::strongZeroFor(const llvm::Value *orig) {
   return selectMasked.count(orig);
 }
 
+// LLVM can speculate an instruction ahead of a conditional without forming a
+// select. For example, LICM hoists a square out of a loop while its only user
+// stays in one arm inside the loop. If execution skips that arm, the adjoint
+// of the hoisted square is zero even when the speculated operand is infinite.
+static bool hasConditionalUses(const Instruction &I, DominatorTree &DT,
+                               PostDominatorTree &PDT,
+                               const SmallPtrSetImpl<const Value *> &masked) {
+  BasicBlock *common = nullptr;
+  bool feedsMasked = false;
+  for (const Use &U : I.uses()) {
+    auto *user = dyn_cast<Instruction>(U.getUser());
+    if (!user)
+      return false;
+    if (isa<FCmpInst>(user))
+      continue;
+    auto *block = user->getParent();
+    if (auto *phi = dyn_cast<PHINode>(user)) {
+      // A phi reads its operand on the edge. A backedge carries the value
+      // into another iteration; it is not a skipped use in this one.
+      block = phi->getIncomingBlock(U.getOperandNo());
+      if (DT.dominates(phi->getParent(), block))
+        return false;
+    } else if (block == I.getParent() && masked.count(user)) {
+      feedsMasked = true;
+      continue;
+    }
+    if (block == I.getParent() || !DT.isReachableFromEntry(block))
+      return false;
+    common = common ? DT.findNearestCommonDominator(common, block) : block;
+    if (!common || common == I.getParent())
+      return false;
+  }
+  if (!common)
+    return feedsMasked;
+  return DT.dominates(I.getParent(), common) &&
+         !PDT.dominates(common, I.getParent());
+}
+
 // Fills selectMasked. A value is masked when it is a floating-point
 // instruction of oldFunc whose every use is a value operand of a select, a
 // comparison (which carries no derivative), or another masked value, and which
@@ -12291,4 +12329,12 @@ void GradientUtils::computeSelectMasked() {
         if (cand.count(OI) && !selectMasked.count(OI))
           reach.push_back(OI);
   }
+
+  // Visit users first to propagate protection along a hoisted expression in
+  // the same block. A phi merges paths and cannot itself be hoisted.
+  for (auto &BB : *oldFunc)
+    for (auto &I : llvm::reverse(BB))
+      if (I.getType()->isFPOrFPVectorTy() && !isa<PHINode>(I) &&
+          hasConditionalUses(I, *OrigDT, *OrigPDT, selectMasked))
+        selectMasked.insert(&I);
 }
