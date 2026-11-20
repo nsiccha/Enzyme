@@ -309,7 +309,11 @@ struct CacheAnalysis {
   // also catches publication of the owned buffer without its header. A
   // loaded value that type analysis knows holds no pointer, such as an
   // element of a Float64 array read back, cannot name the storage, so its
-  // uses need not be followed.
+  // uses need not be followed. A Julia write barrier, which follows every
+  // store of an object reference into the storage, only tells the garbage
+  // collector that its first operand may now hold the others. It accesses no
+  // memory the program can read, so it exposes nothing; a store that puts the
+  // storage itself somewhere is checked on its own.
   bool allocationUnexposedToCall(CallInst *alloc, CallInst *callsite) {
     auto key = std::make_pair(alloc, callsite);
     auto found = unexposedAllocations.find(key);
@@ -329,6 +333,9 @@ struct CacheAnalysis {
           continue;
         if (isa<CmpInst>(I) || isAnyBranch(I) || isa<SwitchInst>(I))
           continue;
+        if (auto CI = dyn_cast<CallInst>(I))
+          if (isJuliaWriteBarrier(getFuncNameFromCall(CI)))
+            continue;
         if (auto SI = dyn_cast<StoreInst>(I)) {
           if (SI->getValueOperand() != V)
             continue;
