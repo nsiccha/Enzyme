@@ -50,6 +50,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/CaptureTracking.h"
@@ -103,6 +104,9 @@
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#if LLVM_VERSION_MAJOR >= 20
+#include "llvm/Transforms/Utils/ControlFlowUtils.h"
+#endif
 #include "llvm/Transforms/Utils/Local.h"
 
 #include "llvm/IR/LegacyPassManager.h"
@@ -3869,6 +3873,50 @@ static bool unifyReturnBlocks(Function &F) {
   return true;
 }
 
+/// Jump threading can duplicate both a preserve end and the conditional
+/// branch that follows it. Rejoin the two arms immediately before that
+/// branch, even when code that bypassed Begin also reaches its destinations.
+static BasicBlock *joinGCPreserveBranches(CallInst *Begin,
+                                          ArrayRef<CallInst *> Ends,
+                                          DominatorTree &DT) {
+  auto *Entry = Begin->getParent();
+  if (Ends.size() != 2 || Entry->getTerminator()->getNumSuccessors() != 2)
+    return nullptr;
+
+  BranchInst *Branches[2];
+  for (unsigned I = 0; I < 2; ++I) {
+    if (Ends[I]->getParent()->getSinglePredecessor() != Entry)
+      return nullptr;
+    Branches[I] = dyn_cast<BranchInst>(getNextNonDebugInstruction(Ends[I]));
+    if (!Branches[I] || !Branches[I]->isConditional())
+      return nullptr;
+  }
+
+  // Both arms must already reach both successors. The hub will then change
+  // no dominance relation between existing blocks, and repairing successor
+  // PHIs (which the LLVM utility does) suffices to preserve SSA.
+  auto *A = Branches[0]->getSuccessor(0), *B = Branches[0]->getSuccessor(1);
+  auto *C = Branches[1]->getSuccessor(0), *D = Branches[1]->getSuccessor(1);
+  if (A == B || !((A == C && B == D) || (A == D && B == C)))
+    return nullptr;
+
+  DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Eager);
+  SmallVector<BasicBlock *, 1> Guards;
+#if LLVM_VERSION_MAJOR >= 20
+  ControlFlowHub Hub;
+  for (auto *Br : Branches)
+    Hub.addBranch(Br->getParent(), Br->getSuccessor(0), Br->getSuccessor(1));
+  return Hub.finalize(&DTU, Guards, "gcpreserve");
+#else
+  SetVector<BasicBlock *> Incoming, Outgoing;
+  for (auto *Br : Branches)
+    Incoming.insert(Br->getParent());
+  Outgoing.insert(A);
+  Outgoing.insert(B);
+  return CreateControlFlowHub(&DTU, Guards, Incoming, Outgoing, "gcpreserve");
+#endif
+}
+
 /// Give `Begin` a single returning `llvm.julia.gc_preserve_end` that
 /// post-dominates it, replacing the several ends it currently has.  Ends on
 /// abort-only paths are left as they are: those paths never return, and the
@@ -3904,6 +3952,12 @@ static MergeResult MergeGCPreserveEnds(CallInst *Begin,
   for (auto End : Ends)
     Blocks.push_back(End->getParent());
   auto Merge = PDT.nearestCommonPostDominator(Blocks);
+  if (!Merge || !DT.dominates(BB, Merge)) {
+    if (auto *Join = joinGCPreserveBranches(Begin, Ends, DT)) {
+      Merge = Join;
+      CFGChanged = true;
+    }
+  }
   if (!Merge)
     return MergeResult::NoMergePoint;
 
