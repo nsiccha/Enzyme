@@ -9293,6 +9293,7 @@ bool GradientUtils::branchByRecomputedPredicates(
   // pass computed on some paths only would be read where it was never
   // written. Values of blocks that dominate ctx ran whenever ctx ran.
   const ValueToValueMapTy noAvailable;
+  DenseMap<BasicBlock *, BasicBlock *> onlyReturningSuccessor;
   for (auto B : region) {
     auto term = B->getTerminator();
     Value *cond = nullptr;
@@ -9302,6 +9303,24 @@ bool GradientUtils::branchByRecomputedPredicates(
       cond = SI->getCondition();
     if (!cond)
       continue;
+
+    // A bounds check can branch to a block that never returns. Reverse
+    // use analysis discards its condition when only one successor can
+    // return, and reaching this merge already tells us which edge ran.
+    BasicBlock *only = nullptr;
+    for (BasicBlock *succ : successors(B)) {
+      if (notForAnalysis.count(isOriginal(succ)))
+        continue;
+      if (only && only != succ) {
+        only = nullptr;
+        break;
+      }
+      only = succ;
+    }
+    if (only) {
+      onlyReturningSuccessor[B] = only;
+      continue;
+    }
     if (!safeToRecomputeOnAllPaths(cond, ctx, DT))
       return false;
     SmallVector<Instruction *, 8> todo;
@@ -9338,6 +9357,8 @@ bool GradientUtils::branchByRecomputedPredicates(
     auto term = B->getTerminator();
     if (isUnconditionalBranch(term))
       return True;
+    if (auto only = onlyReturningSuccessor.lookup(B))
+      return only == S ? True : False;
     auto found = conds.find(B);
     Value *cond;
     if (found != conds.end())
