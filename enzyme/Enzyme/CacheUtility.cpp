@@ -1829,8 +1829,10 @@ AllocaInst *CacheUtility::createCacheForScope(LimitContext ctx, Type *T,
               MDNode::get(malloccall->getContext(), {ident}));
           // Only caches of numbers may share a tape arena chunk: a nested
           // derivative's type analysis must not see pointers and numbers at
-          // the same unknown offsets of one allocation.
-          if (isCallerOwnedCacheElement(myType))
+          // the same unknown offsets of one allocation. Without the arena,
+          // add nothing, so the derivative is what it was.
+          if (EnzymeCallerOwnedTapes && EnzymeArenaCombinedCaches &&
+              isCallerOwnedCacheElement(myType))
             malloccall->setMetadata(
                 "enzyme_cache_pointer_free",
                 MDNode::get(malloccall->getContext(), {}));
