@@ -4289,9 +4289,10 @@ void createInvertedTerminator(DiffeGradientUtils *gutils,
 // returns. Reserve those caches from the derivative's tape arena instead,
 // which the arena releases at the return, so a derivative makes a few chunk
 // allocations rather than one malloc and one free per cached value and loop
-// entry. Only a cache whose allocation and single free carry the matching
-// enzyme_cache_alloc/enzyme_cache_free tag qualifies: the allocation is then
-// the cache's only storage (never reallocated) and its free its only release.
+// entry. Only a cache of numbers whose allocation and single free carry the
+// matching enzyme_cache_alloc/enzyme_cache_free tag qualifies: the allocation
+// is then the cache's only storage (never reallocated) and its free its only
+// release, and no pointer shares the arena's chunks with numbers.
 static void reserveCombinedCachesFromArena(GradientUtils *gutils) {
   Function *F = gutils->newFunc;
   auto releases = [](Metadata *op) {
@@ -4316,7 +4317,8 @@ static void reserveCombinedCachesFromArena(GradientUtils *gutils) {
       if (!callee || callee->getName() != "malloc" || CI->arg_size() != 1 ||
           !CI->getArgOperand(0)->getType()->isIntegerTy(64) ||
           CI->getType() != getInt8PtrTy(F->getContext()) ||
-          hasMetadata(CI, "enzyme_ompfor"))
+          hasMetadata(CI, "enzyme_ompfor") ||
+          !hasMetadata(CI, "enzyme_cache_pointer_free"))
         continue;
       if (auto *MD = hasMetadata(CI, "enzyme_cache_alloc")) {
         Metadata *op = MD->getOperand(0);

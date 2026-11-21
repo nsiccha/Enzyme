@@ -125,6 +125,17 @@ Function *getCallerTapeReserve(Module &M) {
     return reserve;
   reserve->setLinkage(Function::InternalLinkage);
   reserve->addFnAttr(Attribute::NoUnwind);
+  // A slice is fresh memory like malloc's: it aliases nothing the caller can
+  // reach, and a reservation touches only the arena and the allocator. Keep
+  // the call, so optimizations of the derivative see these facts.
+  reserve->addFnAttr(Attribute::NoInline);
+  reserve->addRetAttr(Attribute::NoAlias);
+  reserve->addRetAttr(Attribute::NonNull);
+#if LLVM_VERSION_MAJOR >= 16
+  reserve->setOnlyAccessesInaccessibleMemOrArgMem();
+#else
+  reserve->addFnAttr(Attribute::InaccessibleMemOrArgMemOnly);
+#endif
   auto entry = BasicBlock::Create(C, "entry", reserve);
   auto fit = BasicBlock::Create(C, "check.capacity", reserve);
   auto grow = BasicBlock::Create(C, "grow", reserve);
@@ -201,6 +212,9 @@ Function *getCallerTapeRelease(Module &M) {
     return release;
   release->setLinkage(Function::InternalLinkage);
   release->addFnAttr(Attribute::NoUnwind);
+  // Releasing frees the chunks every slice lives in, memory the arena only
+  // reaches through its head pointer, so the call keeps its unknown effects.
+  release->addFnAttr(Attribute::NoInline);
   auto entry = BasicBlock::Create(C, "entry", release);
   auto check = BasicBlock::Create(C, "check", release);
   auto loop = BasicBlock::Create(C, "release", release);
@@ -1776,6 +1790,13 @@ AllocaInst *CacheUtility::createCacheForScope(LimitContext ctx, Type *T,
           malloccall->setMetadata(
               "enzyme_cache_alloc",
               MDNode::get(malloccall->getContext(), {ident}));
+          // Only caches of numbers may share a tape arena chunk: a nested
+          // derivative's type analysis must not see pointers and numbers at
+          // the same unknown offsets of one allocation.
+          if (isCallerOwnedCacheElement(myType))
+            malloccall->setMetadata(
+                "enzyme_cache_pointer_free",
+                MDNode::get(malloccall->getContext(), {}));
         }
 
         scopeInstructions[alloc].push_back(malloccall);
