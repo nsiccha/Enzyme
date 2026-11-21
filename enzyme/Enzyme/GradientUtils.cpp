@@ -3870,11 +3870,12 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
 
     const auto &allocations = scopeAllocs[found2->second.first];
     CallInst *allocation = allocations.front();
-    // A single bounded integer cache has exactly one allocation and one
-    // matching reverse free. Leave ragged, pointer and custom caches alone.
+    // A single bounded cache of pointer-free values (integers, floating-point
+    // numbers and fixed vectors, arrays or records of them) has exactly one
+    // allocation and one matching reverse free. Leave ragged, pointer and
+    // custom caches alone.
     if (collectCallerBuffers && allocations.size() == 1 &&
-        malloc->getType()->isIntegerTy() &&
-        malloc->getType()->getIntegerBitWidth() <= 64 &&
+        isCallerOwnedCacheElement(malloc->getType()) &&
         allocation->getCalledFunction() &&
         allocation->getCalledFunction()->getName() == "malloc" &&
         allocation->arg_size() == 1 &&

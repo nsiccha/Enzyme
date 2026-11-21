@@ -60,7 +60,7 @@ llvm::cl::opt<bool> EnzymeRewriteAccumulators(
 
 llvm::cl::opt<bool> EnzymeCallerOwnedTapes(
     "enzyme-caller-owned-tapes", cl::init(true), cl::Hidden,
-    cl::desc("Store non-inlined callees' integer loop caches in the caller"));
+    cl::desc("Store non-inlined callees' pointer-free loop caches in the caller"));
 
 llvm::cl::opt<bool> EnzymeGroupPackedCaches(
     "enzyme-group-packed-caches", cl::init(true), cl::Hidden,
@@ -83,6 +83,12 @@ static bool isPackedElement(Type *T) {
   if (auto *S = dyn_cast<StructType>(T))
     return !S->isOpaque() && llvm::all_of(S->elements(), isPackedElement);
   return false;
+}
+
+bool isCallerOwnedCacheElement(Type *T) {
+  if (auto *I = dyn_cast<IntegerType>(T))
+    return I->getBitWidth() <= 64;
+  return isPackedElement(T);
 }
 
 bool canUseCallerTapeArena(const Module &M) {

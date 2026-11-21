@@ -62,6 +62,7 @@ extern llvm::cl::opt<bool> EnzymeZeroCache;
 extern llvm::cl::opt<bool> EnzymeGroupPackedCaches;
 }
 
+bool isCallerOwnedCacheElement(llvm::Type *T);
 bool canUseCallerTapeArena(const llvm::Module &M);
 llvm::StructType *getCallerTapeArenaType(llvm::LLVMContext &C);
 llvm::Function *getCallerTapeReserve(llvm::Module &M);
