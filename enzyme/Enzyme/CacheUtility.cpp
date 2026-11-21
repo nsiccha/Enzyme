@@ -62,6 +62,12 @@ llvm::cl::opt<bool> EnzymeCallerOwnedTapes(
     "enzyme-caller-owned-tapes", cl::init(true), cl::Hidden,
     cl::desc("Store non-inlined callees' pointer-free loop caches in the caller"));
 
+llvm::cl::opt<bool> EnzymeArenaCombinedCaches(
+    "enzyme-arena-combined-caches", cl::init(true), cl::Hidden,
+    cl::desc("Reserve a combined derivative's bounded loop caches from its "
+             "tape arena, released at its return, instead of one malloc and "
+             "free each"));
+
 llvm::cl::opt<bool> EnzymeGroupPackedCaches(
     "enzyme-group-packed-caches", cl::init(true), cl::Hidden,
     cl::desc("Store the packed ragged caches of one element type and loop "

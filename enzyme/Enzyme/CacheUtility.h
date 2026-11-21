@@ -60,6 +60,7 @@ extern llvm::cl::opt<bool> EnzymeZeroCache;
 
 /// Let packed ragged caches of one element type and loop nest share storage
 extern llvm::cl::opt<bool> EnzymeGroupPackedCaches;
+extern llvm::cl::opt<bool> EnzymeArenaCombinedCaches;
 }
 
 bool isCallerOwnedCacheElement(llvm::Type *T);

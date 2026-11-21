@@ -4285,6 +4285,66 @@ void createInvertedTerminator(DiffeGradientUtils *gutils,
   }
 }
 
+// A combined derivative frees each bounded loop cache it allocates before it
+// returns. Reserve those caches from the derivative's tape arena instead,
+// which the arena releases at the return, so a derivative makes a few chunk
+// allocations rather than one malloc and one free per cached value and loop
+// entry. Only a cache whose allocation and single free carry the matching
+// enzyme_cache_alloc/enzyme_cache_free tag qualifies: the allocation is then
+// the cache's only storage (never reallocated) and its free its only release.
+static void reserveCombinedCachesFromArena(GradientUtils *gutils) {
+  Function *F = gutils->newFunc;
+  auto releases = [](Metadata *op) {
+    return cast<ConstantInt>(
+               cast<ConstantAsMetadata>(cast<MDNode>(op)->getOperand(0))
+                   ->getValue())
+        ->isOne();
+  };
+  std::map<Metadata *, SmallVector<CallInst *, 1>> frees;
+  SmallVector<std::pair<CallInst *, Metadata *>, 8> mallocs;
+  for (auto &BB : *F)
+    for (auto &I : BB) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+      if (auto *MD = hasMetadata(CI, "enzyme_cache_free")) {
+        Metadata *op = MD->getOperand(0);
+        if (releases(op))
+          frees[op].push_back(CI);
+      }
+      auto *callee = CI->getCalledFunction();
+      if (!callee || callee->getName() != "malloc" || CI->arg_size() != 1 ||
+          !CI->getArgOperand(0)->getType()->isIntegerTy(64) ||
+          CI->getType() != getInt8PtrTy(F->getContext()) ||
+          hasMetadata(CI, "enzyme_ompfor"))
+        continue;
+      if (auto *MD = hasMetadata(CI, "enzyme_cache_alloc")) {
+        Metadata *op = MD->getOperand(0);
+        if (releases(op))
+          mallocs.emplace_back(CI, op);
+      }
+    }
+  for (auto &pair : mallocs) {
+    CallInst *alloc = pair.first;
+    auto &found = frees[pair.second];
+    if (found.size() != 1)
+      continue;
+    CallInst *release = found.front();
+    auto *freeFn = release->getCalledFunction();
+    if (!freeFn || freeFn->getName() != "free")
+      continue;
+    IRBuilder<> B(alloc);
+    Value *slice =
+        B.CreateCall(getCallerTapeReserve(*F->getParent()),
+                     {gutils->getOrCreateCallerTapeArena(),
+                      alloc->getArgOperand(0)});
+    alloc->replaceAllUsesWith(slice);
+    alloc->eraseFromParent();
+    release->eraseFromParent();
+    found.clear();
+  }
+}
+
 Function *EnzymeLogic::CreatePrimalAndGradient(
     RequestContext context, const ReverseCacheKey &&prevkey, TypeAnalysis &TA,
     const AugmentedReturn *augmenteddata, bool omp) {
@@ -5237,6 +5297,11 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
       entry = OldEntryInsts;
     }
   }
+
+  if (key.mode == DerivativeMode::ReverseModeCombined && !omp &&
+      EnzymeArenaCombinedCaches &&
+      canUseCallerTapeArena(*gutils->newFunc->getParent()))
+    reserveCombinedCachesFromArena(gutils);
 
   if (gutils->callerTapeArena) {
     for (auto &BB : *gutils->newFunc) {
