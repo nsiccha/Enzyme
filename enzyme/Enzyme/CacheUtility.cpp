@@ -99,7 +99,12 @@ bool isCallerOwnedCacheElement(Type *T) {
 
 bool canUseCallerTapeArena(const Module &M) {
   auto arch = Triple(M.getTargetTriple()).getArch();
+  // A derivative compiled on behalf of another one (the inner derivative of
+  // a nested one) is differentiated again with the module it is linked into,
+  // and an outer derivative cannot differentiate through the arena's single
+  // release of all its chunks; such a module keeps one malloc per cache.
   return EnzymeCallerOwnedTapes &&
+         !M.getModuleFlag("enzyme_no_tape_arena") &&
          (arch == Triple::x86_64 || arch == Triple::aarch64) &&
          M.getDataLayout().getPointerSizeInBits() == 64 &&
          M.getDataLayout().getAllocaAddrSpace() == 0;
@@ -136,8 +141,19 @@ Function *getCallerTapeReserve(Module &M) {
 #else
   reserve->addFnAttr(Attribute::InaccessibleMemOrArgMemOnly);
 #endif
+  // Chunks double from 256 bytes up to 64 KiB, so a derivative makes a few
+  // allocations for many small caches and holds at most one partly used
+  // chunk beyond what it stores. A request above 4 KiB gets a chunk of its
+  // own size, linked behind the current one, so a large cache costs one
+  // allocation of exactly its size, as before, and never doubles the next.
+  constexpr uint64_t firstChunk = 256;
+  constexpr uint64_t largestChunk = 64 * 1024;
+  constexpr uint64_t largeRequest = 4 * 1024;
   auto entry = BasicBlock::Create(C, "entry", reserve);
   auto fit = BasicBlock::Create(C, "check.capacity", reserve);
+  auto choose = BasicBlock::Create(C, "choose", reserve);
+  auto large = BasicBlock::Create(C, "large", reserve);
+  auto largeLink = BasicBlock::Create(C, "large.link", reserve);
   auto grow = BasicBlock::Create(C, "grow", reserve);
   auto link = BasicBlock::Create(C, "link", reserve);
   auto done = BasicBlock::Create(C, "slice", reserve);
@@ -162,17 +178,36 @@ Function *getCallerTapeReserve(Module &M) {
   auto used = B.CreateLoad(i64, usedAddr);
   auto capacity = B.CreateLoad(i64, capacityAddr);
   B.CreateCondBr(B.CreateICmpULE(need, B.CreateSub(capacity, used)), done,
-                 grow);
+                 choose);
+
+  B.SetInsertPoint(choose);
+  auto alloc = M.getOrInsertFunction("malloc", ptrTy, i64);
+  B.CreateCondBr(B.CreateAnd(B.CreateICmpUGT(need, B.getInt64(largeRequest)),
+                             B.CreateIsNotNull(head)),
+                 large, grow);
+
+  B.SetInsertPoint(large);
+  auto own = B.CreateCall(alloc, {B.CreateAdd(need, B.getInt64(alignment))});
+  own->addRetAttr(Attribute::NoAlias);
+  B.CreateCondBr(B.CreateIsNull(own), fail, largeLink);
+
+  B.SetInsertPoint(largeLink);
+  auto headLink = B.CreatePointerCast(head, getUnqual(ptrTy));
+  B.CreateStore(B.CreateLoad(ptrTy, headLink),
+                B.CreatePointerCast(own, getUnqual(ptrTy)));
+  B.CreateStore(own, headLink);
+  B.CreateRet(B.CreateInBoundsGEP(B.getInt8Ty(), own, B.getInt64(alignment)));
 
   B.SetInsertPoint(grow);
-  auto doubled =
-      B.CreateSelect(B.CreateICmpULE(capacity, B.getInt64(maxCapacity / 2)),
-                     B.CreateShl(capacity, 1), need);
-  auto candidate =
-      B.CreateSelect(B.CreateICmpUGT(doubled, need), doubled, need);
-  auto newCapacity = B.CreateSelect(B.CreateICmpULT(candidate, B.getInt64(256)),
-                                    B.getInt64(256), candidate);
-  auto alloc = M.getOrInsertFunction("malloc", ptrTy, i64);
+  auto bounded = B.CreateShl(
+      B.CreateSelect(B.CreateICmpULT(capacity, B.getInt64(largestChunk / 2)),
+                     capacity, B.getInt64(largestChunk / 2)),
+      1);
+  auto atLeastFirst =
+      B.CreateSelect(B.CreateICmpULT(bounded, B.getInt64(firstChunk)),
+                     B.getInt64(firstChunk), bounded);
+  auto newCapacity = B.CreateSelect(B.CreateICmpUGT(need, atLeastFirst), need,
+                                    atLeastFirst);
   auto newHead =
       B.CreateCall(alloc, {B.CreateAdd(newCapacity, B.getInt64(alignment))});
   newHead->addRetAttr(Attribute::NoAlias);
