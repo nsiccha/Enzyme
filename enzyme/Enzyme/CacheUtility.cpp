@@ -58,12 +58,14 @@ llvm::cl::opt<bool> EnzymeRewriteAccumulators(
     cl::desc("Rewrite a loop-carried counter whose step is an inner loop's "
              "trip count into a closed form of the induction variable"));
 
+// The tape arena is off by default, so that the tests of the caches it replaces keep
+// their allocations; a frontend turns both options on (Enzyme.jl does).
 llvm::cl::opt<bool> EnzymeCallerOwnedTapes(
-    "enzyme-caller-owned-tapes", cl::init(true), cl::Hidden,
+    "enzyme-caller-owned-tapes", cl::init(false), cl::Hidden,
     cl::desc("Store non-inlined callees' pointer-free loop caches in the caller"));
 
 llvm::cl::opt<bool> EnzymeArenaCombinedCaches(
-    "enzyme-arena-combined-caches", cl::init(true), cl::Hidden,
+    "enzyme-arena-combined-caches", cl::init(false), cl::Hidden,
     cl::desc("Reserve a combined derivative's bounded loop caches from its "
              "tape arena, released at its return, instead of one malloc and "
              "free each"));

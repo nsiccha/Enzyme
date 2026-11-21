@@ -1,5 +1,5 @@
-; RUN: %opt < %s %OPnewLoadEnzyme -enzyme-preopt=false -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg),verify" -S | FileCheck %s
-; RUN: %opt < %s %OPnewLoadEnzyme -enzyme-preopt=false -enzyme-arena-combined-caches=false -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg),verify" -S | FileCheck %s --check-prefix=OWN
+; RUN: %opt < %s %OPnewLoadEnzyme -enzyme-preopt=false -enzyme-caller-owned-tapes=true -enzyme-arena-combined-caches=true -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg),verify" -S | FileCheck %s
+; RUN: %opt < %s %OPnewLoadEnzyme -enzyme-preopt=false -enzyme-caller-owned-tapes=true -enzyme-arena-combined-caches=false -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg),verify" -S | FileCheck %s --check-prefix=OWN
 
 ; A combined derivative caches the values a loop reads before overwriting
 ; them. With the arena the cache is reserved from the derivative's tape arena,
