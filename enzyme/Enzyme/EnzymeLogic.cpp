@@ -299,26 +299,43 @@ struct CacheAnalysis {
     return false;
   }
 
-  std::map<std::pair<CallInst *, CallInst *>, bool> unexposedAllocations;
+  std::map<std::pair<Instruction *, CallInst *>, bool> unexposedAllocations;
 
-  // Whether no use of alloc, including pointers loaded transitively from it,
-  // can expose its storage to callsite. Reject passing even a nocapture
-  // argument: the call could read through it or return one of its fields.
-  // Uses that cannot reach callsite are irrelevant, but a use after the call
-  // in a loop can reach the next iteration and must count. Following loads
-  // also catches publication of the owned buffer without its header. A
-  // loaded value that type analysis knows holds no pointer, such as an
-  // element of a Float64 array read back, cannot name the storage, so its
-  // uses need not be followed. A Julia write barrier, which follows every
-  // store of an object reference into the storage, only tells the garbage
-  // collector that its first operand may now hold the others. It accesses no
-  // memory the program can read, so it exposes nothing; a store that puts the
-  // storage itself somewhere is checked on its own.
-  bool allocationUnexposedToCall(CallInst *alloc, CallInst *callsite) {
+  // Whether V is an object this function creates: a stack slot, or the
+  // result of a noalias call such as an allocation.
+  static bool isNewObject(Value *V) {
+    if (isa<AllocaInst>(V))
+      return true;
+    auto CB = dyn_cast<CallBase>(V);
+    return CB && isNoAlias(CB);
+  }
+
+  // Whether no use of alloc, an object this function creates (isNewObject),
+  // including pointers loaded transitively from it, can expose its storage to
+  // callsite. Reject passing even a nocapture argument: the call could read
+  // through it or return one of its fields. Uses that cannot reach callsite
+  // are irrelevant, but a use after the call in a loop can reach the next
+  // iteration and must count. Following loads also catches publication of
+  // the owned buffer without its header. A loaded value that type analysis
+  // knows holds no pointer, such as an element of a Float64 array read back,
+  // cannot name the storage, so its uses need not be followed. A Julia write
+  // barrier, which follows every store of an object reference into the
+  // storage, only tells the garbage collector that its first operand may now
+  // hold the others. It accesses no memory the program can read, so it
+  // exposes nothing; a store that puts the storage itself somewhere is
+  // checked on its own. Such a store into alloc itself (a Julia Memory stores
+  // the address of its inline data into its data field), or into another
+  // object this function creates that is itself unexposed (a Julia 1.11+
+  // array header holds its Memory and that Memory's data), leaves the storage
+  // reachable only through that object, whose own walk follows loads of the
+  // pointer back out of it. A query that reaches an object it is still
+  // answering for answers conservatively.
+  bool allocationUnexposedToCall(Instruction *alloc, CallInst *callsite) {
     auto key = std::make_pair(alloc, callsite);
     auto found = unexposedAllocations.find(key);
     if (found != unexposedAllocations.end())
       return found->second;
+    unexposedAllocations[key] = false;
     SmallVector<Value *, 16> todo{alloc};
     SmallPtrSet<Value *, 32> seen;
     while (!todo.empty()) {
@@ -334,11 +351,18 @@ struct CacheAnalysis {
         if (isa<CmpInst>(I) || isAnyBranch(I) || isa<SwitchInst>(I))
           continue;
         if (auto CI = dyn_cast<CallInst>(I))
-          if (isJuliaWriteBarrier(getFuncNameFromCall(CI)))
+          if (isJuliaWriteBarrier(getFuncNameFromCall(CI)) ||
+              CI->isLifetimeStartOrEnd())
             continue;
         if (auto SI = dyn_cast<StoreInst>(I)) {
           if (SI->getValueOperand() != V)
             continue;
+          Value *holder = getBaseObject(SI->getPointerOperand());
+          if (holder == alloc ||
+              (isNewObject(holder) &&
+               allocationUnexposedToCall(cast<Instruction>(holder), callsite)))
+            continue;
+          return unexposedAllocations[key] = false;
         } else if (auto MI = dyn_cast<MemIntrinsic>(I)) {
           if (auto MT = dyn_cast<MemTransferInst>(MI)) {
             if (MT->getRawSource() == V)
@@ -360,18 +384,461 @@ struct CacheAnalysis {
     return unexposedAllocations[key] = true;
   }
 
+  std::map<std::pair<StoreInst *, CallInst *>, bool> unchangedSlotStores;
+
+  // Whether I, a write that follows callsite, is a store of the value the
+  // stack slot it writes already holds whenever it runs after callsite, so
+  // that it cannot change what callsite read. Julia passes an immutable
+  // struct that holds references to a call by reference, through a stack
+  // slot it stores the struct into right before the call; in a loop that
+  // store runs again before each call, with the same value into the same
+  // slot. A store S qualifies when
+  //  * S dominates callsite, so callsite reads the slot only after an S;
+  //  * S stores at a constant offset into the slot, and its value is not
+  //    computed by an instruction that can run again after S, so every
+  //    execution of S stores the same value at the same address;
+  //  * the slot's address never escapes: pointers derived from it are only
+  //    loaded from, compared, stored into, passed to lifetime markers, or
+  //    passed to calls that neither capture nor write through them;
+  //  * no other store or memory intrinsic into the slot can run after S (an
+  //    initialization before it does not matter).
+  // From its first execution on, S then leaves the slot unchanged.
+  bool rewritesUnchangedSlotValue(Instruction *I, CallInst *callsite) {
+    auto S = dyn_cast<StoreInst>(I);
+    if (!S || !S->isSimple())
+      return false;
+    auto key = std::make_pair(S, callsite);
+    auto found = unchangedSlotStores.find(key);
+    if (found != unchangedSlotStores.end())
+      return found->second;
+    auto &result = unchangedSlotStores[key];
+    result = false;
+    if (!OrigDT.dominates(S, callsite))
+      return false;
+    const auto &DL = oldFunc->getParent()->getDataLayout();
+    int64_t offset = 0;
+    auto slot = dyn_cast<AllocaInst>(
+        getPointerFieldOwner(S->getPointerOperand(), offset, DL));
+    if (!slot)
+      return false;
+    if (auto VI = dyn_cast<Instruction>(S->getValueOperand()))
+      if (isPotentiallyReachable(S, VI, nullptr, &OrigDT, &OrigLI))
+        return false;
+    SmallVector<Value *, 8> todo{slot};
+    SmallPtrSet<Value *, 16> seen;
+    while (!todo.empty()) {
+      auto V = todo.pop_back_val();
+      if (!seen.insert(V).second)
+        continue;
+      for (auto U : V->users()) {
+        auto J = dyn_cast<Instruction>(U);
+        if (!J)
+          return false;
+        if (isa<LoadInst>(J) || isa<CmpInst>(J))
+          continue;
+        if (isa<CastInst>(J) || isa<GetElementPtrInst>(J)) {
+          todo.push_back(J);
+          continue;
+        }
+        if (auto SI = dyn_cast<StoreInst>(J)) {
+          if (SI->getValueOperand() == V)
+            return false;
+          if (SI != S &&
+              isPotentiallyReachable(S, SI, nullptr, &OrigDT, &OrigLI))
+            return false;
+          continue;
+        }
+        if (auto MI = dyn_cast<MemIntrinsic>(J)) {
+          if (MI->getRawDest() == V &&
+              isPotentiallyReachable(S, MI, nullptr, &OrigDT, &OrigLI))
+            return false;
+          continue;
+        }
+        if (auto CB = dyn_cast<CallBase>(J)) {
+          if (CB->isLifetimeStartOrEnd() ||
+              isDebugFunction(CB->getCalledFunction()))
+            continue;
+          if (CB->getCalledOperand() == V)
+            return false;
+          for (unsigned i = 0; i < CB->arg_size(); ++i)
+            if (CB->getArgOperand(i) == V &&
+                !(CB->doesNotCapture(i) && CB->onlyReadsMemory(i)))
+              return false;
+          continue;
+        }
+        return false;
+      }
+    }
+    return result = true;
+  }
+
+  // Whether V is the data pointer of the Julia empty Memory singleton (a
+  // global Enzyme.jl marks enzymejl_empty_memory), loaded from the field that
+  // follows its length. That Memory has length zero, so no in-bounds access
+  // writes the storage its data pointer names.
+  static bool isEmptyMemoryData(Value *V) {
+    auto LI = dyn_cast<LoadInst>(V);
+    if (!LI || !LI->isSimple() || !LI->getType()->isPointerTy())
+      return false;
+    const auto &DL = LI->getModule()->getDataLayout();
+    Value *ptr = LI->getPointerOperand();
+    APInt offset(DL.getIndexTypeSizeInBits(ptr->getType()), 0);
+    ptr = ptr->stripAndAccumulateConstantOffsets(DL, offset,
+                                                 /*AllowNonInbounds*/ true);
+    auto GV = dyn_cast<GlobalVariable>(getBaseObject(ptr, false));
+    return GV && GV->getMetadata("enzymejl_empty_memory") &&
+           offset == DL.getPointerSize();
+  }
+
+  // The byte offset from owner and the size of what J, a store or a memory
+  // intrinsic of constant length, writes, when its destination is a constant
+  // offset from owner (through julia.pointer_from_objref too).
+  static bool writesOwnerBytes(Instruction *J, Value *owner, int64_t &off,
+                               int64_t &size) {
+    const auto &DL = J->getModule()->getDataLayout();
+    Value *dst = nullptr;
+    if (auto SI = dyn_cast<StoreInst>(J)) {
+      dst = SI->getPointerOperand();
+      size = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+    } else if (auto MI = dyn_cast<MemIntrinsic>(J)) {
+      auto len = dyn_cast<ConstantInt>(MI->getLength());
+      if (!len)
+        return false;
+      dst = MI->getRawDest();
+      size = len->getSExtValue();
+    } else {
+      return false;
+    }
+    off = 0;
+    return getPointerFieldOwner(dst, off, DL) == owner;
+  }
+
+  // Whether J writes only bytes of owner outside the field of fieldSize bytes
+  // at offset, such as an object's length beside its data field. Alias
+  // analysis cannot always tell such a write from one into the field when
+  // the field is read through pointer_from_objref or through a merge of
+  // owner with other objects.
+  static bool writesOtherOwnerBytes(Instruction *J, Value *owner,
+                                    int64_t offset, int64_t fieldSize) {
+    int64_t off, size;
+    return writesOwnerBytes(J, owner, off, size) && size >= 0 &&
+           (off + size <= offset || off >= offset + fieldSize);
+  }
+
+  // The object whose own storage the pointer ld loads names, when ld reads a
+  // field of an object this function creates (isNewObject) that holds the
+  // address of storage inside that object. Julia 1.11+ allocates a Memory of
+  // a short constant length inline, as an object or, once its allocation is
+  // moved to the stack, as a stack slot, and stores the address of its inline
+  // data into its data field. Such a store must dominate ld, and every
+  // instruction between the object's creation and ld that may write what ld
+  // reads must be such a store, so ld reads one of them. A write at a
+  // constant offset from the object to bytes outside the field, such as the
+  // length or the inline data, does not count (writesOtherOwnerBytes): Julia
+  // writes the inline data through pointer_from_objref.
+  Instruction *selfPointerFieldOwner(LoadInst *ld) {
+    if (!ld->isSimple() || !ld->getType()->isPointerTy())
+      return nullptr;
+    const auto &DL = oldFunc->getParent()->getDataLayout();
+    int64_t offset = 0;
+    Value *owner = getPointerFieldOwner(ld->getPointerOperand(), offset, DL);
+    if (!isNewObject(owner))
+      return nullptr;
+    const int64_t fieldSize = DL.getTypeStoreSize(ld->getType());
+    auto isSelfPointerStore = [&](Instruction *J) -> bool {
+      auto SI = dyn_cast<StoreInst>(J);
+      int64_t off, size;
+      return SI && SI->isSimple() && writesOwnerBytes(J, owner, off, size) &&
+             off == offset && size == fieldSize &&
+             getBaseObject(SI->getValueOperand()) == owner;
+    };
+    bool stored = false, other = false;
+    allInstructionsBetween(
+        OrigLI, cast<Instruction>(owner), ld, [&](Instruction *J) -> bool {
+          if (!J->mayWriteToMemory())
+            return /*earlyBreak*/ false;
+          if (writesOtherOwnerBytes(J, owner, offset, fieldSize))
+            return /*earlyBreak*/ false;
+          if (!writesToMemoryReadBy(nullptr, AA, TLI, /*maybeReader*/ ld,
+                                    /*maybeWriter*/ J))
+            return /*earlyBreak*/ false;
+          if (isSelfPointerStore(J)) {
+            stored |= OrigDT.dominates(J, ld);
+            return /*earlyBreak*/ false;
+          }
+          other = true;
+          return /*earlyBreak*/ true;
+        });
+    return stored && !other ? cast<Instruction>(owner) : nullptr;
+  }
+
+  // Whether a use of obj, an object this function creates (isNewObject), that
+  // can run before J may let a pointer obj did not derive reach its address:
+  // a store of the address, a pointer-to-integer cast, a return, or passing
+  // it to a call other than as a nocapture argument, to a write barrier or a
+  // lifetime marker, or in a jl_roots bundle (which only keeps it alive).
+  // Uses that cannot reach J, such as the argument of a call that throws a
+  // bounds error, do not count.
+  bool capturedBefore(Instruction *obj, Instruction *J) {
+    SmallVector<Value *, 8> todo{obj};
+    SmallPtrSet<Value *, 16> seen;
+    while (!todo.empty()) {
+      auto V = todo.pop_back_val();
+      if (!seen.insert(V).second)
+        continue;
+      for (auto &U : V->uses()) {
+        auto I = dyn_cast<Instruction>(U.getUser());
+        if (!I)
+          return true;
+        if (!isPotentiallyReachable(I, J, nullptr, &OrigDT, &OrigLI))
+          continue;
+        if (isa<LoadInst>(I) || isa<CmpInst>(I) || isa<MemIntrinsic>(I))
+          continue;
+        if (auto SI = dyn_cast<StoreInst>(I)) {
+          if (SI->getValueOperand() == V)
+            return true;
+          continue;
+        }
+        if (isa<PtrToIntInst>(I))
+          return true;
+        if (isPointerArithmeticInst(I, /*includephi*/ true,
+                                    /*includebin*/ false) ||
+            isa<SelectInst>(I)) {
+          todo.push_back(I);
+          continue;
+        }
+        if (auto CB = dyn_cast<CallBase>(I)) {
+          if (isJuliaWriteBarrier(getFuncNameFromCall(CB)) ||
+              CB->isLifetimeStartOrEnd())
+            continue;
+          if (CB->isArgOperand(&U)) {
+            if (isNoCapture(CB, CB->getArgOperandNo(&U)))
+              continue;
+          } else if (CB->isBundleOperand(&U)) {
+            if (CB->getOperandBundleForOperand(U.getOperandNo()).getTagName() ==
+                "jl_roots")
+              continue;
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Whether J, which accesses memory through the pointers ptrs, cannot write
+  // obj, a stack slot or a Julia object this function creates: the pointers
+  // derive from other objects only, and nothing that runs before J lets
+  // those reach obj's address (capturedBefore). Such an object holds no
+  // pointer to itself when it is created, unlike an allocation whose
+  // allocator fills a field with the address of its inline storage, so a
+  // pointer loaded from memory, or one a callee finds, can name it only after
+  // a store of its address.
+  bool accessesOnlyOtherObjects(ArrayRef<Value *> ptrs, Instruction *obj,
+                                Instruction *J) {
+    if (!isa<AllocaInst>(obj) &&
+        !(isa<CallInst>(obj) &&
+          getFuncNameFromCall(cast<CallInst>(obj)) == "julia.gc_alloc_obj"))
+      return false;
+    for (auto ptr : ptrs)
+      for (auto base : getBaseObjects(ptr))
+        if (base == obj)
+          return false;
+    return !capturedBefore(obj, J);
+  }
+
+  // Whether J, a store or memory intrinsic writing through ptr or a call,
+  // cannot write obj (accessesOnlyOtherObjects): for a call, through none of
+  // its pointer operands.
+  bool writesOnlyOtherObjects(Instruction *J, Value *ptr, Instruction *obj) {
+    SmallVector<Value *, 4> ptrs;
+    if (ptr)
+      ptrs.push_back(ptr);
+    else if (auto CB = dyn_cast<CallBase>(J)) {
+      for (auto &op : CB->data_ops())
+        if (op->getType()->isPointerTy())
+          ptrs.push_back(op);
+      for (unsigned i = 0; i < CB->getNumOperandBundles(); i++)
+        for (auto &op : CB->getOperandBundleAt(i).Inputs)
+          if (op->getType()->isPointerTy())
+            ptrs.push_back(op);
+    } else
+      return false;
+    return accessesOnlyOtherObjects(ptrs, obj, J);
+  }
+
+  // The value ld reads when ld reads a pointer field of an object this
+  // function creates (isNewObject) that a single store fills with a value
+  // that cannot name the object: Julia 1.13 stores a Memory's data pointer
+  // into the header of a new array and loads it back from there for each
+  // later access. The store must dominate ld, and every other instruction
+  // between the object's creation and ld that may write what ld reads must
+  // write bytes of the object outside the field (writesOtherOwnerBytes),
+  // write through a pointer loaded back from the field after the store, or
+  // write other objects only (writesOnlyOtherObjects: a broadcast fills a
+  // second new array, and a call that is not passed the object may run in
+  // between). Such a load reads the stored value until another write changes
+  // the field, and a write through it cannot reach the object.
+  Value *forwardedFieldValue(LoadInst *ld) {
+    if (!ld->isSimple() || !ld->getType()->isPointerTy())
+      return nullptr;
+    const auto &DL = oldFunc->getParent()->getDataLayout();
+    int64_t offset = 0;
+    Value *owner = getPointerFieldOwner(ld->getPointerOperand(), offset, DL);
+    if (!isNewObject(owner))
+      return nullptr;
+    auto ownerI = cast<Instruction>(owner);
+    const int64_t fieldSize = DL.getTypeStoreSize(ld->getType());
+    // The load of the field that a write through ptr goes through, if any.
+    auto fieldReload = [&](Value *ptr) -> LoadInst * {
+      auto L = dyn_cast<LoadInst>(getBaseObject(ptr));
+      int64_t off = 0;
+      if (!L || !L->isSimple() ||
+          DL.getTypeStoreSize(L->getType()) != (uint64_t)fieldSize ||
+          getPointerFieldOwner(L->getPointerOperand(), off, DL) != owner ||
+          off != offset)
+        return nullptr;
+      return L;
+    };
+    StoreInst *fill = nullptr;
+    SmallVector<LoadInst *, 4> reloads;
+    bool other = false;
+    allInstructionsBetween(OrigLI, ownerI, ld, [&](Instruction *J) -> bool {
+      if (!J->mayWriteToMemory() ||
+          writesOtherOwnerBytes(J, owner, offset, fieldSize))
+        return /*earlyBreak*/ false;
+      int64_t off, size;
+      auto SI = dyn_cast<StoreInst>(J);
+      if (SI && SI->isSimple() && writesOwnerBytes(J, owner, off, size) &&
+          off == offset && size == fieldSize) {
+        if (fill && fill != SI) {
+          other = true;
+          return /*earlyBreak*/ true;
+        }
+        fill = SI;
+        return /*earlyBreak*/ false;
+      }
+      Value *dst = nullptr;
+      if (SI)
+        dst = SI->getPointerOperand();
+      else if (auto MI = dyn_cast<MemIntrinsic>(J))
+        dst = MI->getRawDest();
+      if (dst)
+        if (auto L = fieldReload(dst)) {
+          reloads.push_back(L);
+          return /*earlyBreak*/ false;
+        }
+      if (writesOnlyOtherObjects(J, dst, ownerI))
+        return /*earlyBreak*/ false;
+      if (!writesToMemoryReadBy(nullptr, AA, TLI, /*maybeReader*/ ld,
+                                /*maybeWriter*/ J))
+        return /*earlyBreak*/ false;
+      other = true;
+      return /*earlyBreak*/ true;
+    });
+    if (other || !fill || !OrigDT.dominates(fill, ld))
+      return nullptr;
+    for (auto L : reloads)
+      if (!OrigDT.dominates(fill, L))
+        return nullptr;
+    Value *V = fill->getValueOperand();
+    if (getBaseObject(V) == owner)
+      return nullptr;
+    // V cannot name the object: it was computed before the object existed,
+    // or the object is one whose address only a capture can hand out and
+    // none happened before the store (accessesOnlyOtherObjects).
+    if (auto VI = dyn_cast<Instruction>(V))
+      if (!OrigDT.dominates(VI, ownerI) &&
+          !accessesOnlyOtherObjects({V}, ownerI, fill))
+        return nullptr;
+    return V;
+  }
+
+  // The allocations of the Memory header whose data field ld reads, when that
+  // header merges new Memory allocations (getFreshPointerHeaderAllocations)
+  // with the Julia empty Memory singleton (see isEmptyMemoryData). Julia
+  // 1.11+ merges a Memory of run-time length with that singleton when the
+  // length may be zero; with bounds checks forced on, it then loads the data
+  // pointer from the merged header rather than merging the two data pointers.
+  // No in-bounds access writes the storage the singleton's data pointer names.
+  bool getEmptyMergedMemoryAllocations(LoadInst *ld,
+                                       SmallVectorImpl<CallInst *> &allocs) {
+    if (!ld->isSimple() || !ld->getType()->isPointerTy())
+      return false;
+    const auto &DL = oldFunc->getParent()->getDataLayout();
+    int64_t offset = 0;
+    Value *header = getPointerFieldOwner(ld->getPointerOperand(), offset, DL)
+                        ->stripPointerCasts();
+    if (offset != (int64_t)DL.getPointerSize())
+      return false;
+    SmallVector<Value *, 2> headers;
+    if (auto PN = dyn_cast<PHINode>(header))
+      headers.append(PN->value_op_begin(), PN->value_op_end());
+    else if (auto SI = dyn_cast<SelectInst>(header))
+      headers.append({SI->getTrueValue(), SI->getFalseValue()});
+    else
+      return false;
+    size_t start = allocs.size();
+    bool empty = false;
+    for (auto V : headers) {
+      auto GV = dyn_cast<GlobalVariable>(V->stripPointerCasts());
+      if (GV && GV->getMetadata("enzymejl_empty_memory")) {
+        empty = true;
+        continue;
+      }
+      if (!getFreshPointerHeaderAllocations(V, offset, allocs)) {
+        allocs.resize(start);
+        return false;
+      }
+    }
+    if (empty)
+      return true;
+    allocs.resize(start);
+    return false;
+  }
+
+  // Whether an instruction between alloc and ld, which reads the field at
+  // offset of a header merging alloc with the empty Memory singleton
+  // (getEmptyMergedMemoryAllocations), may write that field of alloc. Alias
+  // analysis cannot tell a write into another field of alloc, such as the
+  // length Julia stores after allocating a Memory, from one into the field
+  // through the merge, so a write at a constant offset from alloc to other
+  // bytes does not count (writesOtherOwnerBytes).
+  bool isMergedFieldWrittenBefore(CallInst *alloc, int64_t offset,
+                                  LoadInst *ld) {
+    const int64_t fieldSize =
+        oldFunc->getParent()->getDataLayout().getTypeStoreSize(ld->getType());
+    bool written = false;
+    allInstructionsBetween(OrigLI, alloc, ld, [&](Instruction *J) -> bool {
+      if (!J->mayWriteToMemory() ||
+          writesOtherOwnerBytes(J, alloc, offset, fieldSize) ||
+          !writesToMemoryReadBy(nullptr, AA, TLI, /*maybeReader*/ ld,
+                                /*maybeWriter*/ J))
+        return /*earlyBreak*/ false;
+      written = true;
+      return /*earlyBreak*/ true;
+    });
+    return written;
+  }
+
   // Whether I only writes storage the call could not reach: created after
-  // callsite, or still unexposed to it. That storage is either a noalias
-  // allocation the call dominates, written directly (a box or tuple a later
-  // statement fills), or fresh owned storage such an allocation's header
-  // points to: an allocator may initialize a field with a pointer to fresh
-  // owned storage, and its enzyme_fresh_pointer attribute gives that field's
-  // byte offset. A header merged from several such allocations qualifies, a
-  // merge with any other object does not. The allocation-order proof requires
-  // a callsite outside loops: a later dynamic execution could otherwise have
-  // seen the allocation. The use proof includes such later executions.
+  // callsite, or still unexposed to it. That storage is either an object this
+  // function creates, written directly (a box or tuple a later statement
+  // fills, a stack slot), or storage such an object's header points to: an
+  // allocator may initialize a field with a pointer to fresh owned storage,
+  // and its enzyme_fresh_pointer attribute gives that field's byte offset,
+  // or the function may store into the field the address of the object's own
+  // inline storage (selfPointerFieldOwner). A header merged from several
+  // allocations of the first kind qualifies, a merge with any other object
+  // does not. For a Memory of run-time length, Julia 1.11+ merges either the
+  // data pointer with that of the empty Memory singleton (isEmptyMemoryData)
+  // or, with bounds checks forced on, the header with the singleton itself
+  // (getEmptyMergedMemoryAllocations). A data pointer the function loads
+  // back from a new array header it stored it into is followed to the stored
+  // value (forwardedFieldValue). The allocation-order proof requires a
+  // callsite outside loops: a later dynamic execution could otherwise have seen
+  // the allocation. The use proof includes such later executions.
   bool writesToNewOwnedStorage(Instruction *I, CallInst *callsite) {
-    bool callOutsideLoop = !OrigLI.getLoopFor(callsite->getParent());
     Value *ptr = nullptr;
     if (auto SI = dyn_cast<StoreInst>(I))
       ptr = SI->getPointerOperand();
@@ -379,23 +846,62 @@ struct CacheAnalysis {
       ptr = MI->getRawDest();
     if (!ptr)
       return false;
+    return namesNewOwnedStorage(ptr, callsite);
+  }
+
+  // Whether the pointer ptr names only storage the call could not reach (see
+  // writesToNewOwnedStorage).
+  bool namesNewOwnedStorage(Value *ptr, CallInst *callsite) {
     Value *obj = getBaseObject(ptr);
-    if (auto fresh = dyn_cast<CallInst>(obj))
-      return callOutsideLoop && OrigDT.dominates(callsite, fresh) &&
-             isNoAlias(fresh);
+    if (isa<PHINode>(obj) || isa<SelectInst>(obj)) {
+      for (auto base : getBaseObjects(obj))
+        if (!isEmptyMemoryData(base) &&
+            !writesToNewObjectStorage(base, callsite))
+          return false;
+      return true;
+    }
+    return writesToNewObjectStorage(obj, callsite);
+  }
+
+  // Whether a write whose base object is obj writes only storage the call
+  // could not reach (see writesToNewOwnedStorage).
+  bool writesToNewObjectStorage(Value *obj, CallInst *callsite) {
+    bool callOutsideLoop = !OrigLI.getLoopFor(callsite->getParent());
+    // Whether the storage of object fresh, which this function creates, did
+    // not exist at callsite or was not exposed to it.
+    auto newToCall = [&](Instruction *fresh) {
+      return (isa<CallInst>(fresh) && callOutsideLoop &&
+              OrigDT.dominates(callsite, fresh)) ||
+             allocationUnexposedToCall(fresh, callsite);
+    };
+    if (isNewObject(obj))
+      return newToCall(cast<Instruction>(obj));
     auto ld = dyn_cast<LoadInst>(obj);
     if (!ld)
       return false;
+    if (auto owner = selfPointerFieldOwner(ld))
+      return newToCall(owner);
+    if (auto stored = forwardedFieldValue(ld))
+      return namesNewOwnedStorage(stored, callsite);
     SmallVector<CallInst *, 2> allocs;
-    if (!getFreshPointerAllocations(ld, allocs))
-      return false;
+    bool mergedWithEmpty = false;
+    if (!getFreshPointerAllocations(ld, allocs)) {
+      if (!getEmptyMergedMemoryAllocations(ld, allocs))
+        return false;
+      mergedWithEmpty = true;
+    }
     for (auto alloc : allocs)
-      if (!(callOutsideLoop && OrigDT.dominates(callsite, alloc)) &&
-          !allocationUnexposedToCall(alloc, callsite))
+      if (!newToCall(alloc))
         return false;
     int64_t offset = 0;
     getPointerFieldOwner(ld->getPointerOperand(), offset,
                          oldFunc->getParent()->getDataLayout());
+    if (mergedWithEmpty) {
+      for (auto alloc : allocs)
+        if (isMergedFieldWrittenBefore(alloc, offset, ld))
+          return false;
+      return true;
+    }
     for (auto alloc : allocs)
       // The cache is keyed by the load alone, which holds only while the
       // load has a single base allocation.
@@ -1034,7 +1540,8 @@ struct CacheAnalysis {
             writesOnlyStorageOfNewArguments(CB, callsite_op))
           return false;
 
-      if (writesToNewOwnedStorage(inst2, callsite_op))
+      if (writesToNewOwnedStorage(inst2, callsite_op) ||
+          rewritesUnchangedSlotValue(inst2, callsite_op))
         return false;
 
       const uint8_t kind = subsequentWriteKind(inst2);

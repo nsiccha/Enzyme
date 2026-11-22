@@ -1,6 +1,7 @@
 ; RUN: if [ %llvmver -ge 15 ]; then %opt < %s %OPnewLoadEnzyme -passes="enzyme,function(mem2reg,instsimplify,%simplifycfg)" -enzyme-preopt=false -S | FileCheck %s; fi
 
-; An object allocated before the call may have been exposed to it.
+; An object allocated before the call may have been exposed to it: here the
+; function publishes it through its argument before the call.
 
 ; The operand is extracted from an aggregate argument, as Julia passes
 ; structured operands, so alias analysis cannot separate it from a
@@ -37,6 +38,8 @@ define double @f({ ptr, ptr } %agg, double %m) {
 entry:
   %arr = extractvalue { ptr, ptr } %agg, 0
   %box = call noalias ptr @malloc(i64 8)
+  %slot = extractvalue { ptr, ptr } %agg, 1
+  store ptr %box, ptr %slot
   %r = call double @sqdist(ptr %arr, double %m)
   %obj = call noalias ptr @enzyme_allocator(i64 8)
   %buffer = load ptr, ptr %obj
