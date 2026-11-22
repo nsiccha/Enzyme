@@ -3883,12 +3883,12 @@ static BasicBlock *joinGCPreserveBranches(CallInst *Begin,
   if (Ends.size() != 2 || Entry->getTerminator()->getNumSuccessors() != 2)
     return nullptr;
 
-  BranchInst *Branches[2];
+  Instruction *Branches[2];
   for (unsigned I = 0; I < 2; ++I) {
     if (Ends[I]->getParent()->getSinglePredecessor() != Entry)
       return nullptr;
-    Branches[I] = dyn_cast<BranchInst>(getNextNonDebugInstruction(Ends[I]));
-    if (!Branches[I] || !Branches[I]->isConditional())
+    Branches[I] = getNextNonDebugInstruction(Ends[I]);
+    if (!Branches[I] || !isConditionalBranch(Branches[I]))
       return nullptr;
   }
 
@@ -3906,7 +3906,9 @@ static BasicBlock *joinGCPreserveBranches(CallInst *Begin,
   ControlFlowHub Hub;
   for (auto *Br : Branches)
     Hub.addBranch(Br->getParent(), Br->getSuccessor(0), Br->getSuccessor(1));
-  return Hub.finalize(&DTU, Guards, "gcpreserve");
+  Hub.finalize(&DTU, Guards, "gcpreserve");
+  // The two distinct successors guarantee a guard at the entry to the hub.
+  return Guards.front();
 #else
   SetVector<BasicBlock *> Incoming, Outgoing;
   for (auto *Br : Branches)

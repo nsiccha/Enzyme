@@ -386,6 +386,21 @@ static bool ReplaceOriginalCall(IRBuilder<> &Builder, Value *ret,
   return false;
 }
 
+#if LLVM_VERSION_MAJOR >= 24
+// LLVM 24 changed the AAKindSet factory from attribute IDs to attribute types.
+template <typename Set, typename... Attributes>
+static constexpr auto allowedAAKinds(int)
+    -> decltype(Set::template get<Attributes...>()) {
+  return Set::template get<Attributes...>();
+}
+
+template <typename Set, typename... Attributes>
+static constexpr auto allowedAAKinds(long)
+    -> decltype(Set::template get<&Attributes::ID...>()) {
+  return Set::template get<&Attributes::ID...>();
+}
+#endif
+
 class EnzymeBase {
 public:
   EnzymeLogic Logic;
@@ -2705,12 +2720,10 @@ public:
 
 #if LLVM_VERSION_MAJOR >= 24
       static constexpr AAKindSet Allowed =
-          AAKindSet::get<&AAHeapToStack::ID, &AANoCapture::ID,
-                         &AAMemoryBehavior::ID, &AAMemoryLocation::ID,
-                         &AANoUnwind::ID, &AANoSync::ID, &AANoRecurse::ID,
-                         &AAWillReturn::ID, &AANoReturn::ID, &AANonNull::ID,
-                         &AANoAlias::ID, &AADereferenceable::ID, &AAAlign::ID,
-                         &AANoFree::ID, &AANoUndef::ID>();
+          allowedAAKinds<AAKindSet, AAHeapToStack, AANoCapture, AAMemoryBehavior,
+                         AAMemoryLocation, AANoUnwind, AANoSync, AANoRecurse,
+                         AAWillReturn, AANoReturn, AANonNull, AANoAlias,
+                         AADereferenceable, AAAlign, AANoFree, AANoUndef>(0);
 
       AttributorConfig aconfig(CGUpdater);
       aconfig.Allowed = Allowed;
