@@ -3479,6 +3479,67 @@ void TypeAnalyzer::visitAtomicRMWInst(llvm::AtomicRMWInst &I) {
   }
 }
 
+/// Whether every \p fbits wide lane of the mask \p M is either all set or all
+/// clear.
+static bool masksWholeLanes(const APInt &M, unsigned fbits) {
+  if (fbits == 0 || M.getBitWidth() % fbits != 0)
+    return false;
+  for (unsigned pos = 0; pos < M.getBitWidth(); pos += fbits) {
+    APInt lane = M.extractBits(fbits, pos);
+    if (!lane.isAllOnes() && !lane.isMinValue())
+      return false;
+  }
+  return true;
+}
+
+/// The float type of the result of a binary operator that only moves whole
+/// floats between the lanes of an integer holding nothing but floats of that
+/// type, or nullptr. SROA packs a small float aggregate (a pair of floats, such
+/// as a ComplexF32) into an integer with zext, shl by the float width and a
+/// disjoint or, and unpacks the upper float with lshr by the float width and
+/// trunc. Vacated lanes hold zero bits, a float zero, as for zext, whose result
+/// keeps its operand's float type. ConcreteType::binopIn would make these
+/// results unknown (float op integer) or reject them (float | float).
+static Type *packedFloatLanes(const DataLayout &dl, Type *T,
+                              Instruction::BinaryOps Opcode, Value *Args[2],
+                              const TypeTree &LHS, const TypeTree &RHS) {
+  if (!T || !T->isIntegerTy())
+    return nullptr;
+  unsigned width = T->getIntegerBitWidth();
+  switch (Opcode) {
+  case BinaryOperator::LShr:
+  case BinaryOperator::Shl: {
+    auto CI = dyn_cast_or_null<ConstantInt>(Args[1]);
+    if (!CI)
+      return nullptr;
+    Type *FT = LHS.allFloat(T, dl);
+    if (!FT)
+      return nullptr;
+    unsigned fbits = dl.getTypeSizeInBits(FT);
+    if (fbits == 0 || width % fbits != 0)
+      return nullptr;
+    const APInt &amount = CI->getValue();
+    if (!amount.ult(width) || amount.urem(fbits) != 0)
+      return nullptr;
+    return FT;
+  }
+  case BinaryOperator::Or: {
+    if (!Args[0] || !Args[1] || !isStructurallyDisjointOr(Args[0], Args[1]))
+      return nullptr;
+    Type *FT = LHS.allFloat(T, dl);
+    if (!FT || FT != RHS.allFloat(T, dl))
+      return nullptr;
+    unsigned fbits = dl.getTypeSizeInBits(FT);
+    if (!masksWholeLanes(structurallyZeroBits(Args[0]), fbits) ||
+        !masksWholeLanes(structurallyZeroBits(Args[1]), fbits))
+      return nullptr;
+    return FT;
+  }
+  default:
+    return nullptr;
+  }
+}
+
 void TypeAnalyzer::visitBinaryOperation(const DataLayout &dl, llvm::Type *T,
                                         llvm::Instruction::BinaryOps Opcode,
                                         Value *Args[2], TypeTree &Ret,
@@ -3734,6 +3795,10 @@ void TypeAnalyzer::visitBinaryOperation(const DataLayout &dl, llvm::Type *T,
     }
 
     if (direction & DOWN) {
+      if (Type *FT = packedFloatLanes(dl, T, Opcode, Args, LHS, RHS)) {
+        Ret = TypeTree(ConcreteType(FT)).Only(-1, nullptr);
+        return;
+      }
       TypeTree Result = AnalysisLHS;
       bool Legal = true;
       Result.binopIn(Legal, AnalysisRHS, Opcode);
