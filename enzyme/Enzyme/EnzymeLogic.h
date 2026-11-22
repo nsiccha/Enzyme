@@ -37,6 +37,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/CommandLine.h"
 
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -96,6 +97,19 @@ static inline llvm::raw_ostream &operator<<(llvm::raw_ostream &o, CacheType c) {
   return o << str(c);
 }
 
+// Operand flags describe direct writes. The write kinds also cover memory
+// reached through references held by those operands.
+struct CallOverwriteInfo {
+  uint8_t subsequentWrites = 0;
+  std::vector<bool> overwrittenArgs;
+  // Stores available to a custom rule for more precise alias analysis. All
+  // other writes, including those inherited from callers, remain unclassified.
+  uint8_t unclassifiedWrites = 0;
+  std::vector<llvm::WeakVH> stores;
+};
+
+using CallOverwriteMap = std::map<llvm::CallInst *, CallOverwriteInfo>;
+
 //! return structtype if recursive function
 class AugmentedReturn {
 public:
@@ -112,8 +126,7 @@ public:
   //! returned struct
   std::map<AugmentedStruct, int> returns;
 
-  std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-      overwritten_args_map;
+  CallOverwriteMap overwritten_args_map;
 
   std::map<llvm::Instruction *, bool> can_modref_map;
 
@@ -139,8 +152,7 @@ public:
       llvm::Function *fn, llvm::Type *tapeType,
       std::map<std::pair<llvm::Instruction *, CacheType>, int> tapeIndices,
       std::map<AugmentedStruct, int> returns,
-      std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-          overwritten_args_map,
+      CallOverwriteMap overwritten_args_map,
       std::map<llvm::Instruction *, bool> can_modref_map,
       const std::vector<DIFFE_TYPE> &constant_args, bool shadowReturnUsed)
       : fn(fn), tapeType(tapeType), tapeIndices(tapeIndices), returns(returns),

@@ -203,8 +203,7 @@ public:
   llvm::SmallPtrSet<llvm::Instruction *, 4> unnecessaryIntermediates;
 
   const std::map<llvm::Instruction *, bool> *can_modref_map;
-  const std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-      *overwritten_args_map_ptr;
+  const CallOverwriteMap *overwritten_args_map_ptr;
   const llvm::SmallPtrSetImpl<const llvm::Value *> *unnecessaryValuesP;
   //! In the reverse pass of split mode, the augmented pass's unnecessary values
   //! and recompute decisions, to answer whether the primal pass used a value.

@@ -879,7 +879,7 @@ struct CacheAnalysis {
     return can_modref_map;
   }
 
-  std::pair<uint8_t, std::vector<bool>>
+  CallOverwriteInfo
   compute_overwritten_args_for_one_callsite(CallInst *callsite_op) {
     auto Fn = getFunctionFromCall(callsite_op);
     if (!Fn)
@@ -968,7 +968,9 @@ struct CacheAnalysis {
       args_safe.push_back(init_safe);
     }
 
-    uint8_t next_subsequent_inst_may_write = subsequent_calls_may_write;
+    CallOverwriteInfo info;
+    info.subsequentWrites = info.unclassifiedWrites = subsequent_calls_may_write;
+    const bool custom = customCallHandlers.count(funcName) != 0;
 
     // Second, we check for memory modifications that can occur in the
     // continuation of the
@@ -1042,11 +1044,16 @@ struct CacheAnalysis {
       // overwritten below. An unknown write adds its kind: after stores of
       // pointers only, the callee may keep numbers it reads.
       if (!writesOnlyUncapturedLocalOrNoaliasArgMemory(inst2, TLI)) {
-        uint8_t next = addSubsequentWrite(next_subsequent_inst_may_write, kind);
-        if (next != next_subsequent_inst_may_write &&
-            !(next_subsequent_inst_may_write & SubsequentWriteAny))
+        uint8_t next = addSubsequentWrite(info.subsequentWrites, kind);
+        if (next != info.subsequentWrites &&
+            !(info.subsequentWrites & SubsequentWriteAny))
           emitUnknownWrite(callsite_op, inst2);
-        next_subsequent_inst_may_write = next;
+        info.subsequentWrites = next;
+        if (custom && isa<StoreInst>(inst2))
+          info.stores.emplace_back(inst2);
+        else
+          info.unclassifiedWrites =
+              addSubsequentWrite(info.unclassifiedWrites, kind);
       }
       const bool writesCreatedObject = writesOnlyCreatedObject(inst2);
       for (unsigned i = 0; i < args.size(); ++i) {
@@ -1083,8 +1090,6 @@ struct CacheAnalysis {
       return false;
     });
 
-    std::vector<bool> overwritten_args;
-
     if (funcName == "__kmpc_fork_call") {
       Value *op = callsite_op->getArgOperand(2);
       Function *task = nullptr;
@@ -1103,22 +1108,22 @@ struct CacheAnalysis {
       }
 
       // Global.tid is cacheable
-      overwritten_args.push_back(false);
+      info.overwrittenArgs.push_back(false);
 
       // Bound.tid is cacheable
-      overwritten_args.push_back(false);
+      info.overwrittenArgs.push_back(false);
 
       // Ignore first three arguments of fork call
       for (unsigned i = 3; i < args.size(); ++i) {
-        overwritten_args.push_back(!args_safe[i]);
+        info.overwrittenArgs.push_back(!args_safe[i]);
       }
     } else {
       for (unsigned i = 0; i < args.size(); ++i) {
-        overwritten_args.push_back(!args_safe[i]);
+        info.overwrittenArgs.push_back(!args_safe[i]);
       }
     }
 
-    return std::make_pair(next_subsequent_inst_may_write, overwritten_args);
+    return info;
   }
 
   // Given a function and the arguments passed to it by its caller that are
@@ -1126,10 +1131,8 @@ struct CacheAnalysis {
   //   the set of uncacheable arguments for each callsite inside the function. A
   //   pointer argument is uncacheable at a callsite if the memory pointed to
   //   might be modified after that callsite.
-  std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-  compute_overwritten_args_for_callsites() {
-    std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-        overwritten_args_map;
+  CallOverwriteMap compute_overwritten_args_for_callsites() {
+    CallOverwriteMap overwritten_args_map;
 
     for (auto &B : *oldFunc) {
       if (unnecessaryBlocks.count(&B))
@@ -1146,10 +1149,8 @@ struct CacheAnalysis {
 
           // For all other calls, we compute the uncacheable args for this
           // callsite.
-          overwritten_args_map.insert(
-              std::pair<CallInst *,
-                        std::pair<uint8_t, const std::vector<bool>>>(
-                  op, compute_overwritten_args_for_one_callsite(op)));
+          overwritten_args_map.emplace(
+              op, compute_overwritten_args_for_one_callsite(op));
         }
       }
     }
@@ -3021,8 +3022,8 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
                    *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
                    subsequent_calls_may_write, _overwritten_argsPP,
                    DerivativeMode::ReverseModePrimal, omp);
-  const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-      overwritten_args_map = CA.compute_overwritten_args_for_callsites();
+  const CallOverwriteMap overwritten_args_map =
+      CA.compute_overwritten_args_for_callsites();
   gutils->overwritten_args_map_ptr = &overwritten_args_map;
 
   const std::map<Instruction *, bool> can_modref_map =
@@ -4959,10 +4960,9 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
                    *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
                    key.subsequent_calls_may_write, _overwritten_argsPP,
                    key.mode, omp);
-  const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-      overwritten_args_map =
-          (augmenteddata) ? augmenteddata->overwritten_args_map
-                          : CA.compute_overwritten_args_for_callsites();
+  const CallOverwriteMap overwritten_args_map =
+      augmenteddata ? augmenteddata->overwritten_args_map
+                    : CA.compute_overwritten_args_for_callsites();
   gutils->overwritten_args_map_ptr = &overwritten_args_map;
 
   const std::map<Instruction *, bool> can_modref_map =
@@ -5677,8 +5677,8 @@ Function *EnzymeLogic::CreateForwardDiff(
         PPC.FAM.getResult<ScalarEvolutionAnalysis>(*gutils->oldFunc),
         *gutils->OrigLI, *gutils->OrigDT, TLI, guaranteedUnreachable,
         subsequent_calls_may_write, _overwritten_argsPP, mode, omp);
-    const std::map<CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-        overwritten_args_map = CA.compute_overwritten_args_for_callsites();
+    const CallOverwriteMap overwritten_args_map =
+        CA.compute_overwritten_args_for_callsites();
     gutils->overwritten_args_map_ptr = &overwritten_args_map;
     can_modref_map = std::make_unique<const std::map<Instruction *, bool>>(
         CA.compute_uncacheable_load_map());

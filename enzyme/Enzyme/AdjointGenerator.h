@@ -62,8 +62,7 @@ private:
   TypeResults &TR = gutils->TR;
   std::function<unsigned(llvm::Instruction *, CacheType, llvm::IRBuilder<> &)>
       getIndex;
-  const std::map<llvm::CallInst *, std::pair<uint8_t, const std::vector<bool>>>
-      overwritten_args_map;
+  const CallOverwriteMap overwritten_args_map;
   const AugmentedReturn *augmentedReturn;
   const std::map<llvm::ReturnInst *, llvm::StoreInst *> *replacedReturns;
 
@@ -80,9 +79,7 @@ public:
       std::function<unsigned(llvm::Instruction *, CacheType,
                              llvm::IRBuilder<> &)>
           getIndex,
-      const std::map<llvm::CallInst *,
-                     std::pair<uint8_t, const std::vector<bool>>>
-          overwritten_args_map,
+      const CallOverwriteMap overwritten_args_map,
       const AugmentedReturn *augmentedReturn,
       const std::map<llvm::ReturnInst *, llvm::StoreInst *> *replacedReturns,
       const llvm::SmallPtrSetImpl<const llvm::Value *> &unnecessaryValues,
@@ -4942,8 +4939,8 @@ public:
 
     auto found_ow = overwritten_args_map.find(&call);
     assert(found_ow != overwritten_args_map.end());
-    const uint8_t subsequent_calls_may_write = found_ow->second.first;
-    const std::vector<bool> &overwritten_args = found_ow->second.second;
+    const uint8_t subsequent_calls_may_write = found_ow->second.subsequentWrites;
+    const std::vector<bool> &overwritten_args = found_ow->second.overwrittenArgs;
 
     IRBuilder<> BuilderZ(gutils->getNewFromOriginal(&call));
     BuilderZ.setFastMathFlags(getFast());
@@ -7177,12 +7174,12 @@ public:
         (Mode == DerivativeMode::ForwardMode ||
          Mode == DerivativeMode::ForwardModeError)
             ? false
-            : overwritten_args_map.find(&call)->second.first;
+            : overwritten_args_map.find(&call)->second.subsequentWrites;
     const std::vector<bool> &overwritten_args =
         (Mode == DerivativeMode::ForwardMode ||
          Mode == DerivativeMode::ForwardModeError)
             ? std::vector<bool>()
-            : overwritten_args_map.find(&call)->second.second;
+            : overwritten_args_map.find(&call)->second.overwrittenArgs;
 
     auto called = getFunctionFromCall(&call);
 

@@ -249,6 +249,12 @@ LLVMValueRef EnzymeGradientUtilsInvertPointer(GradientUtils *gutils,
                                               LLVMValueRef val,
                                               LLVMBuilderRef builder);
 
+int64_t EnzymeGradientUtilsGetSubsequentStores(GradientUtils *gutils,
+                                               LLVMValueRef orig,
+                                               uint8_t *unclassified,
+                                               LLVMValueRef *stores,
+                                               uint64_t capacity);
+
 // TODO: Other API functions that are defined in CApi.cpp for GradientUtils
 void *EnzymeGradientUtilsGetExternalContext(GradientUtils *gutils);
 EnzymeLogicRef EnzymeTypeAnalyzerGetLogic(void *analyzer);

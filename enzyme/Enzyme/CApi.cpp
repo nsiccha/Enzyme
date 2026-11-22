@@ -621,7 +621,7 @@ uint8_t EnzymeGradientUtilsGetUncacheableArgs(GradientUtils *gutils,
   }
   assert(found != gutils->overwritten_args_map_ptr->end());
 
-  const std::vector<bool> &overwritten_args = found->second.second;
+  const std::vector<bool> &overwritten_args = found->second.overwrittenArgs;
 
   if (size != overwritten_args.size()) {
     llvm::errs() << " orig: " << *call << "\n";
@@ -634,6 +634,26 @@ uint8_t EnzymeGradientUtilsGetUncacheableArgs(GradientUtils *gutils,
     data[i] = overwritten_args[i];
   }
   return 1;
+}
+
+static const CallOverwriteInfo *lookupCallWrites(GradientUtils *gutils,
+                                                 LLVMValueRef orig) {
+  if (gutils->mode == DerivativeMode::ForwardMode ||
+      gutils->mode == DerivativeMode::ForwardModeError)
+    return nullptr;
+
+  if (!gutils->overwritten_args_map_ptr)
+    return nullptr;
+
+  auto call = dyn_cast<CallInst>(unwrap(orig));
+  if (!call)
+    return nullptr;
+
+  auto found = gutils->overwritten_args_map_ptr->find(call);
+  if (found == gutils->overwritten_args_map_ptr->end())
+    return nullptr;
+
+  return &found->second;
 }
 
 /// The writes that follow the call orig and that its callee cannot see: those
@@ -650,23 +670,31 @@ uint8_t EnzymeGradientUtilsGetUncacheableArgs(GradientUtils *gutils,
 uint8_t EnzymeGradientUtilsGetSubsequentWrites(GradientUtils *gutils,
                                                LLVMValueRef orig,
                                                uint8_t *writes) {
-  if (gutils->mode == DerivativeMode::ForwardMode ||
-      gutils->mode == DerivativeMode::ForwardModeError)
+  auto info = lookupCallWrites(gutils, orig);
+  if (!info)
     return 0;
-
-  if (!gutils->overwritten_args_map_ptr)
-    return 0;
-
-  auto call = dyn_cast<CallInst>(unwrap(orig));
-  if (!call)
-    return 0;
-
-  auto found = gutils->overwritten_args_map_ptr->find(call);
-  if (found == gutils->overwritten_args_map_ptr->end())
-    return 0;
-
-  *writes = found->second.first;
+  *writes = info->subsequentWrites;
   return 1;
+}
+
+/// Report local stores for a custom rule and the kinds of writes that remain
+/// unclassified. Query the count with stores == nullptr, then supply a buffer
+/// of that length. A deleted store yields a null entry (assume any write).
+/// Return -1 when no record is available.
+int64_t EnzymeGradientUtilsGetSubsequentStores(GradientUtils *gutils,
+                                               LLVMValueRef orig,
+                                               uint8_t *unclassified,
+                                               LLVMValueRef *stores,
+                                               uint64_t capacity) {
+  auto info = lookupCallWrites(gutils, orig);
+  if (!info)
+    return -1;
+  *unclassified = info->unclassifiedWrites;
+  if (stores && capacity >= info->stores.size()) {
+    for (size_t i = 0; i < info->stores.size(); ++i)
+      stores[i] = wrap(static_cast<Value *>(info->stores[i]));
+  }
+  return info->stores.size();
 }
 
 CTypeTreeRef EnzymeGradientUtilsAllocAndGetTypeTree(GradientUtils *gutils,

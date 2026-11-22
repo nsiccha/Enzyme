@@ -16,6 +16,7 @@
 
 #include "CApi.h"
 #include "llvm-c/Core.h"
+#include <cstdio>
 
 /// Custom augmented forward handler for `__enzyme_test_arg_shadow(ptr %p)`.
 /// Forwards the shadow of `%p` as the call's shadow return, exercising
@@ -93,6 +94,25 @@ static uint8_t forwardArgSelf(LLVMBuilderRef builder, LLVMValueRef call,
   return 0;
 }
 
+// Print the analysis seen by an augmented custom call, including the store's
+// destination. The fixture supplies one local store to a named global.
+static uint8_t forwardReportStores(LLVMBuilderRef builder, LLVMValueRef call,
+                                   GradientUtils *gutils, LLVMValueRef *normal,
+                                   LLVMValueRef *shadow, LLVMValueRef *tape) {
+  uint8_t other = 0;
+  auto count = EnzymeGradientUtilsGetSubsequentStores(gutils, call, &other,
+                                                      nullptr, 0);
+  LLVMValueRef store = nullptr;
+  if (count == 1 &&
+      EnzymeGradientUtilsGetSubsequentStores(gutils, call, &other, &store, 1) ==
+          count &&
+      store && LLVMIsAStoreInst(store)) {
+    std::fprintf(stderr, "local store to %s, unclassified writes %u\n",
+                 LLVMGetValueName(LLVMGetOperand(store, 1)), unsigned(other));
+  }
+  return forwardArgSelf(builder, call, gutils, normal, shadow, tape);
+}
+
 namespace {
 struct RegisterTestCallHandlers {
   RegisterTestCallHandlers() {
@@ -100,6 +120,8 @@ struct RegisterTestCallHandlers {
                               reverseNoOp);
     EnzymeRegisterCallHandler("__enzyme_test_arg_tape", forwardArgTape,
                               reverseArgTape);
+    EnzymeRegisterCallHandler("__enzyme_test_report_stores", forwardReportStores,
+                              reverseNoOp);
     EnzymeRegisterCallHandler("__enzyme_test_arg_self", forwardArgSelf,
                               reverseNoOp);
   }
