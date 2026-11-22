@@ -790,6 +790,18 @@ def uplo_to_trans : IntMatchers<
     ["'l'", "'L'", "'U'", "'u'"],
     ["'t'", "'T'", "'N'", "'n'"]
     >;
+// The two above with a conjugate transpose: 'C' for a complex routine, where
+// the Hermitian factorizations need op(A) = A^H, and 'T' otherwise.
+def uplo_to_normal_conj : IntMatchers<
+    "charType", "charType",
+    ["'l'", "'L'", "'U'", "'u'"],
+    ["'n'", "'N'", "(blas.isComplex() ? 'C' : 'T')", "(blas.isComplex() ? 'c' : 't')"]
+    >;
+def uplo_to_conjtrans : IntMatchers<
+    "charType", "charType",
+    ["'l'", "'L'", "'U'", "'u'"],
+    ["(blas.isComplex() ? 'c' : 't')", "(blas.isComplex() ? 'C' : 'T')", "'N'", "'n'"]
+    >;
 def uplo_to_side : IntMatchers<
     "charType", "charType",
     ["'l'", "'L'", "'U'", "'u'"],
@@ -866,11 +878,15 @@ def potrf: CallBlasPattern<(Op $layout, $uplo, $n, $A, $lda, $info),
                   (Seq<["tri", "triangular", "n"], [], 0>
                       (BlasCall<"lacpy"> $layout, (flip_uplo $uplo), $n, $n, (Shadow $A), use<"tri">, $n),
                       
+                      // The full Hermitian (real: symmetric) tangent of A from its
+                      // stored triangle: the other triangle is conjugated and, for a
+                      // complex routine, the imaginary part of the diagonal is dropped,
+                      // since potrf reads only the real part of the diagonal.
                       (CopyLowerToUpper<""> $layout, $uplo, (Shadow $A), $n),
                       
-                      // Actual Math
-                      (BlasCall<"trsm"> $layout, Char<"L">, $uplo, (uplo_to_normal $uplo), Char<"N">, $n, $n, Constant<"1.0">, $A, $lda, (Shadow $A)),
-                      (BlasCall<"trsm"> $layout, Char<"R">, $uplo, (uplo_to_trans $uplo), Char<"N">, $n, $n, Constant<"1.0">, $A, $lda, (Shadow $A)),
+                      // Actual Math: L^{-1} dA L^{-H} (lower) or U^{-H} dA U^{-1} (upper)
+                      (BlasCall<"trsm"> $layout, Char<"L">, $uplo, (uplo_to_normal_conj $uplo), Char<"N">, $n, $n, Constant<"1.0">, $A, $lda, (Shadow $A)),
+                      (BlasCall<"trsm"> $layout, Char<"R">, $uplo, (uplo_to_conjtrans $uplo), Char<"N">, $n, $n, Constant<"1.0">, $A, $lda, (Shadow $A)),
                       (BlasCall<"scal"> $n, Constant<"0.5">, (First (Shadow $A)), (Add $lda, ConstantInt<1>)),
 
                      (Seq<["tmp", "vector", "n"], [], 1>

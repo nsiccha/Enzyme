@@ -1357,7 +1357,7 @@ void rev_call_arg(bool forward, const DagInit *ruleDag,
       os << "{mat_" << name << "}";
     } else if (Def->isSubClassOf("Constant")) {
       auto val = Def->getValueAsString("value");
-      os << "{to_blas_fp_callconv(Builder2, ConstantFP::get(fpType, " << val
+      os << "{to_blas_fp_callconv(Builder2, blasFPConstant(fpType, " << val
          << "), byRefFloat, blasFPType, allocationBuilder, \"constant.fp."
          << val << "\")}";
     } else if (Def->isSubClassOf("Char")) {
@@ -2084,7 +2084,7 @@ void emit_dag(bool forward, Twine resultVarName, const DagInit *ruleDag,
       item("out", base + 7);
     }
     if (constScale)
-      os << "        SmallVector<Value *, 1> soz_scale = {ConstantFP::get("
+      os << "        SmallVector<Value *, 1> soz_scale = {blasFPConstant("
             "fpType, "
          << scaleDef->getDef()->getValueAsString("value") << ")};\n";
     else

@@ -1291,6 +1291,23 @@ Type *BlasInfo::fpType(LLVMContext &ctx, bool to_scalar) const {
   }
 }
 
+bool BlasInfo::isComplex() const {
+  return floatType == "c" || floatType == "C" || floatType == "z" ||
+         floatType == "Z";
+}
+
+Constant *blasFPConstant(Type *fpType, double val) {
+  if (auto VT = dyn_cast<FixedVectorType>(fpType)) {
+    // A complex BLAS scalar: (re, im). Only the real part carries the value.
+    assert(VT->getNumElements() == 2);
+    auto elTy = VT->getElementType();
+    Constant *parts[2] = {ConstantFP::get(elTy, val),
+                          ConstantFP::get(elTy, 0.0)};
+    return ConstantVector::get(parts);
+  }
+  return ConstantFP::get(fpType, val);
+}
+
 IntegerType *BlasInfo::intType(LLVMContext &ctx) const {
   if (is64)
     return IntegerType::get(ctx, 64);
@@ -1783,9 +1800,58 @@ void copy_lower_to_upper(llvm::IRBuilder<> &B, llvm::Function *called, llvm::Typ
   LB.CreateCall(copyfn, copyArgs);
   if (auto F = GetFunctionFromValue(copyfn.getCallee()))
     attributeKnownFunctions(*F);
+
+  // A complex routine reads the stored triangle of a Hermitian matrix: the
+  // other triangle is the conjugate of the stored one. Conjugate the copy in
+  // place with LAPACK's ?lacgv (N, X, INCX). cuBLAS has no such routine and
+  // no Hermitian factorization that uses this helper.
+  const bool conjugate = blas.isComplex() && !cublas;
+  if (conjugate) {
+    Value *lacgvArgs[] = {countArg, bArg, incBArg};
+    Type *lacgvTys[] = {lacgvArgs[0]->getType(), lacgvArgs[1]->getType(),
+                        lacgvArgs[2]->getType()};
+    FunctionType *LFT = FunctionType::get(B.getVoidTy(), lacgvTys, false);
+    auto lacgv_name = std::string(blas.prefix) + blas.floatType + "lacgv" +
+                      blas.suffix;
+    auto lacgvfn = getOrInsertPerCallingConv(M, called, lacgv_name, LFT);
+    LB.CreateCall(lacgvfn, lacgvArgs);
+  }
   LB.CreateCondBr(LB.CreateICmpEQ(i_plus_one, N_minus_1), end, loop);
 
-  EB.CreateCondBr(EB.CreateICmpSLE(N_minus_1, zero), end, loop);
+  if (conjugate) {
+    // The diagonal of a Hermitian matrix is real: the routine reads only its
+    // real part, so the imaginary part of each diagonal entry is dropped.
+    BasicBlock *diag = BasicBlock::Create(M.getContext(), "diag", F);
+    BasicBlock *diagEnd = BasicBlock::Create(M.getContext(), "diag.end", F);
+    EB.CreateCondBr(EB.CreateICmpSLE(Narg, zero), diagEnd, diag);
+
+    IRBuilder<> DB(diag);
+    auto j = DB.CreatePHI(intType, 2);
+    j->addIncoming(zero, entry);
+    auto j_plus_one = DB.CreateAdd(j, one, "", true, true);
+    j->addIncoming(j_plus_one, diag);
+    // Store a zero imaginary part as a scalar: the element is only as aligned
+    // as its real type, not as a vector of two would be.
+    Value *dptr = lookup_with_layout(DB, fpType, layoutarg, Aarg, ldaarg, j, j);
+    auto elTy = cast<FixedVectorType>(fpType)->getElementType();
+    if (dptr->getType()->isIntegerTy())
+      dptr = DB.CreateIntToPtr(dptr, getUnqual(elTy));
+    else
+      dptr = DB.CreatePointerCast(
+          dptr,
+          getPointerType(elTy,
+                         cast<PointerType>(dptr->getType())->getAddressSpace()));
+    Value *imptr = DB.CreateConstInBoundsGEP1_64(elTy, dptr, 1);
+    DB.CreateStore(ConstantFP::get(elTy, 0.0), imptr);
+    DB.CreateCondBr(DB.CreateICmpEQ(j_plus_one, Narg), diagEnd, diag);
+
+    IRBuilder<> DEB(diagEnd);
+    DEB.CreateCondBr(DEB.CreateICmpSLE(N_minus_1, zero), end, loop);
+    // The loop's first iteration now comes from diag.end, not entry.
+    i->setIncomingBlock(0, diagEnd);
+  } else {
+    EB.CreateCondBr(EB.CreateICmpSLE(N_minus_1, zero), end, loop);
+  }
   {
     IRBuilder<> B(end);
     B.CreateRetVoid();

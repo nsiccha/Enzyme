@@ -898,6 +898,8 @@ struct BlasInfo {
 
   llvm::Type *fpType(llvm::LLVMContext &ctx, bool to_scalar = false) const;
   llvm::IntegerType *intType(llvm::LLVMContext &ctx) const;
+  /// Whether the routine works on complex numbers (the c and z routines).
+  bool isComplex() const;
 };
 
 #if LLVM_VERSION_MAJOR >= 16
@@ -2730,6 +2732,12 @@ llvm::Value *to_blas_fp_callconv(llvm::IRBuilder<> &B, llvm::Value *V,
                                  bool byRef, llvm::Type *julia_decl,
                                  llvm::IRBuilder<> &entryBuilder,
                                  llvm::Twine const & = "");
+
+/// The BLAS scalar `val` in the type `fpType` of a BLAS routine. A complex
+/// routine's scalar is a two-element vector holding the real and the imaginary
+/// part, so a real constant is (val, 0), never the splat (val, val), which
+/// would be val + val * im.
+llvm::Constant *blasFPConstant(llvm::Type *fpType, double val);
 
 llvm::Value *get_cached_mat_width(llvm::IRBuilder<> &B,
                                   llvm::ArrayRef<llvm::Value *> trans,
