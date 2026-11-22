@@ -3,14 +3,14 @@
   "line": {
     "repo": "nsiccha/Enzyme",
     "ref": "dogfood",
-    "sha": "68a07ff37d599682474dfda7e2fc324620e690d2"
+    "sha": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
   },
   "upstream": {
     "repo": "EnzymeAD/Enzyme",
     "ref": "main",
-    "sha": "0fa6f8401af6b8211a783213643692be20508842"
+    "sha": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea"
   },
-  "prepared_at": "2026-11-19T03:35:25+00:00",
+  "prepared_at": "2026-11-22T05:46:03+00:00",
   "problems": [
     {
       "id": "mlir-custom-reverse-rules",
@@ -235,6 +235,28 @@
           "result": "passed",
           "detail": "PR #3324 records 218 MLIR tests, 24 pipeline cases, 1,394 Enzyme-JAX tests and 15 frontend checks on its earlier source combination.",
           "evidence": "https://github.com/EnzymeAD/Enzyme/pull/3324"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 24 MLIR optimizer built from the compiled Enzyme revision 09f4483f63f8a730e227e25040f425c9252bfbd5. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/MLIR/Batch/custom_rule.mlir",
+            "enzyme/test/MLIR/ReverseMode/custom_rule_control_flow.mlir",
+            "enzyme/test/MLIR/ReverseMode/custom_rule_multi_call.mlir",
+            "enzyme/test/MLIR/ReverseMode/custom_rule_sets.mlir",
+            "enzyme/test/MLIR/ReverseMode/custom_rule_tensor.mlir",
+            "enzyme/test/MLIR/ReverseMode/func.mlir",
+            "enzyme/test/MLIR/ReverseMode/func_call_write.mlir",
+            "enzyme/test/MLIR/ReverseMode/mul_strongzero.mlir",
+            "enzyme/test/MLIR/ReverseMode/multiret2.mlir",
+            "enzyme/test/MLIR/ReverseMode/need_rule_set.mlir",
+            "enzyme/test/MLIR/ReverseMode/nested_custom_rule.mlir",
+            "enzyme/test/MLIR/ReverseMode/recursion.mlir",
+            "enzyme/test/MLIR/ReverseMode/split_mode.mlir",
+            "enzyme/test/MLIR/ReverseMode/wrap_lowers_custom_rules.mlir"
+          ],
+          "native_build": "b1722662c27bd0cda00d5b981b8aaeaced551c6d2978c217d2df57e58ac5f2b8"
         }
       ],
       "draft": {
@@ -387,6 +409,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. The emitted pointer and by-value calling conventions both passed FileCheck. Each executable matched 12 central differences across four inputs, with maximum absolute error 9.93e-12."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/tapebyref.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [],
@@ -539,6 +570,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/ActivityAnalysis/reevaluation.cpp"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -650,6 +690,15 @@
           ],
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. LLVM 16.0.6 lit reported PASS for 1 named fixtures on that source revision.",
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/ActivityAnalysis/memorysearch.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -824,6 +873,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 6000 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/blas/gemm_f_c_only_C.ll",
+            "enzyme/test/Enzyme/ForwardMode/blas/gemv_f_c_only_y.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -1239,6 +1298,38 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Two adjoint seeds produced the analytic alpha gradient and cleared all nine entries of the overwritten output adjoint."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/blas/copy_f_only_y.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/cblas_dgemm_active_alpha.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/copy_f.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/dlacpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c_lacpy_runtime_act.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c_loop.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c_split.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c_split_lacpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c_split_transpose_lacpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_c_transpose_lacpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_change_ld.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_over.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemm_f_over_lacpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemv_c_loop2.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemv_c_loop3_matcopy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemv_f_c_split_blascpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemv_f_c_split_blascpy_runtime_act.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemv_f_c_split_memcpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/gemv_f_overwritten_y.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/spmv_f_c_lacpy.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/syrk_f.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas_diffuse.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -1470,6 +1561,18 @@
           "bounds": "default and checked",
           "result": "passed",
           "detail": "The unified Enzyme library and bitcode loader were rebuilt against LLVM 20.1.8. With Enzyme.jl 962fc64c and Gen 0.4.9, both bounds modes passed 3/3 dynamic trace updates and 4/4 static Map assertions. Each run verified 491 Enzyme.jl source files and the hashes of the loaded libraries."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/TypeAnalysis/julia_boxed_elements.ll",
+            "enzyme/test/TypeAnalysis/julia_dispatch_layout.ll",
+            "enzyme/test/TypeAnalysis/julia_distinct_boxes.ll",
+            "enzyme/test/TypeAnalysis/nonstrictdangling.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -1625,6 +1728,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/multiwaymergepredicates.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -1780,6 +1892,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/combinedcondret.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -2018,6 +2139,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/strict-log-exp.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -2173,6 +2303,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/mincut-derived-load.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -2328,6 +2467,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/TypeAnalysis/explicit_large_layout.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -2696,6 +2844,27 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 47108 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/div.ll",
+            "enzyme/test/Enzyme/ForwardMode/divconst.ll",
+            "enzyme/test/Enzyme/ForwardMode/divf.ll",
+            "enzyme/test/Enzyme/ForwardMode/divl.ll",
+            "enzyme/test/Enzyme/ForwardMode/divreduce.ll",
+            "enzyme/test/Enzyme/ForwardMode/divreduce2.ll",
+            "enzyme/test/Enzyme/ForwardMode/fdiv_overflow.ll",
+            "enzyme/test/Enzyme/ForwardModeSplit/div.ll",
+            "enzyme/test/Enzyme/ForwardModeSplit/divreduce.ll",
+            "enzyme/test/Enzyme/ForwardModeSplit/divreduce2.ll",
+            "enzyme/test/Enzyme/ForwardModeVector/div.ll",
+            "enzyme/test/Enzyme/ForwardModeVector/divreduce.ll",
+            "enzyme/test/Enzyme/ForwardModeVector/divreduce2.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -2932,6 +3101,18 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 34 passed and 2 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/blas/dlascl.ll",
+            "enzyme/test/Enzyme/ForwardMode/blas/gemm_f_active_beta.ll",
+            "enzyme/test/Enzyme/ForwardMode/nodefinition-twice.ll",
+            "enzyme/test/Enzyme/ReverseMode/blas/dlascl.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -3087,6 +3268,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/constantfree.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -3305,6 +3495,18 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/xortapetype.ll",
+            "enzyme/test/Enzyme/JuliaCallingConvention/sret_typed_tracked_root.ll",
+            "enzyme/test/Enzyme/ReverseMode/tapevaluetype.ll",
+            "enzyme/test/Enzyme/ReverseMode/unwrapload.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -3535,6 +3737,23 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 64 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/captured-pointer-int.ll",
+            "enzyme/test/Enzyme/ReverseMode/captured-pointer.ll",
+            "enzyme/test/Enzyme/ReverseMode/captured-size.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-earlier.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-offset.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-overwritten.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-unmarked.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-wrongfield.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -3829,6 +4048,27 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 64 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer-captured.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer-operand.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer-prior.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer-replaced.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer-returned-input.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer-unannotated.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-argument-writer.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-writer-merged-existing.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-writer-merged.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-writer-overwritten.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-writer-unmarked.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-writer-wrongfield.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-writer.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -4059,6 +4299,23 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 64 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/fresh-object-earlier.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-object-maybealias.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-object.ll",
+            "enzyme/test/Enzyme/ReverseMode/local-readonly-or-throw-follower-sret.ll",
+            "enzyme/test/Enzyme/ReverseMode/local-readonly-or-throw-follower.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-merged-existing.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-merged.ll",
+            "enzyme/test/Enzyme/ReverseMode/readonly-or-throw-follower-unmarked.ll",
+            "enzyme/test/Enzyme/ReverseMode/readonly-or-throw-follower.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -4384,6 +4641,30 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 64 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/fresh-array-resized-operand.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-array-resized.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-filled-by-calls-replaced.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-filled-by-calls.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-filled-with-new-arrays-replaced.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-filled-with-new-arrays.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-loop-iteration-replaced.ll",
+            "enzyme/test/Enzyme/ReverseMode/fresh-storage-loop-iteration.ll",
+            "enzyme/test/Enzyme/ReverseMode/mutually-recursive-writer-operand.ll",
+            "enzyme/test/Enzyme/ReverseMode/mutually-recursive-writer.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-writer-product-input.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-writer-product-unmarked.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-writer-product.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-writer-recursive.ll",
+            "enzyme/test/Enzyme/ReverseMode/received-pointer-slot-derived.ll",
+            "enzyme/test/Enzyme/ReverseMode/received-pointer-slot.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -4554,6 +4835,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/julia_gc_alloc_zeroing_bundles.ll",
+            "enzyme/test/Enzyme/ReverseMode/julia_gc_alloc_zeroing_bundles.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -4709,6 +5000,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/fromstack_ascast_pointee.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -4903,6 +5203,19 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/load-local-readonly-or-throw-follower-sret.ll",
+            "enzyme/test/Enzyme/ReverseMode/load-local-readonly-or-throw-follower.ll",
+            "enzyme/test/Enzyme/ReverseMode/load-readonly-or-throw-follower-unmarked.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-numbers-read.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-pointer-read.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -5014,6 +5327,15 @@
           ],
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. LLVM 16.0.6 lit reported PASS for 1 named fixtures on that source revision.",
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/TypeAnalysis/sdivknownzero.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -5176,6 +5498,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/loop-carried-allocation.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -5295,6 +5626,16 @@
           ],
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. LLVM 16.0.6 lit reported PASS for 2 named fixtures on that source revision.",
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/loopyreduction-fdiv-inloop-use.ll",
+            "enzyme/test/Enzyme/ReverseMode/loopyreduction-select-inloop-use.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -5549,6 +5890,21 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardModeSplit/rwloop.ll",
+            "enzyme/test/Enzyme/ForwardModeSplit/sumsimple.ll",
+            "enzyme/test/Enzyme/ForwardModeSplit/sumsimpleoptnone.ll",
+            "enzyme/test/Enzyme/ReverseMode/loopinvariantcache.ll",
+            "enzyme/test/Enzyme/ReverseMode/reorderrep.ll",
+            "enzyme/test/Enzyme/ReverseMode/rwrloop.ll",
+            "enzyme/test/Enzyme/ReverseMode/usedinlastiter.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -5660,6 +6016,15 @@
           ],
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. LLVM 16.0.6 lit reported PASS for 1 named fixtures on that source revision.",
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/mergesplitcond.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -5822,6 +6187,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/TypeAnalysis/norecur_cast_seed.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -6024,6 +6398,20 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-backedge.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-operand.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-private.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-published.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-replaced.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-pointer-earlier.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -6263,6 +6651,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. A private copy of Enzyme.jl 61a65ac33ab9 declared the tested native build. Its repair query enabled the grouped-cache comparisons and the original fixture passed all 151 assertions, including 64 that are conditional on that capability."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/ragged-cache-group.ll",
+            "enzyme/test/Enzyme/ReverseMode/triangular.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -6490,6 +6888,20 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardModeSplit/rwloop.ll",
+            "enzyme/test/Enzyme/ReverseMode/metacachelicm.ll",
+            "enzyme/test/Enzyme/ReverseMode/metacachelicm2.ll",
+            "enzyme/test/Enzyme/ReverseMode/ragged-cache-chunk.ll",
+            "enzyme/test/Enzyme/ReverseMode/reversecacheunwrap.ll",
+            "enzyme/test/Enzyme/ReverseMode/triangular.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -6653,6 +7065,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/hoisted_negative_sublimit.ll",
+            "enzyme/test/Enzyme/ReverseMode/ragged-cache-chunk.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -6808,6 +7230,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/julia_array_data_remat_call.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -6963,6 +7394,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/rematerialized-store-cycle.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -7082,6 +7522,16 @@
           ],
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. LLVM 16.0.6 lit reported PASS for 2 named fixtures on that source revision.",
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/dynamicloop-replay-once-directuse.ll",
+            "enzyme/test/Enzyme/ReverseMode/dynamicloop-replay-once.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -7251,6 +7701,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/readonlyorthrow_returned_memory.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -7446,6 +7905,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/cacheSizing.ll",
+            "enzyme/test/Enzyme/ReverseMode/loopentryavailable.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -7748,6 +8217,26 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/callundefinphi.ll",
+            "enzyme/test/Enzyme/ReverseMode/callundefinphi2.ll",
+            "enzyme/test/Enzyme/ReverseMode/fwdsolve.ll",
+            "enzyme/test/Enzyme/ReverseMode/insertsort.ll",
+            "enzyme/test/Enzyme/ReverseMode/loopentryrecompute.ll",
+            "enzyme/test/Enzyme/ReverseMode/matdescent.ll",
+            "enzyme/test/Enzyme/ReverseMode/mm.ll",
+            "enzyme/test/Enzyme/ReverseMode/mm2.ll",
+            "enzyme/test/Enzyme/ReverseMode/overwrite_outer_loop.ll",
+            "enzyme/test/Enzyme/ReverseMode/rwrloop.ll",
+            "enzyme/test/Enzyme/ReverseMode/sharedcachefwd.ll",
+            "enzyme/test/Enzyme/ReverseMode/unwrap_group.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -7903,6 +8392,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/loopentrymerge.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -8014,6 +8512,15 @@
           ],
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. LLVM 16.0.6 lit reported PASS for 1 named fixtures on that source revision.",
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/switchunreachableremat_case.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -8202,6 +8709,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/negating-sign-closed-form.ll",
+            "enzyme/test/Enzyme/ReverseMode/selectstrongzero.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -8364,6 +8881,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/selectstrongzero.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -8530,6 +9056,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "result": "passed",
           "detail": "Earlier staged source 0eb02b67a608a788886dd1adbbc5cb900e2818e7. Enzyme.jl 81d83dd7e2d7b377891a141b235d032da35674c7 with LLVM.jl 10.4.3 and GPUCompiler 2.23.3 tested updated consumer fixtures. Julia reported 76 passed and 0 marked broken or skipped. Both native libraries were verified."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/cache_for_reverse_arg.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -8685,6 +9220,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/siblingloopload.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -8860,6 +9404,17 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/adjoint-reduction-permission-extra.ll",
+            "enzyme/test/Enzyme/ReverseMode/adjoint-reduction-permission.ll",
+            "enzyme/test/Enzyme/ReverseMode/adjoint-reduction-tiny.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -9015,6 +9570,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/phisplitcond.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -9185,6 +9749,16 @@
           ],
           "result": "failed",
           "detail": "With Enzyme.jl 01d65bc18c40, the preceding combined native source failed 10 of 12 assertions. Scalar, batched, mixture and masked reverse cases returned NaN. Both loaded library paths were checked."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ForwardMode/strongzero_math.ll",
+            "enzyme/test/Enzyme/ReverseMode/strongzero_math.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -9347,6 +9921,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/strict-log-exp.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -9542,6 +10125,16 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/constant-indirect-callee.ll",
+            "enzyme/test/Enzyme/SimpleGVN/indirect_callee.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -9697,6 +10290,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/typedlaterwrite.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -9852,6 +10454,15 @@
           "native_build": "0eb02b67a608a788886dd1adbbc5cb900e2818e7",
           "julia": "1.10.12",
           "bounds": "default"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/JuliaCallingConvention/restored_returnroots_removed_args.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
         }
       ],
       "requires": [
@@ -10083,6 +10694,521 @@
           "native_build": "Enzyme c344b930392fe0a5ef75dcc9dedfb96ff2584f7e with LLVM 24 bc0683cc7ba1e08ed32aa7e07a5d0589e084c29f",
           "result": "passed",
           "detail": "Each source file passed Clang syntax checking with the LLVM 24 headers and generated tables used by the Reactant CPU build."
+        }
+      ]
+    },
+    {
+      "id": "native-ccall-computed-blas-library",
+      "role": "fix",
+      "title": "Reverse BLAS rules leave the library that a computed-library ccall selected",
+      "summary": "A BLAS or LAPACK call whose library is chosen when the call site first runs, such as ccall((:dlacpy_64_, lib()), ...), keeps its primal on that library. The reverse rule's cache copies and helper routines, such as dcopy and daxpy, were taken from another provider. The rules now use the library of the call site for the primal and for every helper routine.",
+      "repairs": [
+        {
+          "id": "ccall_computed_blas_library",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "cb1e89666f23b474fae1bb7a819fe23413487fe9",
+            "title": "Use the primal BLAS library for cache copies and helper routines",
+            "original": [
+              "cb1e89666f23b474fae1bb7a819fe23413487fe9"
+            ]
+          }
+        ],
+        "why_together": "One native commit changes the C API entry point, the BLAS rule generator and its cache helper, and adds the IR regression test."
+      },
+      "depends_on": [],
+      "draft": {
+        "title": "Reverse BLAS rules leave the library that a computed-library ccall selected",
+        "body": "A Julia call such as `ccall((:dlacpy_64_, lib()), ...)` can resolve the library at the call site. Enzyme uses the selected provider for the primal call, but a reverse BLAS rule can resolve the vector copy or accumulation helper from a different library. The generated helper calls should use the handle of the primal call. The regression checks the library operand of the generated calls.\n\n[ccall_library_copy.ll](https://github.com/nsiccha/Enzyme/blob/cb1e89666f23b474fae1bb7a819fe23413487fe9/enzyme/test/Enzyme/ReverseMode/blas/ccall_library_copy.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/blas/ccall_library_copy.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        }
+      ]
+    },
+    {
+      "id": "native-ragged-cache-levels",
+      "role": "fix",
+      "title": "Boolean and aggregate reverse caches allocate once per entry of a ragged loop nest",
+      "summary": "When an inner loop's extent is known only inside an enclosing loop, Reverse caches of Boolean values, fixed-size vectors and pointer-free arrays or structures were allocated at every entry of the outer loop, and nests of three or more chunks were not packed at all. These caches now use one growing value buffer with one offset buffer per additional chunk level, and compatible caches of a combined Reverse derivative share them.",
+      "repairs": [
+        {
+          "id": "ragged_cache_levels",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "2528afe8490e74f86fde7f0b054a83a281d12e3f",
+            "title": "Pack ragged cache levels and pointer-free records in growable buffers",
+            "original": [
+              "2528afe8490e74f86fde7f0b054a83a281d12e3f"
+            ]
+          }
+        ],
+        "why_together": "One native commit generalises the packed cache layout to further chunk levels and element kinds, updates three existing cache fixtures and adds two."
+      },
+      "depends_on": [
+        "native-packed-ragged-cache",
+        "native-packed-cache-groups"
+      ],
+      "draft": {
+        "title": "Boolean and aggregate reverse caches allocate once per entry of a ragged loop nest",
+        "body": "Reverse differentiation of nested loops with variable inner extents can emit an allocation for every outer-loop entry. This also affects Boolean values and pointer-free records. The values can share one growable buffer, with offsets into it for each additional ragged level. The linked LLVM IR cases exercise nested ragged extents and pointer-free records.\n\n[ragged-cache-levels.ll](https://github.com/nsiccha/Enzyme/blob/2528afe8490e74f86fde7f0b054a83a281d12e3f/enzyme/test/Enzyme/ReverseMode/ragged-cache-levels.ll) · [ragged-cache-records.ll](https://github.com/nsiccha/Enzyme/blob/2528afe8490e74f86fde7f0b054a83a281d12e3f/enzyme/test/Enzyme/ReverseMode/ragged-cache-records.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/fixlcssabug.ll",
+            "enzyme/test/Enzyme/ReverseMode/loadisload.ll",
+            "enzyme/test/Enzyme/ReverseMode/ragged-cache-levels.ll",
+            "enzyme/test/Enzyme/ReverseMode/ragged-cache-records.ll",
+            "enzyme/test/Enzyme/ReverseMode/reversecacheunwrap.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        }
+      ]
+    },
+    {
+      "id": "native-gc-preserve-branch",
+      "role": "fix",
+      "title": "Reverse does not handle a GC preserve region that ends on two branching paths",
+      "summary": "A Julia GC.@preserve region can end on two paths that then branch to the same pair of destinations. A broadcast writer that checks for storage overlap and copies through a temporary has this shape. Enzyme now rejoins the two ends into one before it reverses the region.",
+      "repairs": [
+        {
+          "id": "gc_preserve_branch",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "relation": "related",
+          "url": "https://github.com/EnzymeAD/Enzyme/pull/3210"
+        },
+        {
+          "relation": "related",
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/3404"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "09013d217ca615c127c5e2f64ee2c158eecf544e",
+            "title": "Rejoin branching Julia GC preserve ends before reversing them",
+            "original": [
+              "09013d217ca615c127c5e2f64ee2c158eecf544e"
+            ]
+          },
+          {
+            "sha": "07828590b87824f583f2441f0b393b6a36c49c12",
+            "title": "Use the LLVM branch helpers when rejoining GC preserve ends",
+            "original": [
+              "07828590b87824f583f2441f0b393b6a36c49c12"
+            ]
+          }
+        ],
+        "why_together": "The first commit implements the CFG transformation and its IR regression. The second compiles the same transformation with the split branch instructions in LLVM 24 and the control-flow hub interface in LLVM 20 and later."
+      },
+      "depends_on": [],
+      "draft": {
+        "title": "Reverse does not handle a GC preserve region that ends on two branching paths",
+        "body": "A Julia GC preserve region can end in either arm of a branch. Both arms can subsequently branch to the same destinations in different orders, and another path can bypass the region entirely. Reverse mode needs a single matching preserve end while retaining the incoming values of the successor PHIs. The attached IR gives this control flow and checks the differentiated function.\n\n[gcpres-branch.ll](https://github.com/nsiccha/Enzyme/blob/09013d217ca615c127c5e2f64ee2c158eecf544e/enzyme/test/Enzyme/ReverseMode/gcpres-branch.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "tests": [],
+          "detail": "Clang compiled the affected FunctionUtils.cpp translation unit in syntax-only mode at 09f4483f63f8a730e227e25040f425c9252bfbd5 using the Bazel-generated headers and defines from XLA’s LLVM bc0683cc. The preceding build had failed on the branch instruction class and the return type of ControlFlowHub::finalize."
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/gcpres-branch.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        }
+      ]
+    },
+    {
+      "id": "native-conditional-use-adjoints",
+      "role": "fix",
+      "title": "Reverse returns NaN when arithmetic hoisted out of a skipped branch meets an infinite value",
+      "summary": "A loop can skip an infinite endpoint and still return NaN gradients. LLVM moves the subtraction, division and square in front of the loop, only the branch for finite endpoints uses the result, and reversing the hoisted arithmetic multiplies a zero adjoint by infinity. Enzyme now recognises when control flow can skip every use that carries a derivative and protects those partial products.",
+      "repairs": [
+        {
+          "id": "conditional_use_adjoints",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "relation": "related",
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/2285"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "593c7937cc90695ddd9c6ef31aa93f3c55e45eeb",
+            "title": "Preserve zero adjoints in speculated arithmetic with conditional uses",
+            "original": [
+              "593c7937cc90695ddd9c6ef31aa93f3c55e45eeb"
+            ]
+          }
+        ],
+        "why_together": "One native commit extends the zero-adjoint check of select-masked arithmetic to values whose derivative-carrying uses control flow can skip, with its IR regression test."
+      },
+      "depends_on": [
+        "native-select-strong-zero",
+        "native-select-nonfinite-products"
+      ],
+      "draft": {
+        "title": "Reverse returns NaN when arithmetic hoisted out of a skipped branch meets an infinite value",
+        "body": "A branch skips arithmetic on an infinite endpoint. After LLVM hoists that arithmetic, reverse differentiation can evaluate a zero adjoint times infinity and return a NaN. The derivative contribution of the skipped branch should be zero. The IR regression isolates the hoisted subtraction, division and square.\n\n[hoisted-guard.ll](https://github.com/nsiccha/Enzyme/blob/593c7937cc90695ddd9c6ef31aa93f3c55e45eeb/enzyme/test/Enzyme/ReverseMode/hoisted-guard.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/hoisted-guard.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        }
+      ]
+    },
+    {
+      "id": "native-compared-operand-adjoints",
+      "role": "fix",
+      "title": "Reverse returns NaN when a skipped branch first compares a hoisted value",
+      "summary": "The protection of hoisted arithmetic missed a value that the skipped branch only compares, such as the interval width in b - a >= 0.125 ? exp(-a * a) : 0.0. LLVM hoists that value too, and it counted as a use that always runs, so the derivative stayed NaN. A value that only comparisons read carries no derivative and no longer counts, and a protected use in any block also protects its operand.",
+      "repairs": [
+        {
+          "id": "compared_operand_adjoints",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "relation": "related",
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/2285"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "078431a87bc49e6391f64dc61eacf48412b220b5",
+            "title": "Protect operands of hoisted values that only comparisons read",
+            "original": [
+              "078431a87bc49e6391f64dc61eacf48412b220b5"
+            ]
+          }
+        ],
+        "why_together": "One native commit refines the use analysis of the preceding hoisted-arithmetic repair and adds its IR regression test."
+      },
+      "depends_on": [
+        "native-conditional-use-adjoints"
+      ],
+      "draft": {
+        "title": "Reverse returns NaN when a skipped branch first compares a hoisted value",
+        "body": "In an expression such as `b - a >= 0.125 ? exp(-a * a) : 0.0`, the width can feed a comparison even when every use that contributes to the derivative is skipped. Counting that comparison as an unconditional derivative use allows a zero adjoint to be multiplied by an infinite operand. The regression exercises this case and the propagation of the zero adjoint to its operands.\n\n[hoisted-guard-compare.ll](https://github.com/nsiccha/Enzyme/blob/078431a87bc49e6391f64dc61eacf48412b220b5/enzyme/test/Enzyme/ReverseMode/hoisted-guard-compare.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/hoisted-guard-compare.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        }
+      ]
+    },
+    {
+      "id": "native-overwritten-reachable-data",
+      "role": "fix",
+      "title": "A custom rule cannot tell that data behind a reference in its argument was overwritten",
+      "summary": "The per-argument overwritten flag describes only the memory an argument points to. For a struct, tuple, view or closure that holds an array, a later write to that array left the flag false, so a rule that rereads the data in its reverse pass returned a wrong derivative without an error. The native C API now reports whether a write the callee cannot see follows the call, so a frontend can set the flag for every argument that reaches mutable data.",
+      "repairs": [
+        {
+          "id": "overwritten_reachable_data",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "relation": "reports",
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/3955"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "05ce259ccbc1f40097351cdb7e7528dea722a303",
+            "title": "Report the writes that follow a call through the C API",
+            "original": [
+              "05ce259ccbc1f40097351cdb7e7528dea722a303"
+            ]
+          }
+        ],
+        "why_together": "One native commit adds the C API entry point that the Julia frontend calls. The frontend change and its tests are part of the Julia repair record."
+      },
+      "depends_on": [],
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "Enzyme.jl 37b2a484727a28a78679d28a24e7071d916ca437 with only the test checkout’s native pin changed to 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The test loaded the staged LLVM 18 library. 424 assertions passed, 0 failed, 0 errored and 0 were marked broken.",
+          "tests": [
+            "Enzyme.jl test/rules/overwritten_references.jl"
+          ],
+          "julia": "1.12.7",
+          "native_build": "0f39835fdd2c7eb92f1b22753f682e5fe9b1a694e90ed137478766175dc9a81f"
+        }
+      ]
+    },
+    {
+      "id": "native-unexposed-storage-barriers",
+      "role": "fix",
+      "title": "A loop that stores each result into its own array makes custom rules copy their arguments",
+      "summary": "Julia follows each store of an object reference into an array with a write barrier. In a loop, that barrier is reachable from the next iteration's call and counted as exposing the array to the call. A rule then saw overwritten = true for arguments that hold references and copied their data on every call, and differentiated callees cached loads they could reread. The barrier now exposes nothing, while storing the array itself somewhere still counts.",
+      "repairs": [
+        {
+          "id": "unexposed_storage_barriers",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "relation": "related",
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/3955"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "400c1bdc7b35d7ecd941ddef3b18d02d176d3bb0",
+            "title": "Let a write barrier leave private storage unexposed to a call",
+            "original": [
+              "400c1bdc7b35d7ecd941ddef3b18d02d176d3bb0"
+            ]
+          }
+        ],
+        "why_together": "One native commit changes the exposure proof for storage the function allocated and adds two IR regression tests, one for the private array and one for an array that is published."
+      },
+      "depends_on": [
+        "native-overwritten-reachable-data",
+        "native-owned-output-cache"
+      ],
+      "draft": {
+        "title": "A loop that stores each result into its own array makes custom rules copy their arguments",
+        "body": "A loop stores references into an array allocated before the loop and calls a differentiable function on each iteration. Julia's GC write barrier makes Enzyme treat the array as visible to the next call. Custom rules then see overwritten inputs and copy data that the call could never read. The two IR tests distinguish a GC write barrier from a store that actually publishes the array.\n\n[owned-output-loop-write-barrier.ll](https://github.com/nsiccha/Enzyme/blob/400c1bdc7b35d7ecd941ddef3b18d02d176d3bb0/enzyme/test/Enzyme/ReverseMode/owned-output-loop-write-barrier.ll) · [owned-output-loop-write-barrier-published.ll](https://github.com/nsiccha/Enzyme/blob/400c1bdc7b35d7ecd941ddef3b18d02d176d3bb0/enzyme/test/Enzyme/ReverseMode/owned-output-loop-write-barrier-published.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-write-barrier-published.ll",
+            "enzyme/test/Enzyme/ReverseMode/owned-output-loop-write-barrier.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        }
+      ]
+    },
+    {
+      "id": "llvm24-attributor-attribute-kinds",
+      "title": "The LLVM 24 Attributor factory differs between the revisions used by Enzyme and XLA",
+      "role": "fix",
+      "summary": "Enzyme main selects allowed abstract attributes by type. The LLVM 24 revision used by XLA expects their ID addresses. Both headers advertise LLVM 24, and the same attribute list is required for both.",
+      "draft": {
+        "title": "The LLVM 24 Attributor factory differs between the revisions used by Enzyme and XLA",
+        "body": "Building Enzyme at 723afd5f against XLA’s LLVM bc0683cc fails when instantiating AAKindSet::get. That revision expects a pack of attribute ID addresses. The header at 8823cdce, used in Enzyme CI, accepts attribute types instead. A major-version check selects the same path for both. Selecting the factory by its signature allows the two builds to use the same set of attributes."
+      },
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "relation": "related",
+          "url": "https://github.com/EnzymeAD/Enzyme/pull/3905"
+        }
+      ],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "09f4483f63f8a730e227e25040f425c9252bfbd5",
+            "title": "Select the available LLVM 24 Attributor attribute-set factory",
+            "original": [
+              "09f4483f63f8a730e227e25040f425c9252bfbd5"
+            ]
+          }
+        ],
+        "why_together": "One commit selects the factory that accepts the allowlist on the LLVM being compiled against."
+      },
+      "depends_on": [],
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "tests": [],
+          "detail": "The exact factory helper and constexpr attribute list at 09f4483f63f8a730e227e25040f425c9252bfbd5 compiled under C++17 with the official Attributor headers from both LLVM bc0683cc and 8823cdce. The check used the other LLVM includes and generated configuration from the XLA build."
+        }
+      ]
+    },
+    {
+      "id": "native-caller-owned-loop-tapes",
+      "title": "Combined reverse mode allocates a bounded loop cache on each call",
+      "role": "fix",
+      "summary": "A non-inlined callee in a loop can allocate and free a cache on every call to its augmented primal. The caller can lend bounded, pointer-free caches storage from a shared tape arena. A combined reverse function can reserve its own bounded caches there as well. The frontend opts in and can disable the arena for nested differentiation.",
+      "repairs": [
+        {
+          "id": "tape_arena",
+          "covers": [
+            "native-prerequisite"
+          ]
+        }
+      ],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/EnzymeAD/Enzyme.jl/issues/3826",
+          "relation": "related"
+        }
+      ],
+      "depends_on": [],
+      "fix": {
+        "branch": "dogfood",
+        "commits": [
+          {
+            "sha": "2bfcc48cfb246f0657641bf52bc5ba01c05380cd",
+            "title": "Borrow caller storage for bounded integer loop caches in augmented callees",
+            "original": [
+              "2bfcc48cfb246f0657641bf52bc5ba01c05380cd"
+            ]
+          },
+          {
+            "sha": "6b4a4eda4370e27bb26d5338bdd4565278b59615",
+            "title": "Borrow caller storage for pointer-free loop caches of augmented callees",
+            "original": [
+              "6b4a4eda4370e27bb26d5338bdd4565278b59615"
+            ]
+          },
+          {
+            "sha": "e4562699af9d154064d55c11b622f1e9c70008a5",
+            "title": "Reserve a combined derivative's bounded loop caches from its tape arena",
+            "original": [
+              "e4562699af9d154064d55c11b622f1e9c70008a5"
+            ]
+          },
+          {
+            "sha": "b61ff30dcb85a42e60fb9a29e5fe663b1a99df5d",
+            "title": "Keep pointers out of the tape arena and give reservations malloc's aliasing facts",
+            "original": [
+              "b61ff30dcb85a42e60fb9a29e5fe663b1a99df5d"
+            ]
+          },
+          {
+            "sha": "f05f53083e905e38df3ba922d0299d3783b7bf7f",
+            "title": "Bound the tape arena's spare capacity and keep it out of nested derivatives",
+            "original": [
+              "f05f53083e905e38df3ba922d0299d3783b7bf7f"
+            ]
+          },
+          {
+            "sha": "0a2c55b620151df044e5f8f536e0e56f3ad7a5a9",
+            "title": "Leave the tape arena off unless the frontend turns it on",
+            "original": [
+              "0a2c55b620151df044e5f8f536e0e56f3ad7a5a9"
+            ]
+          },
+          {
+            "sha": "bfb732a1c0b74802107646aa7645f3e2a22037a4",
+            "title": "Tag pointer-free caches for the arena only when it is on",
+            "original": [
+              "bfb732a1c0b74802107646aa7645f3e2a22037a4"
+            ]
+          }
+        ],
+        "why_together": "The first three commits introduce caller storage and reservations. The remaining four preserve alias information, limit spare capacity, protect nested differentiation, and retain the existing IR when the arena is disabled."
+      },
+      "draft": {
+        "title": "Combined reverse mode allocates a bounded loop cache on each call",
+        "body": "Differentiate a loop in combined reverse mode that calls a non-inlined function with a bounded, pointer-free loop cache, then overwrites its input. Each augmented call allocates and frees a new cache although the caller knows its lifetime. A similar allocation occurs for each bounded cache owned by the combined derivative. In the attached IR, the derivative can reserve storage across calls and release it once. Pointer-containing caches still need separate storage, and nested differentiation must retain the allocation and free pairs it differentiates.\n\n[arena-combined-cache.ll](https://github.com/nsiccha/Enzyme/blob/bfb732a1c0b74802107646aa7645f3e2a22037a4/enzyme/test/Enzyme/ReverseMode/arena-combined-cache.ll) · [caller-owned-float-tape.ll](https://github.com/nsiccha/Enzyme/blob/bfb732a1c0b74802107646aa7645f3e2a22037a4/enzyme/test/Enzyme/ReverseMode/caller-owned-float-tape.ll) · [caller-owned-tape.ll](https://github.com/nsiccha/Enzyme/blob/bfb732a1c0b74802107646aa7645f3e2a22037a4/enzyme/test/Enzyme/ReverseMode/caller-owned-tape.ll)"
+      },
+      "validation": [
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "LLVM 16 plugin built from native Enzyme 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The listed fixtures recorded PASS.",
+          "tests": [
+            "enzyme/test/Enzyme/ReverseMode/arena-combined-cache.ll",
+            "enzyme/test/Enzyme/ReverseMode/caller-owned-float-tape.ll",
+            "enzyme/test/Enzyme/ReverseMode/caller-owned-tape.ll"
+          ],
+          "native_build": "3df9b0483d538df9fed788a926b83cfcaa7b5d10"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "Enzyme.jl 37b2a484727a28a78679d28a24e7071d916ca437 with only the test checkout’s native pin changed to 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The test loaded the staged LLVM 18 library. 47 assertions passed, 0 failed, 0 errored and 0 were marked broken.",
+          "tests": [
+            "Enzyme.jl test/tape_arena.jl"
+          ],
+          "julia": "1.12.7",
+          "native_build": "0f39835fdd2c7eb92f1b22753f682e5fe9b1a694e90ed137478766175dc9a81f"
+        },
+        {
+          "base": "723afd5fcaf61145280e5cfdb504f1a26e6ed2ea",
+          "result": "passed",
+          "detail": "Enzyme.jl 37b2a484727a28a78679d28a24e7071d916ca437 with only the test checkout’s native pin changed to 3df9b0483d538df9fed788a926b83cfcaa7b5d10. The test loaded the staged LLVM 18 library. 47 assertions passed, 0 failed, 0 errored and 2 were marked broken.",
+          "tests": [
+            "Enzyme.jl test/inlined_loop_nest.jl"
+          ],
+          "julia": "1.12.7",
+          "native_build": "0f39835fdd2c7eb92f1b22753f682e5fe9b1a694e90ed137478766175dc9a81f"
         }
       ]
     }
