@@ -2166,6 +2166,35 @@ bool legalCombinedForwardReverse(
     return false;
   };
 
+  // An earlier combined call may already have moved an instruction this call
+  // would move into the reverse block of its own call. The reverse pass visits
+  // blocks in their order in the function, and within a block from its last
+  // instruction to its first. When both calls are in one block, this call's
+  // reverse code follows the earlier one's in the same reverse block, so moving
+  // the instruction again after it keeps every operand available. In another
+  // block, the operands the earlier call moved stay in that block's reverse
+  // code, which need not run before this call's: for a call in an earlier block
+  // it runs after it. This call is then not combined, and its forward pass runs
+  // augmented, leaving the moved instructions where they are.
+  BasicBlock *callBlock = gutils->getNewFromOriginal(origop->getParent());
+  auto movedForOtherBlock = [&](Instruction *moved) {
+    auto found = gutils->reverseBlockToPrimal.find(moved->getParent());
+    if (found == gutils->reverseBlockToPrimal.end() ||
+        found->second == callBlock)
+      return false;
+    if (EnzymePrintPerf) {
+      if (called)
+        llvm::errs() << " [moved] failed to replace function "
+                     << (called->getName()) << " due to " << *moved
+                     << ", already moved by another combined call\n";
+      else
+        llvm::errs() << " [moved] failed to replace function "
+                     << (*calledValue) << " due to " << *moved
+                     << ", already moved by another combined call\n";
+    }
+    return true;
+  };
+
   unsigned reachableReturns = 0;
   bool movesReturn = false;
   allFollowersOf(origop, [&](Instruction *inst) {
@@ -2177,7 +2206,7 @@ bool legalCombinedForwardReverse(
         // value moves. Otherwise it stays in the forward pass, which runs
         // whether or not the call does.
         if (usetree.count(ri)) {
-          if (!dominatedByCall(ri)) {
+          if (!dominatedByCall(ri) || movedForOtherBlock(find->second)) {
             legal = false;
             return true;
           }
@@ -2222,6 +2251,11 @@ bool legalCombinedForwardReverse(
           llvm::errs() << " [premove] failed to replace function "
                        << (*calledValue) << " due to " << *inst << "\n";
       }
+      // Early exit
+      return true;
+    }
+    if (movedForOtherBlock(gutils->getNewFromOriginal(inst))) {
+      legal = false;
       // Early exit
       return true;
     }
