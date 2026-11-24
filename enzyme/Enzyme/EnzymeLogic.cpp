@@ -3142,6 +3142,13 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
   assert(constant_args.size() == todiff->getFunctionType()->getNumParams());
 
   auto found = AugmentedCachedFunctions.find(tup);
+  if (callerProvidesStorage && found != AugmentedCachedFunctions.end() &&
+      !found->second.isComplete) {
+    // On a recursive edge the callee's final arena argument and ownership
+    // layout are not known yet. Use its ordinary, self-owned tape variant.
+    tup.callerProvidesStorage = callerProvidesStorage = false;
+    found = AugmentedCachedFunctions.find(tup);
+  }
   if (found != AugmentedCachedFunctions.end()) {
     return found->second;
   }
@@ -3926,8 +3933,8 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
     // ArgTypes.push_back(tapeType);
   }
 
-  auto &ownedSlots =
-      AugmentedCachedFunctions.find(tup)->second.callerOwnedSlots;
+  auto &augmentation = AugmentedCachedFunctions.find(tup)->second;
+  auto &ownedSlots = augmentation.callerOwnedSlots;
   SmallPtrSet<CallInst *, 4> borrowedAllocations;
   if (!recursive && !noTape) {
     for (auto &candidate : gutils->callerBufferAllocations) {
@@ -3939,7 +3946,9 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
       }
     }
   }
-  if (!ownedSlots.empty())
+  augmentation.usesCallerTapeArena =
+      !ownedSlots.empty() || gutils->callerTapeArena;
+  if (augmentation.usesCallerTapeArena)
     ArgTypes.push_back(getUnqual(getCallerTapeArenaType(nf->getContext())));
 
   // Create a new function type...
@@ -4012,6 +4021,12 @@ const AugmentedReturn &EnzymeLogic::CreateAugmentedPrimal(
   CloneFunctionInto(NewF, nf, VMap, CloneFunctionChangeType::LocalChangesOnly,
                     Returns, "", nullptr);
   resetClonedGUID(NewF);
+
+  if (gutils->callerTapeArena) {
+    auto *placeholder = cast<AllocaInst>(VMap[gutils->callerTapeArena]);
+    placeholder->replaceAllUsesWith(NewF->getArg(NewF->arg_size() - 1));
+    placeholder->eraseFromParent();
+  }
 
   IRBuilder<> ib(getFirstNonPHI(&NewF->getEntryBlock()));
 
@@ -4902,7 +4917,7 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
   FnTypeInfo oldTypeInfo =
       preventTypeAnalysisLoops(prevkey.typeInfo, prevkey.todiff);
   auto key = prevkey.replaceTypeInfo(oldTypeInfo);
-  if (augmenteddata && !augmenteddata->callerOwnedSlots.empty())
+  if (augmenteddata && augmenteddata->usesCallerTapeArena)
     key.callerStorageLayout = augmenteddata;
 
   if (key.retType != DIFFE_TYPE::CONSTANT)

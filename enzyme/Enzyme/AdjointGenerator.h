@@ -6383,9 +6383,11 @@ public:
         if (Mode == DerivativeMode::ReverseModePrimal ||
             Mode == DerivativeMode::ReverseModeCombined) {
           const bool callerProvidesStorage =
-              Mode == DerivativeMode::ReverseModeCombined && shouldFree() &&
+              ((Mode == DerivativeMode::ReverseModeCombined && shouldFree() &&
+                gutils->OrigLI->getLoopFor(call.getParent())) ||
+               (Mode == DerivativeMode::ReverseModePrimal &&
+                gutils->collectCallerBuffers)) &&
               !gutils->omp && !called->isVarArg() &&
-              gutils->OrigLI->getLoopFor(call.getParent()) &&
               canUseCallerTapeArena(*called->getParent());
           subdata = &gutils->Logic.CreateAugmentedPrimal(
               RequestContext(&call, &BuilderZ), cast<Function>(called),
@@ -6420,7 +6422,7 @@ public:
           fnandtapetype = subdata;
           newcalled = subdata->fn;
           FT = cast<Function>(newcalled)->getFunctionType();
-          if (!subdata->callerOwnedSlots.empty())
+          if (subdata->usesCallerTapeArena)
             pre_args.push_back(gutils->getOrCreateCallerTapeArena());
 
           auto found =

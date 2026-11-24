@@ -3315,7 +3315,10 @@ AllocaInst *GradientUtils::getOrCreateCallerTapeArena() {
     IRBuilder<> B(inversionAllocs);
     auto Ty = getCallerTapeArenaType(newFunc->getContext());
     callerTapeArena = B.CreateAlloca(Ty, nullptr, "caller.tape");
-    B.CreateStore(Constant::getNullValue(Ty), callerTapeArena);
+    // In an augmented function the alloca stands for the incoming arena
+    // until its final signature is known. Only the combined owner initializes it.
+    if (!collectCallerBuffers)
+      B.CreateStore(Constant::getNullValue(Ty), callerTapeArena);
   }
   return callerTapeArena;
 }

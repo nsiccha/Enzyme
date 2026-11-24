@@ -134,6 +134,8 @@ public:
 
   // Physical tape fields whose loop-cache storage lives in the caller.
   std::set<unsigned> callerOwnedSlots;
+  // The augmented function can also pass the arena on without owning a slot.
+  bool usesCallerTapeArena = false;
 
   const std::vector<DIFFE_TYPE> constant_args;
 
