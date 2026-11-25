@@ -103,7 +103,7 @@ def AutoDiffTypeInterface : TypeInterface<"AutoDiffTypeInterface"> {
     >,
     InterfaceMethod<
       /*desc=*/[{
-        Returns an estimate of the size of a type.
+        Returns an estimate of the size of a type in bits.
 
         `INT64_MAX` if not known.
       }],

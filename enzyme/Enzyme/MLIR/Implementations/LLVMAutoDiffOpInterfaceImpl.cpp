@@ -172,8 +172,12 @@ public:
     if (auto elemType =
             dyn_cast<AutoDiffTypeInterface>(arrayType.getElementType())) {
       int64_t elSize = elemType.getApproxSize();
-      if (elSize != INT64_MAX)
-        return arrayType.getNumElements() * elSize;
+      uint64_t count = arrayType.getNumElements();
+      if (!count || !elSize)
+        return 0;
+      if (elSize > 0 && elSize != INT64_MAX &&
+          count <= uint64_t(INT64_MAX / elSize))
+        return count * elSize;
     }
     return INT64_MAX;
   }

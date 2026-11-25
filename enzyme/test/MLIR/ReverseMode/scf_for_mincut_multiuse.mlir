@@ -12,13 +12,9 @@
 // SINGLE value `a` per iteration and recomputes o1..o4, p, q in the reverse
 // pass.
 //
-// The mincut must therefore recognize that caching `a` -- which is used by four
-// operations -- costs one, not four. This is achieved by node-splitting the
-// mincut graph: each value V is split into V_in -> V_out joined by a single
-// unit-capacity edge, so all of V's flow funnels through it and V costs one to
-// cache regardless of fan-out (mirroring the LLVM Enzyme mincut in
-// Enzyme/DifferentialUseAnalysis.cpp). Without the split, `a` was charged four
-// (one per use) and the mincut instead cached the two downstream values p, q.
+// The value's in -> out edge charges the storage for `a` once, regardless
+// of its four users. Charging each use separately would make the two
+// downstream values p and q appear cheaper than their common input.
 //
 // Below we check that exactly ONE value (`a`) is cached and that o1..o4/p/q are
 // recomputed in the reverse pass.

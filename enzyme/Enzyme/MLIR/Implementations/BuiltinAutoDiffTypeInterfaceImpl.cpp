@@ -21,6 +21,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Support/LLVM.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::enzyme;
@@ -188,14 +189,19 @@ public:
 
   int64_t getApproxSize(Type self) const {
     auto tenType = cast<TensorType>(self);
-    auto elType = cast<AutoDiffTypeInterface>(tenType.getElementType());
+    if (!tenType.hasStaticShape())
+      return INT64_MAX;
+    if (llvm::is_contained(tenType.getShape(), 0))
+      return 0;
+    auto elType = dyn_cast<AutoDiffTypeInterface>(tenType.getElementType());
     if (!elType)
       return INT64_MAX;
     int64_t sz = elType.getApproxSize();
-    if (sz == INT64_MAX)
-      return sz;
-    for (auto n : tenType.getShape())
-      sz *= n;
+    if (sz < 0 || sz == INT64_MAX)
+      return INT64_MAX;
+    for (int64_t n : tenType.getShape())
+      if (llvm::MulOverflow(sz, n, sz))
+        return INT64_MAX;
     return sz;
   }
 };
@@ -324,12 +330,10 @@ public:
   }
 
   int64_t getApproxSize(Type self) const {
-    auto elType =
-        cast<AutoDiffTypeInterface>(cast<ComplexType>(self).getElementType());
-    auto elSize = elType.getApproxSize();
-    if (elSize == INT64_MAX)
-      return elSize;
-    return 2 * elSize;
+    auto elType = dyn_cast<AutoDiffTypeInterface>(
+        cast<ComplexType>(self).getElementType());
+    int64_t bits = elType ? elType.getApproxSize() : INT64_MAX;
+    return bits < 0 || bits > INT64_MAX / 2 ? INT64_MAX : 2 * bits;
   }
 };
 } // namespace

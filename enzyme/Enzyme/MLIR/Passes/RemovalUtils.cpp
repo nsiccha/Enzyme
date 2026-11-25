@@ -23,6 +23,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::enzyme;
@@ -266,13 +267,7 @@ void dump(const Node &n) {
 // producing correct but different caching decisions on every run.
 using NodeSet = llvm::SmallSetVector<Node, 2>;
 
-struct Graph : public llvm::MapVector<Node, NodeSet> {
-  const NodeSet &at(const Node &n) {
-    auto found = find(n);
-    assert(found != end());
-    return found->second;
-  }
-};
+using Graph = llvm::MapVector<Node, NodeSet>;
 
 static void dumpGraphviz(Graph &G) {
   auto serialize = [&](Node n) -> std::string {
@@ -329,43 +324,6 @@ static void dump(Graph &G) {
       for (const auto &N : pair.second) {
         llvm::errs() << "\t";
         dump(N);
-      }
-    }
-  }
-}
-
-// A node in the compute graph.
-// Operation nodes have outgoing edges to value nodes that they produce and
-// incoming nodes from values they take as operands.
-
-// parent is populated with a path from each connected leaf node of G to one
-// of the Value in Source.
-static inline void bfs(const Graph &G, const llvm::SetVector<Value> &Sources,
-                       DenseMap<Node, Node> &parent) {
-  std::deque<Node> q;
-  for (const auto &V : Sources) {
-    Node N(V);
-    parent.try_emplace(N, Node());
-    q.push_back(N);
-  }
-
-  // Standard BFS Loop
-
-  SmallPtrSet<Node, 2> done;
-
-  while (!q.empty()) {
-    auto u = q.front();
-    q.pop_front();
-    auto found = G.find(u);
-    if (found == G.end())
-      continue;
-
-    if (!done.insert(u).second)
-      continue;
-
-    for (const auto &v : found->second) {
-      if (parent.try_emplace(v, u).second) {
-        q.push_back(v);
       }
     }
   }
@@ -499,9 +457,22 @@ static Graph filterGraph(const Graph &Orig, const SetVector<Value> &Roots,
   return G;
 }
 
-static int64_t computeSizeOfType(Value val) {
-  auto T = dyn_cast<AutoDiffTypeInterface>(val.getType());
-  return T ? T.getApproxSize() : INT64_MAX;
+// The type interface estimates bits; charge for whole bytes of tape.
+static int64_t cacheBytes(Value val) {
+  auto type = dyn_cast<AutoDiffTypeInterface>(val.getType());
+  int64_t bits = type ? type.getApproxSize() : INT64_MAX;
+  return bits < 0 || bits == INT64_MAX ? INT64_MAX : llvm::divideCeil(bits, 8);
+}
+
+// An unpriced value on the original tape can be kept or omitted. Give its
+// own split edge zero additional cost, so it cannot justify adding a
+// different unpriced value or increasing the known portion of the tape.
+struct TapeCost {
+  SmallPtrSet<Value, 4> unpricedDirect;
+
+  int64_t operator()(Value v) const {
+    return unpricedDirect.contains(v) ? 0 : cacheBytes(v);
+  }
 };
 
 static int64_t computeRankOfType(Value val) {
@@ -578,104 +549,93 @@ static Node edgeHead(Node n) {
   return n;
 }
 
-// Given the compute graph `Orig` (with `roots` the non-recomputable sources and
-// `Required` the operations that force a value to be live in reverse), return
-// the minimal set of values to cache.
-//
-// The cut is computed on a node-split version of the graph: every value V is
-// split into an incoming node (outgoing=false) and an outgoing node
-// (outgoing=true) joined by a single unit-capacity edge, so that all of V's
-// flow funnels through it and caching V costs exactly one regardless of how
-// many operations consume it. Operations are not split. Since the split graph
-// is a plain `Graph` over the same `Node` type, the existing bfs/dump utilities
-// apply to it directly.
-static SetVector<Value> minCutValues(const Graph &Orig,
-                                     const SetVector<Value> &roots,
-                                     const SetVector<Operation *> &Required) {
-  Graph G;
-  // Build the node-split graph. Each original edge is either operation->value
-  // (a definition) or value->operation (a use).
-  for (const auto &pair : Orig) {
-    Node A = pair.first;
-    // Internal split edge for the tail value (no-op for an operation).
-    if (Value va = A.dynValue())
-      G[Node(va, /*outgoing=*/false)].insert(Node(va, /*outgoing=*/true));
-    for (Node B : pair.second) {
-      G[edgeTail(A)].insert(edgeHead(B));
-      // Internal split edge for the head value (no-op for an operation).
-      if (Value vb = B.dynValue())
-        G[Node(vb, /*outgoing=*/false)].insert(Node(vb, /*outgoing=*/true));
-    }
+// Only a value's in -> out edge may be cut. All definition and use edges
+// have capacity greater than the cost of taping the original values directly.
+// Use insertion-ordered adjacency for deterministic traversal, including when
+// augmenting introduces a reverse edge.
+using ResidualGraph =
+    llvm::MapVector<Node, llvm::SmallMapVector<Node, int64_t, 2>>;
+
+static Node findAugmentingPath(const ResidualGraph &graph,
+                               const SetVector<Value> &roots,
+                               const SetVector<Operation *> &required,
+                               DenseMap<Node, Node> &parent) {
+  parent.clear();
+  SmallVector<Node> queue;
+  for (Value root : roots) {
+    parent.try_emplace(Node(root), Node());
+    queue.emplace_back(root);
   }
-
-  LLVM_DEBUG(llvm::dbgs() << "node-split flow graph: \n";);
-  LLVM_DEBUG(dump(G));
-
-  // Save the original edges for cut extraction; the max-flow below mutates G
-  // into its residual graph. The flow sources are the incoming endpoints of the
-  // roots, which is exactly what bfs() seeds from a set of root values.
-  Graph Split = G;
-
-  // Edmonds-Karp: repeatedly augment along a shortest source->sink path in the
-  // residual graph until no augmenting path remains. All edges have unit
-  // capacity, represented by set membership.
-  while (true) {
-    DenseMap<Node, Node> parent;
-    bfs(G, roots, parent);
-    Node end;
-    for (Operation *req : Required) {
-      if (parent.count(Node(req))) {
-        end = Node(req);
-        break;
-      }
-    }
-    if (end.isNull())
-      break;
-    // Flip the residual edges along the found path, stopping at the source (a
-    // root's incoming endpoint).
-    Node v = end;
-    while (true) {
-      assert(parent.count(v));
-      Node u = parent.find(v)->second;
-      assert(!u.isNull());
-      G[u].remove(v);
-      G[v].insert(u);
-      if (u.isValue() && !u.outgoing() && roots.contains(u.getValue()))
-        break;
-      v = u;
-    }
-  }
-
-  // Reachable set from the sources in the residual graph.
-  DenseMap<Node, Node> parent;
-  bfs(G, roots, parent);
-
-  LLVM_DEBUG(llvm::dbgs() << "residual flow graph: \n";);
-  LLVM_DEBUG(dump(G));
-
-  // The min cut is the set of edges from a reachable node to a non-reachable
-  // node in the original graph. Each such edge names exactly one value to
-  // cache: the value being transported across it. Because values are split,
-  // this edge is one of
-  //   - the internal split edge V_in -> V_out  (=> cache V), or
-  //   - a use edge V_out -> op                 (=> cache V), or
-  //   - a def edge op -> V_in                  (=> cache the produced value).
-  // Operations are never split, so at least one endpoint of the cut edge is a
-  // value, and that value is the one to cache.
-  SetVector<Value> newCaches;
-  for (const auto &pair : Split) {
-    if (!parent.count(pair.first))
+  for (size_t i = 0; i < queue.size(); ++i) {
+    Node from = queue[i];
+    auto users = graph.find(from);
+    if (users == graph.end())
       continue;
-    for (const Node &N : pair.second) {
-      if (parent.count(N))
+    for (const auto &[to, capacity] : users->second) {
+      if (capacity == 0 || !parent.try_emplace(to, from).second)
         continue;
-      assert((pair.first.isValue() || N.isValue()) &&
-             "min-cut edge must transport a value");
-      Value cache = pair.first.isValue() ? pair.first.getValue() : N.getValue();
-      newCaches.insert(cache);
+      if (to.isOperation() && required.contains(to.getOperation()))
+        return to;
+      queue.push_back(to);
     }
   }
-  return newCaches;
+  return Node();
+}
+
+static void dumpResidual(const ResidualGraph &residual) {
+  Graph edges;
+  for (const auto &[from, neighbors] : residual)
+    for (const auto &[to, capacity] : neighbors)
+      if (capacity)
+        edges[from].insert(to);
+  dump(edges);
+}
+
+static FailureOr<SetVector<Value>>
+minCutValues(const Graph &orig, const SetVector<Value> &roots,
+             const SetVector<Operation *> &required, const TapeCost &cost,
+             int64_t budget) {
+  ResidualGraph graph;
+  for (const auto &[from, users] : orig) {
+    if (Value v = from.dynValue())
+      graph[from][edgeTail(from)] = cost(v);
+    for (Node to : users)
+      graph[edgeTail(from)][edgeHead(to)] = budget + 1;
+  }
+  LLVM_DEBUG(llvm::dbgs() << "node-split flow graph:\n"; dumpResidual(graph));
+
+  // Edmonds-Karp: send the bottleneck capacity in one augmentation, even
+  // for a large tensor. The final unsuccessful search gives the source side
+  // of the cut. Only split edges can cross it.
+  DenseMap<Node, Node> parent;
+  int64_t remaining = budget;
+  while (true) {
+    Node sink = findAugmentingPath(graph, roots, required, parent);
+    if (sink.isNull())
+      break;
+    int64_t amount = INT64_MAX;
+    for (Node v = sink, u = parent.lookup(v); !u.isNull();
+         v = u, u = parent.lookup(v))
+      amount = std::min(amount, graph[u][v]);
+    if (amount > remaining)
+      return failure();
+    remaining -= amount;
+    for (Node v = sink, u = parent.lookup(v); !u.isNull();
+         v = u, u = parent.lookup(v)) {
+      graph[u][v] -= amount;
+      graph[v][u] += amount;
+    }
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "residual flow graph:\n"; dumpResidual(graph));
+  SetVector<Value> cut;
+  for (const auto &entry : graph) {
+    Node from = entry.first;
+    if (from.isValue() && !from.outgoing() && parent.contains(from) &&
+        !parent.contains(edgeTail(from)))
+      cut.insert(from.getValue());
+  }
+  return cut;
 }
 
 // When the min cut is ambiguous, prefer caching the LAST value in a computation
@@ -686,19 +646,15 @@ static SetVector<Value> minCutValues(const Graph &Orig,
 // sources -- i.e. the cut nearest the roots, which caches the earliest value in
 // every chain and leaves the longest possible tail to recompute in reverse.
 // Sliding a cut edge downstream past an operation that has a single graph user
-// and a single result yields another cut of the same capacity (the slid edge is
-// the only way from that value to a required op), so this never costs an extra
-// cache; it just shrinks what the reverse pass rebuilds.
-//
-// The size guard keeps the slide from trading a small buffer for a larger one:
-// capacities here are unit, so the flow minimizes the NUMBER of cached values,
-// not their bytes, and two equal-capacity cuts can differ in size.
+// and a single, equally small result preserves the storage bound and shrinks
+// what the reverse pass rebuilds.
 //
 // This mirrors the "push to cache the last value in a computation chain"
 // heuristic in the LLVM Enzyme mincut (Enzyme/DifferentialUseAnalysis.cpp).
 static void pushCachesDownstream(const Graph &Orig,
                                  const SetVector<Operation *> &Required,
-                                 SetVector<Value> &newCaches) {
+                                 SetVector<Value> &newCaches,
+                                 const TapeCost &cost) {
   SmallVector<Value> todo(newCaches.begin(), newCaches.end());
 
   while (!todo.empty()) {
@@ -739,7 +695,7 @@ static void pushCachesDownstream(const Graph &Orig,
       continue;
 
     // Never trade a cached buffer for a larger one.
-    if (computeSizeOfType(cur) < computeSizeOfType(next))
+    if (cost(cur) < cost(next))
       continue;
 
     newCaches.remove(cur);
@@ -1027,28 +983,37 @@ void mlir::enzyme::minCutCache(Block *forward, Block *reverse,
   LLVM_DEBUG(llvm::dbgs() << "post filter graph: \n";);
   LLVM_DEBUG(dump(G));
 
-  Graph Orig = G;
-
-  // Compute the values to cache via a minimum cut. The cut is computed on a
-  // node-split version of the graph (see minCutValues), so that caching a value
-  // costs exactly one regardless of how many operations consume it. Without the
-  // split, a value used by N operations is charged N (one per outgoing edge),
-  // which causes the mincut to prefer caching several downstream values over a
-  // single cheaper upstream one (e.g. an input reused many times). This mirrors
-  // the node-splitting done by the LLVM Enzyme mincut in
-  // DifferentialUseAnalysis.cpp.
-  SetVector<Value> newCaches = minCutValues(Orig, roots, Required);
+  // Direct taping is a feasible cut and bounds both the flow and the
+  // non-cuttable edge capacities. Only sum its known sizes. Unpriced direct
+  // values are individually available to the cut at no additional cost.
+  TapeCost cost;
+  int64_t budget = 0;
+  for (auto &info : caches) {
+    Value v = info.pushedValue();
+    int64_t bytes = cacheBytes(v);
+    if (bytes == INT64_MAX) {
+      cost.unpricedDirect.insert(v);
+      continue;
+    }
+    if (bytes >= INT64_MAX - budget) {
+      caches0 = std::move(caches);
+      return;
+    }
+    budget += bytes;
+  }
+  auto cut = minCutValues(G, roots, Required, cost, budget);
+  if (failed(cut)) {
+    caches0 = std::move(caches);
+    return;
+  }
+  SetVector<Value> newCaches = std::move(*cut);
 
   // The cut above is only one of several equal-capacity min cuts; slide it as
   // far downstream as is free so the reverse pass recomputes as little as
   // possible.
-  pushCachesDownstream(Orig, Required, newCaches);
+  pushCachesDownstream(G, Required, newCaches, cost);
 
   assert(rewriter.getInsertionPoint()->getBlock() == reverse);
-
-  // compute path from new caches to required
-  DenseMap<Node, Node> parent;
-  bfs(Orig, newCaches, parent);
 
   LLVM_DEBUG({
     llvm::dbgs() << "initial new caches: \n";
@@ -1057,9 +1022,9 @@ void mlir::enzyme::minCutCache(Block *forward, Block *reverse,
     }
   });
 
-  // The cachegraph is a sub graph of Orig with only pathes new caches
-  // to Required nodes.
-  Graph cacheGraph = filterGraph(Orig, newCaches, Required);
+  // The cachegraph is a subgraph from the new caches to the required
+  // operations.
+  Graph cacheGraph = filterGraph(G, newCaches, Required);
 
   LLVM_DEBUG(llvm::dbgs() << "cacheGraph:\n");
   LLVM_DEBUG(dump(cacheGraph));
@@ -1080,12 +1045,17 @@ void mlir::enzyme::minCutCache(Block *forward, Block *reverse,
     while (todo.size()) {
       auto cur = todo.pop_back_val();
 
-      auto &next = cacheGraph.at(Node(cur));
-
-      if (next.size() > 1)
+      auto users = cacheGraph.find(Node(cur));
+      if (users == cacheGraph.end()) {
+        // A zero-byte cut can include a value whose paths to the reverse
+        // are already covered by other cached values.
+        newCaches.remove(cur);
+        continue;
+      }
+      if (users->second.size() != 1)
         continue;
 
-      auto nextF = *next.begin();
+      auto nextF = *users->second.begin();
       assert(nextF.isOperation());
       auto opNext = nextF.getOperation();
 
@@ -1097,13 +1067,11 @@ void mlir::enzyme::minCutCache(Block *forward, Block *reverse,
 
       Value candidate = opNext->getResult(0);
 
-      int64_t curSize = computeSizeOfType(cur),
-              curRank = computeRankOfType(cur);
+      int64_t curSize = cost(cur), curRank = computeRankOfType(cur);
 
-      int64_t newSize = computeSizeOfType(candidate),
-              newRank = computeRankOfType(candidate);
+      int64_t newSize = cost(candidate), newRank = computeRankOfType(candidate);
 
-      if (newRank < curRank || (newRank == curRank && newSize < curSize)) {
+      if (newSize < curSize || (newSize == curSize && newRank < curRank)) {
         newCaches.remove(cur);
         newCaches.insert(candidate);
         todo.push_back(candidate);
@@ -1167,7 +1135,7 @@ void mlir::enzyme::minCutCache(Block *forward, Block *reverse,
     }
 
     if (reverseCaches.size()) {
-      Graph fwdGraph = filterGraph(Orig, roots, newCaches);
+      Graph fwdGraph = filterGraph(G, roots, newCaches);
 
       IRMapping fwdmap;
       for (auto &info : caches) {
