@@ -4455,13 +4455,24 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       }
     }
 
-    bool forceErase =
-        !((Mode == DerivativeMode::ReverseModePrimal && forwardsShadow) ||
-          (Mode == DerivativeMode::ReverseModeCombined && forwardsShadow) ||
-          (Mode == DerivativeMode::ReverseModeGradient && backwardsShadow) ||
-          (Mode == DerivativeMode::ForwardModeSplit && backwardsShadow));
+    // Whether this pass zeroes the shadow: the pass that creates it.
+    bool zeroShadow =
+        (Mode == DerivativeMode::ReverseModePrimal && forwardsShadow) ||
+        (Mode == DerivativeMode::ReverseModeCombined && forwardsShadow) ||
+        (Mode == DerivativeMode::ReverseModeGradient && backwardsShadow) ||
+        (Mode == DerivativeMode::ForwardModeSplit && backwardsShadow);
 
-    if (forceErase)
+    // The call itself zeroes the primal allocation. The augmented and the
+    // combined pass run the primal, so it stays there whichever pass creates
+    // the shadow. Without it a stack slot moved to the heap
+    // (enzyme_zerostack) that the primal only partly writes is a
+    // garbage-collected object with undefined pointer fields, which the
+    // collector follows at the next safepoint: the tape keeps the object
+    // reachable.
+    bool primalRuns = Mode == DerivativeMode::ReverseModePrimal ||
+                      Mode == DerivativeMode::ReverseModeCombined;
+
+    if (!zeroShadow && !primalRuns)
       eraseIfUnused(call, /*erase*/ true, /*check*/ false);
     else
       eraseIfUnused(call);
@@ -4473,7 +4484,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       return true;
     }
 
-    if (!forceErase) {
+    if (zeroShadow) {
       Value *op0 = gutils->invertPointerM(orig_op0, BuilderZ);
       Value *op1 = gutils->getNewFromOriginal(call.getArgOperand(1));
       Value *op2 = gutils->getNewFromOriginal(call.getArgOperand(2));
