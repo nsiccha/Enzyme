@@ -2047,10 +2047,10 @@ Value *CacheUtility::computeIndexOfChunk(
 /// For every loop, this returns pair of the LoopContext and the limit of that
 /// loop Both the vector of Chunks and vector of Loops within a Chunk go from
 /// innermost loop to outermost loop.
-CacheUtility::SubLimitType CacheUtility::getSubLimits(bool inForwardPass,
-                                                      IRBuilder<> *RB,
-                                                      LimitContext ctx,
-                                                      Value *extraSize) {
+CacheUtility::SubLimitType
+CacheUtility::getSubLimits(bool inForwardPass, IRBuilder<> *RB,
+                           LimitContext ctx, Value *extraSize,
+                           const ValueToValueMapTy *available) {
   // Store the LoopContext's in InnerMost => Outermost order
   SmallVector<LoopContext, 4> contexts;
 
@@ -2212,8 +2212,22 @@ CacheUtility::SubLimitType CacheUtility::getSubLimits(bool inForwardPass,
         // map
         if (allocationPreheaders[i] != contexts[j].preheader) {
           if (!inForwardPass) {
-            reverseMap[contexts[j].var] = RB->CreateLoad(
-                contexts[j].var->getType(), contexts[j].antivaralloc);
+            // The caller may look up another iteration than the one this
+            // block reverses: a replay of the forward pass has induction
+            // variables of its own, and a loop-carried value is read at the
+            // previous index. The limit belongs to that same iteration. The
+            // reverse counter of such a loop may not even be set yet, and
+            // what is computed here is kept for the rest of the block.
+            Value *var = nullptr;
+            if (available) {
+              auto found = available->find(contexts[j].var);
+              if (found != available->end())
+                var = found->second;
+            }
+            if (!var)
+              var = RB->CreateLoad(contexts[j].var->getType(),
+                                   contexts[j].antivaralloc);
+            reverseMap[contexts[j].var] = var;
           }
         } else {
           break;
@@ -2468,7 +2482,8 @@ Value *CacheUtility::getCachePointer(llvm::Type *T, bool inForwardPass,
                                      Value **bitIndex) {
   assert(ctx.Block);
   assert(cache);
-  auto sublimits = getSubLimits(inForwardPass, &BuilderM, ctx, extraSize);
+  auto sublimits =
+      getSubLimits(inForwardPass, &BuilderM, ctx, extraSize, &available);
 
   Value *next = cache;
   assert(next->getType()->isPointerTy());

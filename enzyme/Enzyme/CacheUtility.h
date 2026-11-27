@@ -308,8 +308,15 @@ public:
                                     std::pair<LoopContext, llvm::Value *>, 4>>,
                             0>
       SubLimitType;
+  ///
+  /// In the reverse pass a limit that is only known inside the loop nest is
+  /// computed again at `RB`, from the induction variables of the loops around
+  /// it. `available` names the iteration the caller looks up: where it maps a
+  /// loop's induction variable, the limit is computed for that value and not
+  /// for the reverse pass's own counter of that loop.
   SubLimitType getSubLimits(bool inForwardPass, llvm::IRBuilder<> *RB,
-                            LimitContext ctx, llvm::Value *extraSize = nullptr);
+                            LimitContext ctx, llvm::Value *extraSize = nullptr,
+                            const llvm::ValueToValueMapTy *available = nullptr);
 
 private:
   /// Internal data structure used by getSubLimit to avoid computing the same
