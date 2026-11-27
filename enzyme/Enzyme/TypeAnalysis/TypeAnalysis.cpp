@@ -3347,8 +3347,14 @@ void TypeAnalyzer::visitInsertValueInst(InsertValueInst &I) {
                    getAnalysis(&I).ShiftIndices(dl, off, ins2_size, 0), &I);
   auto new_res =
       getAnalysis(I.getAggregateOperand()).Clear(off, off + ins_size, agg_size);
-  auto shifted = getAnalysis(I.getInsertedValueOperand())
-                     .ShiftIndices(dl, 0, ins_size, off);
+  // A bounds check may expose an intermediate expression to an error path.
+  // The saved index itself still has only integer uses.
+  auto *value = I.getInsertedValueOperand();
+  TypeTree inserted = getAnalysis(value);
+  if (auto *index = dyn_cast<Instruction>(value))
+    if (index->getMetadata("enzyme_taped_index") && mustRemainInteger(index))
+      inserted = TypeTree(BaseType::Integer).Only(-1, index);
+  auto shifted = inserted.ShiftIndices(dl, 0, ins_size, off);
   new_res |= shifted;
   if (direction & DOWN)
     updateAnalysis(&I, new_res, &I);
@@ -7084,6 +7090,14 @@ bool TypeAnalyzer::mustRemainInteger(Value *val, bool *returned) {
         seen[val].second |= seen[u].second;
       }
       continue;
+    }
+    // A tape insertion preserves the integer role of a saved address index.
+    // Check all other uses as usual, including any reinterpretation.
+    if (auto *iv = dyn_cast<InsertValueInst>(u)) {
+      auto *inst = dyn_cast<Instruction>(val);
+      if (inst && iv->getInsertedValueOperand() == inst &&
+          inst->getMetadata("enzyme_taped_index"))
+        continue;
     }
     if (auto gep = dyn_cast<GetElementPtrInst>(u)) {
       if (gep->isInBounds() && gep->getPointerOperand() != val) {

@@ -3323,6 +3323,23 @@ AllocaInst *GradientUtils::getOrCreateCallerTapeArena() {
   return callerTapeArena;
 }
 
+// Before taping, an address index is used only in inbounds GEPs and
+// possibly in comparisons such as array bounds checks.
+static bool isAddressIndex(const Value *value) {
+  if (!value || !value->getType()->isIntegerTy())
+    return false;
+  bool indexed = false;
+  for (const User *user : value->users()) {
+    if (isa<ICmpInst>(user))
+      continue;
+    auto *gep = dyn_cast<GetElementPtrInst>(user);
+    if (!gep || !gep->isInBounds())
+      return false;
+    indexed = true;
+  }
+  return indexed;
+}
+
 Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
                                       int idx, bool replace,
                                       const Instruction *orig) {
@@ -3816,6 +3833,12 @@ Value *GradientUtils::cacheForReverse(IRBuilder<> &BuilderQ, Value *malloc,
       --tapeidx;
       return malloc;
     }
+
+    // Packing adds a use that was absent when the index was computed.
+    if (auto *inst = dyn_cast<Instruction>(malloc))
+      if (isAddressIndex(isOriginal(inst)))
+        inst->setMetadata("enzyme_taped_index",
+                          MDNode::get(inst->getContext(), {}));
 
     LimitContext ctx(/*ReverseLimit*/ reverseBlocks.size() > 0,
                      BuilderQ.GetInsertBlock());
